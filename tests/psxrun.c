@@ -206,6 +206,7 @@ int main(int argc, char** argv) {
 			}
 		}
 	}
+	gpuSync(p);
 	double cpu = (double) (clock() - start) / CLOCKS_PER_SEC;
 	struct timespec wallEnd;
 	clock_gettime(CLOCK_MONOTONIC, &wallEnd);
@@ -214,9 +215,10 @@ int main(int argc, char** argv) {
 	if (vram) {
 		FILE* f = fopen(vram, "wb");
 		if (f) {
+			const uint16_t* pixels = gpuVram(p);
 			fprintf(f, "P6\n1024 512\n255\n");
 			for (int i = 0; i < 1024 * 512; i++) {
-				uint16_t c = p->gpu.vram[i];
+				uint16_t c = pixels[i];
 				uint8_t rgb[3] = { (uint8_t) ((c & 31) << 3), (uint8_t) (((c >> 5) & 31) << 3), (uint8_t) (((c >> 10) & 31) << 3) };
 				fwrite(rgb, 1, 3, f);
 			}
@@ -255,5 +257,6 @@ int main(int argc, char** argv) {
 		snprintf(path, sizeof path, "%s-%05d.ppm", shots, frames);
 		savePpm(p, path);
 	}
+	gpuFree(p);
 	return 0;
 }

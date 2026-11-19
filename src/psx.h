@@ -86,6 +86,7 @@ struct Gpu {
 	int32_t drawTime;
 	int64_t last;
 	bool frameDone;
+	bool drawPixels;  // false while another thread draws: this GPU only takes drawing's time
 	uint8_t ditherLut[4][4][512];
 	// The picture, as Mednafen makes it: 768 wide, up to 576 lines, with the line widths
 	uint32_t frame[576 * 768];
@@ -119,6 +120,7 @@ struct Sio {
 };
 
 struct Disc;
+struct GpuThread;
 
 
 struct Psx {
@@ -135,6 +137,7 @@ struct Psx {
 	int64_t timersAt;  // the cycle the timers have counted to
 	bool vblank, hretrace;
 	struct Gpu gpu;
+	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
 	struct Sio sio;
 	struct Disc* disc;
 	uint32_t frames;
@@ -216,6 +219,9 @@ void timersHretrace(struct Psx* p, bool in);
 
 // gpu.c
 void gpuReset(struct Psx* p);
+void gpuSync(struct Psx* p);
+void gpuFree(struct Psx* p);
+const uint16_t* gpuVram(struct Psx* p);
 uint32_t gpuRead(struct Psx* p, uint32_t address);
 void gpuWrite(struct Psx* p, uint32_t address, uint32_t value);
 void gpuGp0(struct Psx* p, uint32_t word);
