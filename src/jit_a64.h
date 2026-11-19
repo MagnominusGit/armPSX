@@ -93,6 +93,8 @@ struct Compile {
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
+	struct { uint8_t* site; uint8_t* cont; int i, k; struct State st; } lines[BLOCK_MAX / 4 + 2];
+	int lineCount;
 };
 
 // The primitives jit.c's state uses (w0-w2 only).
@@ -242,6 +244,23 @@ static void bCheck(struct Compile* k, int bound, bool gte, int next) {
 	k->stubSites[next] = aBcond(&k->e, C_GE, NULL);
 }
 
+// Before instruction i, the first of the block's line k: on while the line's generation is the one
+// it was last found as compiled at (see jit_x64.h).
+static void bLineCheck(struct Compile* k, struct Block* b, int line, int i) {
+	struct Emitter* e = &k->e;
+	uint32_t pc = b->pc + 4 * i;
+	aLdr(e, X0, X19, OFF(cpu.icacheGen) + 4 * ((pc >> 4) & 255));
+	aMovImm64(e, X1, (uint64_t) (uintptr_t) &b->gen[line]);
+	aLdr(e, X1, X1, 0);
+	aCmp(e, X0, X1);
+	k->lines[k->lineCount].site = aBcond(e, C_NE, NULL);
+	k->lines[k->lineCount].cont = e->p;
+	k->lines[k->lineCount].i = i;
+	k->lines[k->lineCount].k = line;
+	k->lines[k->lineCount].st = k->st;
+	k->lineCount++;
+}
+
 static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	struct Emitter* e = &k->e;
 	aStrX(e, X21, X19, OFF(cycles));
@@ -275,6 +294,33 @@ static void bEnd(struct Compile* k, struct Block* b) {
 
 static uint8_t* bFinish(struct Compile* k, struct Block* b) {
 	struct Emitter* e = &k->e;
+	for (int l = 0; l < k->lineCount; l++) {
+		int i = k->lines[l].i;
+		uint32_t pc = b->pc + 4 * i;
+		patchHere(e, k->lines[l].site);
+		struct State keep = k->st;
+		k->st = k->lines[l].st;
+		stFlush(k);
+		k->st = keep;
+		storeWordI(e, OFF(cpu.pc), pc);
+		if (b->delay && i == b->count - 1) {
+			storeByteI(e, OFF(cpu.branched), 1);
+		} else {
+			storeWordI(e, OFF(cpu.next), pc + 4);
+			aStrb(e, ZR, X19, OFF(cpu.branched));
+		}
+		aStrX(e, X21, X19, OFF(cycles));
+		aMovX(e, X0, X19);
+		aMovImm64(e, X1, (uint64_t) (uintptr_t) b);
+		movI(e, X2, k->lines[l].k);
+		movI(e, X3, i);
+		callC(e, (const void*) jitLineMiss);
+		aLdrX(e, X21, X19, OFF(cycles));
+		loadLimit(e);
+		aDpImm(e, A_SUBS_IMM | W64, ZR, X0, 1);
+		aBcond(e, C_EQ, k->lines[l].cont);
+		aBr(e, X0);
+	}
 	for (int i = 1; i < b->count; i++) {
 		if (!k->stubSites[i]) continue;
 		patchHere(e, k->stubSites[i]);
@@ -284,6 +330,14 @@ static uint8_t* bFinish(struct Compile* k, struct Block* b) {
 		} else {
 			storeWordI(e, OFF(cpu.next), b->pc + 4 * i + 4);
 			aStrb(e, ZR, X19, OFF(cpu.branched));
+			// to go on from here
+			aMovImm64(e, X1, (uint64_t) (uintptr_t) &k->j->resumeBlock);
+			aMovImm64(e, X2, (uint64_t) (uintptr_t) b);
+			aStrX(e, X2, X1, 0);
+			movI(e, X2, i);
+			aStr(e, X2, X1, (unsigned) (offsetof(struct Jit, resumeIndex) - offsetof(struct Jit, resumeBlock)));
+			aLdr(e, X2, X19, OFF(cpu.icacheChanges));
+			aStr(e, X2, X1, (unsigned) (offsetof(struct Jit, resumeChanges) - offsetof(struct Jit, resumeBlock)));
 		}
 		aB(e, k->j->leave);
 	}
@@ -613,23 +667,27 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	aLdr(&e, X5, X2, (unsigned) offsetof(struct Block, checked));
 	aCmp(&e, X4, X5);
 	uint8_t* go = aBcond(&e, C_EQ, NULL);
-	// The cache changed since: the block's own lines decide
-	aLsrImm(&e, X6, X3, 4);
-	aLdr(&e, X7, X2, (unsigned) offsetof(struct Block, lines));
-	aAddImmX(&e, X8, X2, (unsigned) offsetof(struct Block, gen));
+	// The cache changed since: the block's first line decides
+	aLsrImm(&e, X6, X0, 4);
+	aLogicImm(&e, A_AND_IMM, X6, X6, 255);
 	aAddImmX(&e, X11, X19, OFF(cpu.icacheGen));
-	uint8_t* loop = e.p;
-	aLogicImm(&e, A_AND_IMM, X9, X6, 255);
-	aLdst(&e, L_LDR, X12, X11, X9, L_UXTW | SCALED);
-	aLdr(&e, X13, X8, 0);
+	aLdst(&e, L_LDR, X12, X11, X6, L_UXTW | SCALED);
+	aLdr(&e, X13, X2, (unsigned) offsetof(struct Block, gen));
 	aCmp(&e, X12, X13);
-	aBcond(&e, C_NE, j->leave);
-	aAddImmX(&e, X8, X8, 4);
-	aDpImm(&e, A_ADD_IMM, X6, X6, 1);
-	aDpImm(&e, A_SUBS_IMM, X7, X7, 1);
-	aBcond(&e, C_NE, loop);
+	uint8_t* miss = aBcond(&e, C_NE, NULL);
 	aStr(&e, X4, X2, (unsigned) offsetof(struct Block, checked));
 	patchHere(&e, go);
+	uint8_t* clean = aB(&e, NULL);
+	// Not as compiled: jitEnterMiss fills it or finishes the instruction
+	patchHere(&e, miss);
+	aStrX(&e, X21, X19, OFF(cycles));
+	aMov(&e, X1, X0);
+	aMovX(&e, X0, X19);
+	callC(&e, (const void*) jitEnterMiss);
+	aLdrX(&e, X21, X19, OFF(cycles));
+	loadLimit(&e);
+	aBr(&e, X0);
+	patchHere(&e, clean);
 	// Clean: no load in flight and every absorb entry 0
 	aLdr(&e, X0, X19, OFF(cpu.ldReg));
 	aCmpImm(&e, X0, NO_LOAD);
