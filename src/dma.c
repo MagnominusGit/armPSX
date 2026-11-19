@@ -161,7 +161,7 @@ static void maybeStart(struct Psx* p, int channel) {
 	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->doneAt[channel]) {
 		return;
 	}
-	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000) && channel != OTC) {
+	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000)) {
 		return;
 	}
 	run(p, channel);

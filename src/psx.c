@@ -64,9 +64,6 @@ void psxEvents(struct Psx* p) {
 	sioRun(p);
 	cdromRun(p);
 	spuRun(p);
-	if (p->exe && p->cpu.pc == 0x80030000) {
-		psxLoadExe(p, p->exe, p->exeSize);
-	}
 }
 
 void psxRunFrame(struct Psx* p) {
@@ -74,9 +71,6 @@ void psxRunFrame(struct Psx* p) {
 	int64_t limit = p->cycles + CPU_HZ / 10;
 	while (!p->gpu.frameDone && p->cycles < limit) {
 		int64_t until = p->nextEvent;
-		if (p->exe && until > p->cycles + 64) {
-			until = p->cycles + 64;
-		}
 		cpuRun(p, until > p->cycles ? until : p->cycles + 1);
 	}
 	p->frames++;

@@ -69,7 +69,9 @@ static uint32_t fetch(struct Psx* p, uint32_t address) {
 	c->absorbWhich = 0;
 	uint32_t physical = address & 0x1FFFFFFF;
 	if (physical >= 0x800000 && (physical < 0x1FC00000 || physical >= 0x1FC80000)) {
-		return 0;
+		// SPU and DMA registers read back like memory, so code runs from them (ps1-tests code-in-io).
+		p->cycles += 4;
+		return busRead32(p, address);
 	}
 	const uint8_t* memory = physical < 0x800000 ? p->ram + (physical & (RAM_SIZE - 1)) : p->bios + (physical & (BIOS_SIZE - 1));
 	uint32_t instr;
@@ -278,6 +280,10 @@ void cpuRun(struct Psx* p, int64_t until) {
 			psxEvents(p);
 		}
 		uint32_t pc = c->pc;
+		if (__builtin_expect(p->exe != NULL, 0) && pc == 0x80030000) {
+			psxLoadExe(p, p->exe, p->exeSize);
+			continue;
+		}
 		if ((pc & 0x1FFFFFFF) == 0xB0 && c->r[9] == 0x3D) {
 			tty(p, c->r[4]);
 		} else if ((pc & 0x1FFFFFFF) == 0xA0 && c->r[9] == 0x3C) {
@@ -287,6 +293,13 @@ void cpuRun(struct Psx* p, int64_t until) {
 		if (pc & 3) {
 			c->badVaddr = pc;
 			EXCEPTION(EXC_ADEL);
+			continue;
+		}
+		uint32_t physical = pc & 0x1FFFFFFF;
+		if (physical >= 0x800000 && (physical < 0x1FC00000 || physical >= 0x1FC80000) &&
+		    !(physical >= 0x1F801C00 && physical < 0x1F802000) && !(physical >= 0x1F801080 && physical < 0x1F801100)) {
+			// Instruction fetches from anywhere else, the scratchpad included, are bus errors.
+			EXCEPTION(EXC_IBE);
 			continue;
 		}
 		instr = fetch(p, pc);
@@ -549,7 +562,12 @@ void cpuRun(struct Psx* p, int64_t until) {
 			break;
 		case 0x11:
 		case 0x13:
-			EXCEPTION(EXC_CPU);
+			// COP1 and COP3 aren't fitted: nothing happens when they're marked usable.
+			if (!(c->sr & 1u << (28 + (instr >> 26 & 3)))) {
+				EXCEPTION(EXC_CPU);
+			} else {
+				commitLoad(c);
+			}
 			break;
 		case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: {
 			uses(c, rs);
@@ -633,6 +651,10 @@ void cpuRun(struct Psx* p, int64_t until) {
 		}
 		case 0x32: {
 			uses(c, rs);
+			if (!(c->sr & 0x40000000)) {
+				EXCEPTION(EXC_CPU);
+				break;
+			}
 			uint32_t a = s + imm;
 			if (a & 3) {
 				c->badVaddr = a;
@@ -651,6 +673,10 @@ void cpuRun(struct Psx* p, int64_t until) {
 		}
 		case 0x3A: {
 			uses(c, rs);
+			if (!(c->sr & 0x40000000)) {
+				EXCEPTION(EXC_CPU);
+				break;
+			}
 			uint32_t a = s + imm;
 			if (a & 3) {
 				c->badVaddr = a;
@@ -663,7 +689,12 @@ void cpuRun(struct Psx* p, int64_t until) {
 			break;
 		}
 		case 0x30: case 0x31: case 0x33: case 0x38: case 0x39: case 0x3B:
-			EXCEPTION(EXC_CPU);
+			// LWC/SWC for coprocessors 0, 1 and 3: unusable faults, usable does nothing.
+			if (!(c->sr & 1u << (28 + (instr >> 26 & 3)))) {
+				EXCEPTION(EXC_CPU);
+			} else {
+				commitLoad(c);
+			}
 			break;
 		default:
 			EXCEPTION(EXC_RI);

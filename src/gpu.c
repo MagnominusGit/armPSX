@@ -365,11 +365,10 @@ static void setTpage(struct Gpu* g, uint32_t w) {
 	if (!mode != !g->texMode || x != g->texPageX || y != g->texPageY) {
 		invalidateTexCache(g);
 	}
-	if (g->texDisableAllowChange) {
-		bool disable = (w >> 11) & 1;
-		if (disable != g->texDisable) invalidateTexCache(g);
-		g->texDisable = disable;
-	}
+	// Without "allow texture disable" a write clears the bit (ps1-tests gp0-e1 on hardware).
+	bool disable = g->texDisableAllowChange && ((w >> 11) & 1);
+	if (disable != g->texDisable) invalidateTexCache(g);
+	g->texDisable = disable;
 	g->texPageX = x;
 	g->texPageY = y;
 	g->texMode = mode;

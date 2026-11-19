@@ -96,6 +96,19 @@ int main(int argc, char** argv) {
 		}
 	}
 	double secs = (double) (clock() - start) / CLOCKS_PER_SEC;
+	const char* vram = getenv("PSXRUN_VRAM");
+	if (vram) {
+		FILE* f = fopen(vram, "wb");
+		if (f) {
+			fprintf(f, "P6\n1024 512\n255\n");
+			for (int i = 0; i < 1024 * 512; i++) {
+				uint16_t c = p->gpu.vram[i];
+				uint8_t rgb[3] = { (uint8_t) ((c & 31) << 3), (uint8_t) (((c >> 5) & 31) << 3), (uint8_t) (((c >> 10) & 31) << 3) };
+				fwrite(rgb, 1, 3, f);
+			}
+			fclose(f);
+		}
+	}
 	if (wav) {
 		uint32_t riff = wavBytes + 36;
 		fseek(wav, 4, SEEK_SET);
