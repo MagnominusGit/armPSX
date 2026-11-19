@@ -88,7 +88,7 @@ static void gpuListPump(struct Psx* p) {
 			return;
 		}
 		if (!gpuDmaCanWrite(p)) {
-			wait = p->gpu.drawTime < 0 ? (1 - (int64_t) p->gpu.drawTime) / 2 : 32;
+			wait = p->gpu.drawTime < 0 ? (1 - (int64_t) p->gpu.drawTime) / 2 : p->mode == MODE_FAST ? 256 : 32;
 			break;
 		}
 		uint32_t header = ramRead(p, d->listNext);
@@ -230,7 +230,8 @@ static void maybeStart(struct Psx* p, int channel);
 void dmaRun(struct Psx* p) {
 	mdecClock(p, p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT] ? mdecPump : NULL);
 	if (p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT] || mdecBusy(p)) {
-		psxSchedule(p, p->cycles + 128);
+		// (the Fast mode runs the MDEC in longer steps)
+		psxSchedule(p, p->cycles + (p->mode == MODE_FAST ? 1024 : 128));
 	}
 	struct Dma* d = &p->dma;
 	if (d->listActive) {
