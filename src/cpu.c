@@ -246,6 +246,32 @@ static void waitMuldiv(struct Psx* p) {
 	}
 }
 
+// For the recompiler: MFHI/MFLO's wait, and DIV/DIVU's results.
+void cpuJitWaitMuldiv(struct Psx* p) {
+	waitMuldiv(p);
+}
+
+void cpuJitDivide(struct Psx* p, uint32_t s, uint32_t t, int sign) {
+	if (sign) {
+		if (t == 0) {
+			R[32] = s;
+			R[33] = (int32_t) s < 0 ? 1 : 0xFFFFFFFF;
+		} else if (s == 0x80000000 && t == 0xFFFFFFFF) {
+			R[32] = 0;
+			R[33] = 0x80000000;
+		} else {
+			R[32] = (uint32_t) ((int32_t) s % (int32_t) t);
+			R[33] = (uint32_t) ((int32_t) s / (int32_t) t);
+		}
+	} else if (t == 0) {
+		R[32] = s;
+		R[33] = 0xFFFFFFFF;
+	} else {
+		R[32] = s % t;
+		R[33] = s / t;
+	}
+}
+
 static void waitGte(struct Psx* p) {
 	if (p->cycles < p->cpu.gteDone) {
 		p->cycles = p->cpu.gteDone;

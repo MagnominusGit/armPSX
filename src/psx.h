@@ -172,6 +172,8 @@ uint32_t cpuFetch(struct Psx* p, uint32_t address);
 bool cpuIrqPending(struct Psx* p);
 void cpuExecute(struct Psx* p, uint32_t pc, uint32_t instr);
 int cpuJitExecute(struct Psx* p, uint32_t pc, uint32_t instr, int delay);
+void cpuJitWaitMuldiv(struct Psx* p);
+void cpuJitDivide(struct Psx* p, uint32_t s, uint32_t t, int sign);
 bool jitCreate(struct Psx* p);
 void jitFree(struct Psx* p);
 void jitFlush(struct Psx* p);

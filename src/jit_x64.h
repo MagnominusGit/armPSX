@@ -445,6 +445,65 @@ static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 			stCommit(k, pending);
 			xStore(e, 4, GPR(fn == 0x11 ? 32 : 33), RSI);
 			return;
+		case 0x10: case 0x12:
+			// MFHI/MFLO: the commit, then the wait for a multiply or divide (memory has the state)
+			stUses(k, rd);
+			stCommit(k, pending);
+			stFlush(k);
+			xStore(e, 8, P(cycles), R13);
+			xMovRR(e, 8, RDI, RBX);
+			callC(e, (const void*) cpuJitWaitMuldiv);
+			xLoad(e, 8, R13, P(cycles));
+			stAfterWait(k);
+			if (rd) {
+				xLoad(e, 4, RAX, GPR(fn == 0x10 ? 32 : 33));
+				xStore(e, 4, GPR(rd), RAX);
+			}
+			return;
+		case 0x18: case 0x19:
+			// MULT/MULTU: done 7, 10 or 14 cycles on, by the operand's leading bits
+			loadGpr(e, RSI, rs);
+			loadGpr(e, RCX, rt);
+			xMovRR(e, 4, RDI, RSI);
+			if (fn == 0x18) {
+				xMovRR(e, 4, R8, RSI);
+				xShiftI(e, X_SAR, 4, R(R8), 31);
+				xAluRR(e, X_XOR, 4, R(RDI), R8);
+			}
+			xAluI(e, X_OR, 4, R(RDI), 0x400);
+			xBsr(e, 4, RDI, R(RDI));
+			movI(e, R8, 7);
+			xAluI(e, X_CMP, 4, R(RDI), 10);
+			{
+				uint8_t* skip = xJcc(e, CC_BE, NULL);
+				xAluI(e, X_ADD, 4, R(R8), 3);
+				xAluI(e, X_CMP, 4, R(RDI), 19);
+				uint8_t* skip2 = xJcc(e, CC_BE, NULL);
+				xAluI(e, X_ADD, 4, R(R8), 4);
+				patchHere(e, skip);
+				patchHere(e, skip2);
+			}
+			xLea(e, 8, RAX, MI(R13, R8, 1, 0));
+			xStore(e, 8, P(cpu.muldivDone), RAX);
+			xMovRR(e, 4, RAX, RSI);
+			xMulWide(e, 4, R(RCX), fn == 0x18);
+			xStore(e, 4, GPR(32), RDX);
+			xStore(e, 4, GPR(33), RAX);
+			stUses(k, rs); stUses(k, rt);
+			stCommit(k, pending);
+			return;
+		case 0x1A: case 0x1B:
+			// DIV/DIVU: done 37 cycles on
+			loadGpr(e, RSI, rs);
+			loadGpr(e, RDX, rt);
+			xMovRR(e, 8, RDI, RBX);
+			movI(e, RCX, fn == 0x1A);
+			callC(e, (const void*) cpuJitDivide);
+			xLea(e, 8, RAX, M(R13, 37));
+			xStore(e, 8, P(cpu.muldivDone), RAX);
+			stUses(k, rs); stUses(k, rt);
+			stCommit(k, pending);
+			return;
 		case 0x2A: case 0x2B:
 			loadGpr(e, RAX, rs);
 			loadGpr(e, RCX, rt);
@@ -545,6 +604,77 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	movI(e, RCX, target);
 	xCmov(e, cc, 4, RAX, R(RCX));
 	xStore(e, 4, P(cpu.next), RAX);
+}
+
+static void waitGte(struct Emitter* e) {
+	xLoad(e, 8, RAX, P(cpu.gteDone));
+	xAluRR(e, X_CMP, 8, R(R13), RAX);
+	xCmov(e, CC_L, 8, R13, R(RAX));
+}
+
+// LWC2/SWC2: a word between RAM or the scratchpad and a GTE register, when the GTE is usable. LWC2's
+// read is a load's but a cycle shorter (and hides one less) from RAM; both wait for the GTE.
+static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
+	struct Emitter* e = &k->e;
+	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
+	xTestI(e, 4, P(cpu.sr), 0x40000000);
+	slowJump(k, CC_E);
+	address(k, instr, 4);
+	if (op == 0x3A) {
+		xTestI(e, 4, P(cpu.sr), 0x10000);
+		slowJump(k, CC_NE);
+	}
+	uint8_t* scratchSite;
+	ramOffset(k, &scratchSite);
+	if (op == 0x3A) {
+		xAluRR(e, X_ADD, 8, R(RDX), R15);
+		uint8_t* write = xJmp(e, NULL);
+		patchHere(e, scratchSite);
+		xMovRR(e, 4, RDX, RCX);
+		xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+		xAluRR(e, X_ADD, 8, R(RDX), RBX);
+		xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
+		patchHere(e, write);
+		stUses(k, rs);
+		stCommit(k, pending);
+		waitGte(e);
+		// the address across the call
+		xAluI(e, X_SUB, 8, R(RSP), 16);
+		xStore(e, 8, M(RSP, 0), RDX);
+		movI(e, RDI, rt);
+		callC(e, (const void*) GTE_ReadDR);
+		xLoad(e, 8, RDX, M(RSP, 0));
+		xAluI(e, X_ADD, 8, R(RSP), 16);
+		xStore(e, 4, M(RDX, 0), RAX);
+		return;
+	}
+	struct State start = k->st;
+	uint8_t* done = NULL;
+	for (int pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			k->st = start;
+			patchHere(e, scratchSite);
+			xMovRR(e, 4, RDX, RCX);
+			xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+			xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
+		}
+		xLoad(e, 4, RSI, pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0));
+		stUses(k, rs);
+		stCommit(k, pending);
+		int surcharge = stBeginRead(k);
+		if (pass == 0) {
+			if (surcharge < 0) bSurchargeIndirect(k);
+			xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
+			xStoreI(e, 1, P(cpu.ldAbsorb), 4);
+		} else {
+			xStoreI(e, 1, P(cpu.ldAbsorb), 0);
+		}
+		if (pass == 0) done = xJmp(e, NULL);
+	}
+	patchHere(e, done);
+	waitGte(e);
+	movI(e, RDI, rt);
+	callC(e, (const void*) GTE_WriteDR);
 }
 
 // COP2: the GTE's commands and moves, when the GTE is usable (otherwise the interpreter raises the

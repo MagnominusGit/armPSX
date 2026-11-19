@@ -72,6 +72,7 @@ static void stCommit(struct Compile* k, int reg);
 static int stBeginRead(struct Compile* k);
 static void stFlushCycles(struct Compile* k);
 static void stFlush(struct Compile* k);
+static void stAfterWait(struct Compile* k);
 
 static bool special(struct Psx* p, uint32_t pc) {
 	uint32_t phys = pc & 0x1FFFFFFF;
@@ -110,8 +111,9 @@ static int leavesLoad(uint32_t instr) {
 static bool aluInlinable(uint32_t instr) {
 	int op = instr >> 26, fn = instr & 63;
 	if (op == 0) {
-		return fn == 0x00 || fn == 0x02 || fn == 0x03 || fn == 0x04 || fn == 0x06 || fn == 0x07 || fn == 0x11 ||
-		       fn == 0x13 || (fn >= 0x20 && fn <= 0x27) || fn == 0x2A || fn == 0x2B;
+		return fn == 0x00 || fn == 0x02 || fn == 0x03 || fn == 0x04 || fn == 0x06 || fn == 0x07 ||
+		       (fn >= 0x10 && fn <= 0x13) || (fn >= 0x18 && fn <= 0x1B) || (fn >= 0x20 && fn <= 0x27) ||
+		       fn == 0x2A || fn == 0x2B;
 	}
 	return op >= 0x08 && op <= 0x0F;
 }
@@ -128,6 +130,7 @@ static bool inlinable(struct Block* b, int i) {
 	if (op >= 0x20 && op <= 0x25 && op != 0x22) return true;
 	if (op == 0x28 || op == 0x29 || op == 0x2B) return true;
 	if (op == 0x12) return gteInlinable(instr);
+	if (op == 0x32 || op == 0x3A) return true;
 	if (kind(instr) == 2) return b->delay && i == b->count - 2;
 	return aluInlinable(instr);
 }
@@ -135,7 +138,8 @@ static bool inlinable(struct Block* b, int i) {
 // Whether a compiled instruction may leave its fast path for the interpreter.
 static bool fallible(uint32_t instr) {
 	int op = instr >> 26, fn = instr & 63;
-	return (op >= 0x20 && op <= 0x2B) || op == 0x12 || op == 0x08 || (op == 0 && (fn == 0x20 || fn == 0x22));
+	return (op >= 0x20 && op <= 0x2B) || op == 0x12 || op == 0x32 || op == 0x3A || op == 0x08 ||
+	       (op == 0 && (fn == 0x20 || fn == 0x22 || (fn >= 0x10 && fn <= 0x1B)));
 }
 
 // The most cycles from instruction s's start to the start of the next instruction through the
@@ -148,9 +152,10 @@ static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, boo
 	*gte = false;
 	for (int t = s; t < b->count - 1 && inl[t]; t++) {
 		uint32_t instr = b->words[t];
-		int op = instr >> 26;
-		sum += 1 + (op >= 0x20 && op <= 0x25 ? 7 : 0);
-		if (op == 0x12) {
+		int op = instr >> 26, fn = instr & 63;
+		if (op == 0 && (fn == 0x10 || fn == 0x12)) sum += 37;  // the longest multiply or divide
+		sum += 1 + (op >= 0x20 && op <= 0x25 ? 7 : op == 0x32 ? 6 : 0);
+		if (op == 0x12 || op == 0x32 || op == 0x3A) {
 			if (last >= 0) sum += last;
 			else *gte = true;
 			if (instr & 0x02000000) last = j->gteCost[instr & 0x3F];
@@ -262,6 +267,14 @@ static int stBeginRead(struct Compile* k) {
 	return s->fudge >= 0 ? (s->fudge >> 4) & 2 : -1;
 }
 
+// After MFHI/MFLO's wait, which takes from the absorb absorbWhich names while it waits.
+static void stAfterWait(struct Compile* k) {
+	struct State* s = &k->st;
+	for (int i = 0; i < 32; i++) {
+		if (s->absorb[i] > 0) s->absorb[i] = -1;
+	}
+}
+
 static void stFlushCycles(struct Compile* k) {
 	if (k->st.cycles) {
 		bAddCycles(k, k->st.cycles);
@@ -338,6 +351,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			k.slowCount = 0;
 			int op = instr >> 26;
 			if (op >= 0x20 && op <= 0x25) emitLoad(&k, instr, pending);
+			else if (op == 0x32 || op == 0x3A) emitGteMemory(&k, instr, pending);
 			else if (op >= 0x28) emitStore(&k, instr, pending);
 			else if (op == 0x12) emitGte(&k, instr, pending);
 			else if (kind(instr) == 2) emitBranch(&k, a, instr, pending);
@@ -377,9 +391,11 @@ static uint32_t fetchWord(struct Psx* p, uint32_t a) {
 
 // Whether the cache holds the block's words in its line k.
 static bool lineHeld(struct Cpu* c, struct Block* b, int k) {
-	for (int w = 0; w < b->count; w++) {
+	int first = k ? 4 * k - (int) ((b->pc >> 2) & 3) : 0;
+	int last = 4 * (k + 1) - (int) ((b->pc >> 2) & 3);
+	if (last > b->count) last = b->count;
+	for (int w = first; w < last; w++) {
 		uint32_t a = b->pc + 4 * w;
-		if ((a >> 4) - (b->pc >> 4) != (uint32_t) k) continue;
 		if (!cached(c, a) || cachedWord(c, a) != b->words[w]) return false;
 	}
 	return true;
