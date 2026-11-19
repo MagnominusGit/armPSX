@@ -105,7 +105,37 @@ static void savePpm(const char* path) {
 static void sample(int16_t l, int16_t r) {}
 static size_t batch(const int16_t* d, size_t n) { return n; }
 static void poll(void) {}
-static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) { return 0; }
+// LR_PRESS: the same script as psxrun's PSXRUN_PRESS, in PlayStation pad bits.
+static uint16_t held;
+static uint16_t pressed(const char* script, int frame) {
+	uint16_t h = 0;
+	const char* s = script;
+	while (s && *s) {
+		int a = 0, b = 0, c = 0;
+		unsigned mask = 0;
+		if (sscanf(s, "%d/%d@%d:%x", &a, &b, &c, &mask) == 4) {
+			if (frame >= c && (frame - c) % a < b) h |= mask;
+		} else if (sscanf(s, "%d-%d:%x", &a, &b, &mask) == 3) {
+			if (frame >= a && frame <= b) h |= mask;
+		}
+		s = strchr(s, ',');
+		if (s) s++;
+	}
+	return h;
+}
+
+static int16_t input(unsigned port, unsigned device, unsigned index, unsigned id) {
+	static const uint16_t bit[16] = {
+		[RETRO_DEVICE_ID_JOYPAD_SELECT] = 0x0001, [RETRO_DEVICE_ID_JOYPAD_L3] = 0x0002, [RETRO_DEVICE_ID_JOYPAD_R3] = 0x0004,
+		[RETRO_DEVICE_ID_JOYPAD_START] = 0x0008, [RETRO_DEVICE_ID_JOYPAD_UP] = 0x0010, [RETRO_DEVICE_ID_JOYPAD_RIGHT] = 0x0020,
+		[RETRO_DEVICE_ID_JOYPAD_DOWN] = 0x0040, [RETRO_DEVICE_ID_JOYPAD_LEFT] = 0x0080, [RETRO_DEVICE_ID_JOYPAD_L2] = 0x0100,
+		[RETRO_DEVICE_ID_JOYPAD_R2] = 0x0200, [RETRO_DEVICE_ID_JOYPAD_L] = 0x0400, [RETRO_DEVICE_ID_JOYPAD_R] = 0x0800,
+		[RETRO_DEVICE_ID_JOYPAD_X] = 0x1000, [RETRO_DEVICE_ID_JOYPAD_A] = 0x2000, [RETRO_DEVICE_ID_JOYPAD_B] = 0x4000,
+		[RETRO_DEVICE_ID_JOYPAD_Y] = 0x8000,
+	};
+	if (port != 0 || device != RETRO_DEVICE_JOYPAD || id >= 16) return 0;
+	return (held & bit[id]) != 0;
+}
 
 int main(int argc, char** argv) {
 	if (argc < 4) {
@@ -141,6 +171,7 @@ int main(int argc, char** argv) {
 	char list[1024];
 	snprintf(list, sizeof list, ",%s,", getenv("LR_AT") ? getenv("LR_AT") : "");
 	for (frame = 1; frame <= (unsigned) frames; frame++) {
+		held = pressed(getenv("LR_PRESS"), frame);
 		p_retro_run();
 		char key[16];
 		snprintf(key, sizeof key, ",%u,", frame);

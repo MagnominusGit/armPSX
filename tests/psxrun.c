@@ -10,6 +10,26 @@
 #include "disc.h"
 
 // psxrun bios frames [exe]: runs headless; PSXRUN_SHOTS=dir/prefix saves pictures at PSXRUN_AT=frame,frame...
+// PSXRUN_PRESS="from-to:buttons,..." holds pad 1 buttons (hex, pad order: 0x0008 Start, 0x4000 Cross,
+// 0x0010 Up, 0x0040 Down, ...) over those frames; "every/len@from:buttons" repeats from a frame on.
+
+// The buttons held on a frame from PSXRUN_PRESS.
+static uint16_t pressed(const char* script, int frame) {
+	uint16_t held = 0;
+	const char* s = script;
+	while (s && *s) {
+		int a = 0, b = 0, c = 0;
+		unsigned mask = 0;
+		if (sscanf(s, "%d/%d@%d:%x", &a, &b, &c, &mask) == 4) {
+			if (frame >= c && (frame - c) % a < b) held |= mask;
+		} else if (sscanf(s, "%d-%d:%x", &a, &b, &mask) == 3) {
+			if (frame >= a && frame <= b) held |= mask;
+		}
+		s = strchr(s, ',');
+		if (s) s++;
+	}
+	return held;
+}
 
 static void savePpm(struct Psx* p, const char* path) {
 	static uint32_t pixels[576 * 768];
@@ -67,6 +87,7 @@ int main(int argc, char** argv) {
 	clock_t start = clock();
 	int traceAt = getenv("PSXRUN_TRACE_AT") ? atoi(getenv("PSXRUN_TRACE_AT")) : -1;
 	for (int i = 1; i <= frames; i++) {
+		p->sio.pad[0].buttons = pressed(getenv("PSXRUN_PRESS"), i);
 		if (i == traceAt) p->traceIo = getenv("PSXRUN_TRACE_N") ? atoi(getenv("PSXRUN_TRACE_N")) : 200;
 		psxRunFrame(p);
 		int n = spuSamples(audio);
