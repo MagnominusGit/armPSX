@@ -72,7 +72,7 @@ static void profReport(struct Psx* p) {
 		if (k < (1 << 16)) host[k][1]++;
 	}
 	qsort(ops, 64, sizeof ops[0], countDesc);
-	fprintf(stderr, "prof: %d samples, %d in recompiled code\n", n, inJit);
+	fprintf(stderr, "prof: %d samples, %d in recompiled code, profReport at %lx\n", n, inJit, (unsigned long) (uintptr_t) profReport);
 	for (int i = 0; i < 12 && ops[i][1]; i++) fprintf(stderr, "prof op %02x %.1f%%\n", (int) ops[i][0], 100.0 * ops[i][1] / n);
 	qsort(host, hosts, sizeof host[0], countDesc);
 	for (int i = 0; i < hosts; i++) fprintf(stderr, "prof host %lx %lu\n", (unsigned long) host[i][0], (unsigned long) host[i][1]);
