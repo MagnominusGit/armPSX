@@ -93,6 +93,7 @@ struct Compile {
 	struct Jit* j;
 	struct State st;
 	bool fast;
+	bool immediate;
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -493,7 +494,7 @@ static int cancelSame(struct Compile* k, int pending, int rt) {
 
 // The scratchpad's way for a memory instruction, from *site with the state as it is now, back to here.
 static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr, int pending, struct State start) {
-	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start };
+	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start, k->immediate };
 }
 
 // A load from [x23 + x9] (RAM) or [x25 + x9] (the scratchpad, pass 1), then the load in flight as

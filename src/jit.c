@@ -83,6 +83,7 @@ struct Cold {
 	int kind, pending;
 	uint32_t instr;
 	struct State start;
+	bool immediate;
 };
 
 // An instruction's way to the interpreter when its fast path can't do it, compiled after the block's end.
@@ -90,6 +91,7 @@ struct Slow {
 	uint8_t* sites[BLOCK_MAX * 2];
 	int count, i;
 	bool after;
+	bool commit;  // the interpreter leaves the load in flight that the fast path wrote at once
 	struct State before;
 	struct Cold cold;
 	uint8_t* back;
@@ -138,6 +140,16 @@ static int leavesLoad(uint32_t instr) {
 	if ((op >= 0x20 && op <= 0x26)) return rt;
 	if ((op == 0x10 || op == 0x12) && !(instr & 0x02000000) && (rs == 0 || rs == 2)) return rt;
 	return NO_LOAD;
+}
+
+// The Fast mode: whether the block's instruction i, a load, can write its register at once, the
+// next instruction (in the block) not naming it in either register field.
+static bool immediateLoad(struct Block* b, int i) {
+	uint32_t instr = b->words[i];
+	int op = instr >> 26, rt = instr >> 16 & 31;
+	if (!b->fast || op < 0x20 || op > 0x25 || op == 0x22 || i + 1 >= b->count) return false;
+	uint32_t next = b->words[i + 1];
+	return rt != (int) (next >> 21 & 31) && rt != (int) (next >> 16 & 31);
 }
 
 static bool aluInlinable(uint32_t instr) {
@@ -427,6 +439,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			k.slowCount = 0;
 			k.cold.site = NULL;
 			int op = instr >> 26;
+			k.immediate = immediateLoad(b, i);
 			if (op >= 0x20 && op <= 0x25) emitLoad(&k, instr, pending);
 			else if (op == 0x32 || op == 0x3A) emitGteMemory(&k, instr, pending);
 			else if (op >= 0x28) emitStore(&k, instr, pending);
@@ -443,9 +456,11 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 				d->i = i;
 				d->after = after;
 				d->back = bHere(&k);
+				d->commit = k.immediate;
 			}
 		}
-		pending = leavesLoad(instr);
+		pending = k.immediate ? NO_LOAD : leavesLoad(instr);
+		k.immediate = false;
 	}
 	stFlush(&k);
 	struct State atEnd = k.st;
@@ -467,6 +482,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		k.st = d->before;
 		stFlush(&k);
 		bHelper(&k, b->pc + 4 * i, b->words[i], b->delay && i == b->count - 1);
+		if (d->commit) bCommitDynamicFast(&k);
 		if (d->after) {
 			bool gte;
 			int bound = boundFrom(j, b, inl, i + 1, &gte);

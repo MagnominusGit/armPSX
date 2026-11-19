@@ -21,6 +21,7 @@ struct Compile {
 	struct Jit* j;
 	struct State st;
 	bool fast;  // the Fast mode: no timing besides a fixed cost per instruction
+	bool immediate;  // the Fast mode: this load writes its register at once (the next instruction doesn't read it)
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -460,7 +461,7 @@ static int cancelSame(struct Compile* k, int pending, int rt) {
 
 // The scratchpad's way for a memory instruction, from *site with the state as it is now, back to here.
 static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr, int pending, struct State start) {
-	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start };
+	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start, k->immediate };
 }
 
 // A load from [r15 + rdx] (RAM) or [rbx + rdx] (the scratchpad, pass 1), then the load in flight
@@ -475,6 +476,10 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	else xMovzx(e, RSI, width, src);
 	stUses(k, rs);
 	stCommit(k, cancelSame(k, pending, rt));
+	if (k->immediate) {
+		if (rt) xStore(e, 4, GPR(rt), RSI);
+		return;
+	}
 	int surcharge = stBeginRead(k);
 	if (k->fast) {
 	} else if (pass == 0) {
@@ -542,11 +547,13 @@ static void bCold(struct Compile* k, struct Cold* c) {
 	struct Emitter* e = &k->e;
 	patchHere(e, c->site);
 	k->st = c->start;
+	k->immediate = c->immediate;
 	scratchOffset(k);
 	if (c->kind == COLD_STORE) xAluRR(e, X_ADD, 8, R(RDX), RBX);
 	xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 	if (c->kind == COLD_LOAD) loadPass(k, c->instr, c->pending, 1);
 	if (c->kind == COLD_LWC2) lwc2Pass(k, c->instr, c->pending, 1);
+	k->immediate = false;
 	xJmp(e, c->back);
 }
 
