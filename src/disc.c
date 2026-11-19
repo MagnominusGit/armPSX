@@ -27,6 +27,8 @@ struct Track {
 	bool audioMsbFirst;
 };
 
+enum { HUNK_SLOTS = 4 };
+
 struct Disc {
 	struct Track tracks[100];
 	int first, last;
@@ -38,15 +40,17 @@ struct Disc {
 	uint8_t* hunk;
 	uint32_t hunkBytes, hunks;
 	int64_t hunkNumber;
-	// The next hunk, decoded by a thread of its own while the game runs: it owns ahead and the chd
-	// while busy
+	// The last few hunks, and the next one decoded by a thread of its own while the game runs (it
+	// owns the slot it decodes into and the chd while busy)
 	pthread_t thread;
 	pthread_mutex_t lock;
 	pthread_cond_t changed;
 	bool threaded, busy, quit;
-	uint8_t* ahead;
-	int64_t aheadNumber;  // the hunk ahead holds, or -1
-	int64_t want;         // the hunk the thread decodes while busy
+	uint8_t* slots[HUNK_SLOTS];
+	int64_t slotHunk[HUNK_SLOTS];  // the hunk each holds, or -1
+	unsigned slotUsed[HUNK_SLOTS], useClock;
+	int current, busySlot;
+	int64_t want;  // the hunk the thread decodes while busy
 };
 
 static void makeToc(struct Disc* d) {
@@ -89,15 +93,33 @@ static void* readAhead(void* arg) {
 		while (!d->busy && !d->quit) pthread_cond_wait(&d->changed, &d->lock);
 		if (d->quit) break;
 		int64_t hunk = d->want;
+		int slot = d->busySlot;
 		pthread_mutex_unlock(&d->lock);
-		bool ok = chd_read(d->chd, (uint32_t) hunk, d->ahead) == CHDERR_NONE;
+		bool ok = chd_read(d->chd, (uint32_t) hunk, d->slots[slot]) == CHDERR_NONE;
 		pthread_mutex_lock(&d->lock);
-		d->aheadNumber = ok ? hunk : -1;
+		d->slotHunk[slot] = ok ? hunk : -1;
 		d->busy = false;
 		pthread_cond_broadcast(&d->changed);
 	}
 	pthread_mutex_unlock(&d->lock);
 	return NULL;
+}
+
+// The slot holding hunk (not the one being decoded into), or -1.
+static int findSlot(struct Disc* d, int64_t hunk) {
+	for (int i = 0; i < HUNK_SLOTS; i++) {
+		if (d->slotHunk[i] == hunk && !(d->busy && i == d->busySlot)) return i;
+	}
+	return -1;
+}
+
+// The least recently used slot besides the current one.
+static int spareSlot(struct Disc* d) {
+	int best = -1;
+	for (int i = 0; i < HUNK_SLOTS; i++) {
+		if (i != d->current && (best < 0 || d->slotUsed[i] < d->slotUsed[best])) best = i;
+	}
+	return best;
 }
 
 // d->hunk = the hunk (false when it can't be read); the one after it is decoded ahead.
@@ -108,19 +130,21 @@ static bool loadHunk(struct Disc* d, int64_t hunk) {
 		return d->hunkNumber == hunk;
 	}
 	pthread_mutex_lock(&d->lock);
-	while (d->busy) pthread_cond_wait(&d->changed, &d->lock);
-	if (d->aheadNumber == hunk) {
-		uint8_t* t = d->hunk;
-		d->hunk = d->ahead;
-		d->ahead = t;
-		d->aheadNumber = d->hunkNumber;
-		d->hunkNumber = hunk;
-	} else {
-		d->hunkNumber = chd_read(d->chd, (uint32_t) hunk, d->hunk) == CHDERR_NONE ? hunk : -1;
+	while (d->busy && d->want == hunk) pthread_cond_wait(&d->changed, &d->lock);
+	int slot = findSlot(d, hunk);
+	if (slot < 0) {
+		while (d->busy) pthread_cond_wait(&d->changed, &d->lock);
+		slot = spareSlot(d);
+		d->slotHunk[slot] = chd_read(d->chd, (uint32_t) hunk, d->slots[slot]) == CHDERR_NONE ? hunk : -1;
 	}
-	if (d->hunkNumber == hunk && hunk + 1 < d->hunks && d->aheadNumber != hunk + 1) {
+	d->current = slot;
+	d->slotUsed[slot] = ++d->useClock;
+	d->hunk = d->slots[slot];
+	d->hunkNumber = d->slotHunk[slot];
+	if (d->hunkNumber == hunk && hunk + 1 < d->hunks && !d->busy && findSlot(d, hunk + 1) < 0) {
+		d->busySlot = spareSlot(d);
+		d->slotHunk[d->busySlot] = -1;
 		d->want = hunk + 1;
-		d->aheadNumber = -1;
 		d->busy = true;
 		pthread_cond_broadcast(&d->changed);
 	}
@@ -194,11 +218,16 @@ static struct Disc* openChd(const char* path) {
 	d->total = plba;
 	finishIndexes(d);
 	makeToc(d);
-	d->ahead = malloc(d->hunkBytes);
-	d->aheadNumber = -1;
+	bool slots = true;
+	d->slots[0] = d->hunk;
+	for (int i = 0; i < HUNK_SLOTS; i++) {
+		if (i) d->slots[i] = malloc(d->hunkBytes);
+		if (!d->slots[i]) slots = false;
+		d->slotHunk[i] = -1;
+	}
 	pthread_mutex_init(&d->lock, NULL);
 	pthread_cond_init(&d->changed, NULL);
-	d->threaded = d->ahead && pthread_create(&d->thread, NULL, readAhead, d) == 0;
+	d->threaded = slots && pthread_create(&d->thread, NULL, readAhead, d) == 0;
 	return d;
 }
 
@@ -431,8 +460,11 @@ void discClose(struct Disc* d) {
 	}
 	for (int i = 0; i < d->fileCount; i++) fclose(d->files[i]);
 	if (d->chd) chd_close(d->chd);
-	free(d->hunk);
-	free(d->ahead);
+	if (d->chd) {
+		for (int i = 0; i < HUNK_SLOTS; i++) free(d->slots[i]);
+	} else {
+		free(d->hunk);
+	}
 	free(d);
 }
 
