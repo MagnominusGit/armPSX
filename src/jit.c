@@ -71,12 +71,24 @@ struct State {
 
 struct Compile;
 
+// A memory instruction's way to the scratchpad when its address isn't RAM, compiled after the
+// block's end: from site (where the state was start) back to where its RAM path goes on.
+enum { COLD_STORE = 1, COLD_LOAD, COLD_LWC2 };
+struct Cold {
+	uint8_t* site;
+	uint8_t* back;
+	int kind, pending;
+	uint32_t instr;
+	struct State start;
+};
+
 // An instruction's way to the interpreter when its fast path can't do it, compiled after the block's end.
 struct Slow {
 	uint8_t* sites[BLOCK_MAX * 2];
 	int count, i;
 	bool after;
 	struct State before;
+	struct Cold cold;
 	uint8_t* back;
 };
 static void stAbsorbStep(struct Compile* k);
@@ -390,6 +402,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			if (fallible(instr)) stFlushCycles(&k);
 			struct State before = k.st;
 			k.slowCount = 0;
+			k.cold.site = NULL;
 			int op = instr >> 26;
 			if (op >= 0x20 && op <= 0x25) emitLoad(&k, instr, pending);
 			else if (op == 0x32 || op == 0x3A) emitGteMemory(&k, instr, pending);
@@ -397,9 +410,10 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			else if (op == 0x12) emitGte(&k, instr, pending);
 			else if (kind(instr) == 2) emitBranch(&k, a, instr, pending);
 			else emitAlu(&k, instr, pending);
-			if (k.slowCount) {
-				// The slow path, after the block's end
+			if (k.slowCount || k.cold.site) {
+				// The scratchpad and slow paths, after the block's end
 				struct Slow* d = &slow[slowCount++];
+				d->cold = k.cold;
 				memcpy(d->sites, k.slows, k.slowCount * sizeof *k.slows);
 				d->count = k.slowCount;
 				d->before = before;
@@ -425,6 +439,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		int i = d->i;
 		memcpy(k.slows, d->sites, d->count * sizeof *k.slows);
 		k.slowCount = d->count;
+		if (d->cold.site) bCold(&k, &d->cold);
 		bPatchSlows(&k);
 		k.st = d->before;
 		stFlush(&k);

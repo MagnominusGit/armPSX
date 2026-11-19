@@ -93,6 +93,7 @@ struct Compile {
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
+	struct Cold cold;
 	struct { uint8_t* site; uint8_t* cont; int i, k; struct State st; } lines[BLOCK_MAX / 4 + 2];
 	int lineCount;
 };
@@ -476,38 +477,58 @@ static int cancelSame(struct Compile* k, int pending, int rt) {
 	return pending == rt ? 0 : pending;
 }
 
-static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
+// The scratchpad's way for a memory instruction, from *site with the state as it is now, back to here.
+static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr, int pending, struct State start) {
+	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start };
+}
+
+// A load from [x23 + x9] (RAM) or [x25 + x9] (the scratchpad, pass 1), then the load in flight as
+// the interpreter leaves it.
+static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
-	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	static const uint32_t loads[6] = { L_LDRSB, L_LDRSH, 0, L_LDR, L_LDRB, L_LDRH };
+	aLdst(e, loads[op - 0x20], X5, pass == 0 ? X23 : X25, X9, L_UXTW);
+	stUses(k, rs);
+	stCommit(k, cancelSame(k, pending, rt));
+	int surcharge = stBeginRead(k);
+	if (pass == 0) {
+		if (surcharge < 0) bSurchargeIndirect(k);
+		aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + (surcharge > 0 ? surcharge : 0));
+		storeByteI(e, OFF(cpu.ldAbsorb), 5);
+	} else {
+		aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
+	}
+	aStr(e, X5, X19, OFF(cpu.ldValue));
+	storeWordI(e, OFF(cpu.ldReg), rt);
+}
+
+// LWC2's read from RAM or the scratchpad, as loadPass.
+static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
+	struct Emitter* e = &k->e;
+	int rs = instr >> 21 & 31;
+	aLdst(e, L_LDR, X5, pass == 0 ? X23 : X25, X9, L_UXTW);
+	stUses(k, rs);
+	stCommit(k, pending);
+	int surcharge = stBeginRead(k);
+	if (pass == 0) {
+		if (surcharge < 0) bSurchargeIndirect(k);
+		aDpImm(e, A_ADD_IMM | W64, X21, X21, 4 + (surcharge > 0 ? surcharge : 0));
+		storeByteI(e, OFF(cpu.ldAbsorb), 4);
+	} else {
+		aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
+	}
+}
+
+static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
+	int op = instr >> 26;
+	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	address(k, instr, width);
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	struct State start = k->st;
-	uint8_t* done = NULL;
-	for (int pass = 0; pass < 2; pass++) {
-		if (pass == 1) {
-			k->st = start;
-			patchHere(e, otherSite);
-			scratchOffset(k);
-		}
-		aLdst(e, loads[op - 0x20], X5, pass == 0 ? X23 : X25, X9, L_UXTW);
-		stUses(k, rs);
-		stCommit(k, cancelSame(k, pending, rt));
-		int surcharge = stBeginRead(k);
-		if (pass == 0) {
-			if (surcharge < 0) bSurchargeIndirect(k);
-			aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + (surcharge > 0 ? surcharge : 0));
-			storeByteI(e, OFF(cpu.ldAbsorb), 5);
-		} else {
-			aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
-		}
-		aStr(e, X5, X19, OFF(cpu.ldValue));
-		storeWordI(e, OFF(cpu.ldReg), rt);
-		if (pass == 0) done = aB(e, NULL);
-	}
-	patchHere(e, done);
+	loadPass(k, instr, pending, 0);
+	coldHere(k, COLD_LOAD, otherSite, instr, pending, start);
 }
 
 static void emitStore(struct Compile* k, uint32_t instr, int pending) {
@@ -520,11 +541,7 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
-	uint8_t* write = aB(e, NULL);
-	patchHere(e, otherSite);
-	scratchOffset(k);
-	aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
-	patchHere(e, write);
+	coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 	loadGpr(e, X5, rt);
 	stUses(k, rs);
 	stUses(k, rt);
@@ -532,6 +549,18 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	if (width == 4) aStr(e, X5, X11, 0);
 	else if (width == 2) aStrh(e, X5, X11, 0);
 	else aStrb(e, X5, X11, 0);
+}
+
+// The scratchpad's way: the address in x9 and x11 (or the slow path), then back.
+static void bCold(struct Compile* k, struct Cold* c) {
+	struct Emitter* e = &k->e;
+	patchHere(e, c->site);
+	k->st = c->start;
+	scratchOffset(k);
+	if (c->kind == COLD_STORE) aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
+	if (c->kind == COLD_LOAD) loadPass(k, c->instr, c->pending, 1);
+	if (c->kind == COLD_LWC2) lwc2Pass(k, c->instr, c->pending, 1);
+	aB(e, c->back);
 }
 
 static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
@@ -742,11 +771,7 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
 		aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
-		uint8_t* write = aB(e, NULL);
-		patchHere(e, otherSite);
-		scratchOffset(k);
-		aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
-		patchHere(e, write);
+		coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 		stUses(k, rs);
 		stCommit(k, pending);
 		waitGte(e);
@@ -758,27 +783,8 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 		return;
 	}
 	struct State start = k->st;
-	uint8_t* done = NULL;
-	for (int pass = 0; pass < 2; pass++) {
-		if (pass == 1) {
-			k->st = start;
-			patchHere(e, otherSite);
-			scratchOffset(k);
-		}
-		aLdst(e, L_LDR, X5, pass == 0 ? X23 : X25, X9, L_UXTW);
-		stUses(k, rs);
-		stCommit(k, pending);
-		int surcharge = stBeginRead(k);
-		if (pass == 0) {
-			if (surcharge < 0) bSurchargeIndirect(k);
-			aDpImm(e, A_ADD_IMM | W64, X21, X21, 4 + (surcharge > 0 ? surcharge : 0));
-			storeByteI(e, OFF(cpu.ldAbsorb), 4);
-		} else {
-			aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
-		}
-		if (pass == 0) done = aB(e, NULL);
-	}
-	patchHere(e, done);
+	lwc2Pass(k, instr, pending, 0);
+	coldHere(k, COLD_LWC2, otherSite, instr, pending, start);
 	waitGte(e);
 	movI(e, X0, rt);
 	aMov(e, X1, X5);

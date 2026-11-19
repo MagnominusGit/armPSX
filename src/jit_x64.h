@@ -21,6 +21,7 @@ struct Compile {
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
+	struct Cold cold;
 	// Each new line's check, for its way out: where, what follows it, and the state there
 	struct { uint8_t* site; uint8_t* cont; int i, k; struct State st; } lines[BLOCK_MAX / 4 + 2];
 	int lineCount;
@@ -421,43 +422,62 @@ static int cancelSame(struct Compile* k, int pending, int rt) {
 	return pending == rt ? 0 : pending;
 }
 
-// Loads: the address, the fast paths (RAM, the scratchpad), then the load in flight as the
-// interpreter leaves it.
-static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
+// The scratchpad's way for a memory instruction, from *site with the state as it is now, back to here.
+static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr, int pending, struct State start) {
+	k->cold = (struct Cold) { site, k->e.p, kind, pending, instr, start };
+}
+
+// A load from [r15 + rdx] (RAM) or [rbx + rdx] (the scratchpad, pass 1), then the load in flight
+// as the interpreter leaves it.
+static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
+	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
+	struct Opnd src = pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0);
+	if (width == 4) xLoad(e, 4, RSI, src);
+	else if (op == 0x20 || op == 0x21) xMovsx(e, RSI, width, src);
+	else xMovzx(e, RSI, width, src);
+	stUses(k, rs);
+	stCommit(k, cancelSame(k, pending, rt));
+	int surcharge = stBeginRead(k);
+	if (pass == 0) {
+		if (surcharge < 0) bSurchargeIndirect(k);
+		xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
+		xStoreI(e, 1, P(cpu.ldAbsorb), 5);
+	} else {
+		xStoreI(e, 1, P(cpu.ldAbsorb), 0);
+	}
+	xStore(e, 4, P(cpu.ldValue), RSI);
+	xStoreI(e, 4, P(cpu.ldReg), rt);
+}
+
+// LWC2's read from RAM or the scratchpad, as loadPass.
+static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
+	struct Emitter* e = &k->e;
+	int rs = instr >> 21 & 31;
+	xLoad(e, 4, RSI, pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0));
+	stUses(k, rs);
+	stCommit(k, pending);
+	int surcharge = stBeginRead(k);
+	if (pass == 0) {
+		if (surcharge < 0) bSurchargeIndirect(k);
+		xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
+		xStoreI(e, 1, P(cpu.ldAbsorb), 4);
+	} else {
+		xStoreI(e, 1, P(cpu.ldAbsorb), 0);
+	}
+}
+
+// Loads: the address, RAM's fast path here and the scratchpad's after the block.
+static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
+	int op = instr >> 26;
 	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	address(k, instr, width);
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	struct State start = k->st;
-	uint8_t* done = NULL;
-	for (int pass = 0; pass < 2; pass++) {
-		if (pass == 1) {
-			k->st = start;
-			patchHere(e, otherSite);
-			scratchOffset(k);
-			xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
-		}
-		struct Opnd src = pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0);
-		if (width == 4) xLoad(e, 4, RSI, src);
-		else if (op == 0x20 || op == 0x21) xMovsx(e, RSI, width, src);
-		else xMovzx(e, RSI, width, src);
-		stUses(k, rs);
-		stCommit(k, cancelSame(k, pending, rt));
-		int surcharge = stBeginRead(k);
-		if (pass == 0) {
-			if (surcharge < 0) bSurchargeIndirect(k);
-			xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
-			xStoreI(e, 1, P(cpu.ldAbsorb), 5);
-		} else {
-			xStoreI(e, 1, P(cpu.ldAbsorb), 0);
-		}
-		xStore(e, 4, P(cpu.ldValue), RSI);
-		xStoreI(e, 4, P(cpu.ldReg), rt);
-		if (pass == 0) done = xJmp(e, NULL);
-	}
-	patchHere(e, done);
+	loadPass(k, instr, pending, 0);
+	coldHere(k, COLD_LOAD, otherSite, instr, pending, start);
 }
 
 static void emitStore(struct Compile* k, uint32_t instr, int pending) {
@@ -470,17 +490,25 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	xAluRR(e, X_ADD, 8, R(RDX), R15);
-	uint8_t* write = xJmp(e, NULL);
-	patchHere(e, otherSite);
-	scratchOffset(k);
-	xAluRR(e, X_ADD, 8, R(RDX), RBX);
-	xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
-	patchHere(e, write);
+	coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 	loadGpr(e, RSI, rt);
 	stUses(k, rs);
 	stUses(k, rt);
 	stCommit(k, pending);
 	xStore(e, width, M(RDX, 0), RSI);
+}
+
+// The scratchpad's way: the address in rdx (or the slow path), then back.
+static void bCold(struct Compile* k, struct Cold* c) {
+	struct Emitter* e = &k->e;
+	patchHere(e, c->site);
+	k->st = c->start;
+	scratchOffset(k);
+	if (c->kind == COLD_STORE) xAluRR(e, X_ADD, 8, R(RDX), RBX);
+	xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
+	if (c->kind == COLD_LOAD) loadPass(k, c->instr, c->pending, 1);
+	if (c->kind == COLD_LWC2) lwc2Pass(k, c->instr, c->pending, 1);
+	xJmp(e, c->back);
 }
 
 // The ALU: operands first (before the load in flight lands), then the commit and the result.
@@ -694,12 +722,7 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
 		xAluRR(e, X_ADD, 8, R(RDX), R15);
-		uint8_t* write = xJmp(e, NULL);
-		patchHere(e, otherSite);
-		scratchOffset(k);
-		xAluRR(e, X_ADD, 8, R(RDX), RBX);
-		xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
-		patchHere(e, write);
+		coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 		stUses(k, rs);
 		stCommit(k, pending);
 		waitGte(e);
@@ -714,28 +737,8 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 		return;
 	}
 	struct State start = k->st;
-	uint8_t* done = NULL;
-	for (int pass = 0; pass < 2; pass++) {
-		if (pass == 1) {
-			k->st = start;
-			patchHere(e, otherSite);
-			scratchOffset(k);
-			xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
-		}
-		xLoad(e, 4, RSI, pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0));
-		stUses(k, rs);
-		stCommit(k, pending);
-		int surcharge = stBeginRead(k);
-		if (pass == 0) {
-			if (surcharge < 0) bSurchargeIndirect(k);
-			xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
-			xStoreI(e, 1, P(cpu.ldAbsorb), 4);
-		} else {
-			xStoreI(e, 1, P(cpu.ldAbsorb), 0);
-		}
-		if (pass == 0) done = xJmp(e, NULL);
-	}
-	patchHere(e, done);
+	lwc2Pass(k, instr, pending, 0);
+	coldHere(k, COLD_LWC2, otherSite, instr, pending, start);
 	waitGte(e);
 	movI(e, RDI, rt);
 	callC(e, (const void*) GTE_WriteDR);
