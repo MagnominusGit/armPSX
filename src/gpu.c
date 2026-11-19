@@ -236,6 +236,27 @@ static inline void swapVertex(struct GpuVertex* a, struct GpuVertex* b) {
 	*b = t;
 }
 
+// The Fast mode's drawing time for a triangle (sorted by y): its area within the drawing area at the
+// rate drawSpan charges.
+static void roughTriangle(struct Gpu* g, const struct GpuVertex* v, bool gouraud, bool textured, int blend, bool maskEval) {
+	int64_t area2 = (int64_t) (v[1].x - v[0].x) * (v[2].y - v[0].y) - (int64_t) (v[2].x - v[0].x) * (v[1].y - v[0].y);
+	if (area2 < 0) area2 = -area2;
+	int32_t x0 = v[0].x, x1 = v[0].x;
+	for (int i = 1; i < 3; i++) {
+		if (v[i].x < x0) x0 = v[i].x;
+		if (v[i].x > x1) x1 = v[i].x;
+	}
+	int32_t y0 = v[0].y > g->clipY0 ? v[0].y : g->clipY0, y1 = v[2].y < g->clipY1 + 1 ? v[2].y : g->clipY1 + 1;
+	if (x0 < g->clipX0) x0 = g->clipX0;
+	if (x1 > g->clipX1 + 1) x1 = g->clipX1 + 1;
+	if (x1 <= x0 || y1 <= y0) return;
+	int64_t pixels = area2 / 2, box = (int64_t) (x1 - x0) * (y1 - y0);
+	if (pixels > box) pixels = box;
+	if (gouraud || textured) g->drawTime -= (int32_t) (pixels * 2);
+	else if (blend >= 0 || maskEval) g->drawTime -= (int32_t) (pixels + ((pixels + 1) >> 1));
+	else g->drawTime -= (int32_t) pixels;
+}
+
 ALWAYS void drawTriangle(struct Gpu* g, bool draw, struct GpuVertex* v, bool gouraud, bool textured, int blend, bool texMult, int texMode, bool maskEval) {
 	struct Deltas d;
 	unsigned core;
@@ -260,6 +281,10 @@ ALWAYS void drawTriangle(struct Gpu* g, bool draw, struct GpuVertex* v, bool gou
 	}
 	if (v[0].y == v[2].y || v[2].y - v[0].y >= 512) return;
 	if (abs(v[2].x - v[0].x) >= 1024 || abs(v[2].x - v[1].x) >= 1024 || abs(v[1].x - v[0].x) >= 1024) return;
+	if (!draw && g->roughTime) {
+		roughTriangle(g, v, gouraud, textured, blend, maskEval);
+		return;
+	}
 	if (!deltas(&d, &v[0], &v[1], &v[2], gouraud, textured)) return;
 
 	struct Interp ig;
@@ -483,7 +508,7 @@ ALWAYS void drawSprite(struct Gpu* g, bool draw, int32_t x0, int32_t y0, int32_t
 				if (blend >= 0 || maskEval) t += (((xb + 1) & ~1) - (xs & ~1)) >> 1;
 				g->drawTime -= t;
 			}
-			for (int32_t x = xs; x < xb && (draw || textured); x++) {
+			for (int32_t x = xs; x < xb && (draw || (textured && !g->roughTime)); x++) {
 				if (textured) {
 					uint16_t t = texel(g, draw, texMode, ur, v);
 					if (draw && t) {
@@ -1180,6 +1205,7 @@ void gpuReset(struct Psx* p) {
 	timersVblank(p, true);
 	g->frameW = 320;
 	g->frameH = 240;
+	g->roughTime = p->mode == MODE_FAST;
 	startDrawThread(p);
 }
 
