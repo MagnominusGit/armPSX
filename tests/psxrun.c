@@ -55,14 +55,16 @@ static void profReport(struct Psx* p) {
 	int n = profCount, inJit = 0;
 	// guest opcode classes in recompiled code, and host addresses elsewhere (by 64-byte bucket)
 	static uint64_t ops[64][2], host[1 << 16][2];
-	int hosts = 0, guests = 0;
+	int hosts = 0, guests = 0, versions[3] = { 0 };
 	static uint64_t guest[4096][2];
 	for (int i = 0; i < 64; i++) ops[i][0] = i;
 	for (int i = 0; i < n; i++) {
 		uint32_t instr;
-		uint32_t pc = jitDescribe(p, (const void*) profSamples[i], &instr);
+		int version = 0;
+		uint32_t pc = jitDescribe(p, (const void*) profSamples[i], &instr, &version);
 		if (pc) {
 			inJit++;
+			if (pc > 1) versions[version]++;
 			if (pc > 1) {
 				int g;
 				for (g = 0; g < guests && guest[g][0] != pc; g++) {}
@@ -79,6 +81,7 @@ static void profReport(struct Psx* p) {
 		if (k < (1 << 16)) host[k][1]++;
 	}
 	qsort(ops, 64, sizeof ops[0], countDesc);
+	fprintf(stderr, "prof versions: generic %d clean %d careful %d\n", versions[0], versions[1], versions[2]);
 	fprintf(stderr, "prof: %d samples, %d in recompiled code, profReport at %lx\n", n, inJit, (unsigned long) (uintptr_t) profReport);
 	for (int i = 0; i < 12 && ops[i][1]; i++) fprintf(stderr, "prof op %02x %.1f%%\n", (int) ops[i][0], 100.0 * ops[i][1] / n);
 	qsort(guest, guests, sizeof guest[0], countDesc);

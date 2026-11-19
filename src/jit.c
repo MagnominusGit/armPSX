@@ -697,8 +697,9 @@ bool jitRun(struct Psx* p, int64_t until) {
 	return true;
 }
 
-// For profiling: the guest instruction whose code holds address (0 when it isn't a block's).
-uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
+// For profiling: the guest instruction whose code holds address and its block's version (GENERIC,
+// CLEAN or CAREFUL); 0 when it isn't recompiled code, 1 for the shared code.
+uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr, int* version) {
 	struct Jit* j = p->jit;
 	const uint8_t* a = address;
 	if (!j || a < j->arena || a >= j->arena + ARENA_SIZE) return 0;
@@ -709,6 +710,7 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 				int w = 0;
 				while (w + 1 < b->count && a >= b->body[v] + b->at[v][w + 1]) w++;
 				*instr = b->words[w];
+				*version = v;
 				return b->pc + 4 * w;
 			}
 		}
