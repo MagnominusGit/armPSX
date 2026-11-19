@@ -1148,12 +1148,12 @@ void gpuRun(struct Psx* p) {
 		timersRun(p);
 		g->linePhase = (g->linePhase + 1) & 1;
 		if (g->linePhase) {
-			p->hretrace = true;
+			timersHretrace(p, true);
 			g->lineCounter = 200;
 			timersHblank(p);
 			continue;
 		}
-		p->hretrace = false;
+		timersHretrace(p, false);
 		g->lineCounter = g->displayMode & 8 ? 3405 - 200 : 3412 + g->phaseChange - 200;
 		g->scanline = (g->scanline + 1) % g->linesPerField;
 		g->phaseChange = !g->phaseChange;

@@ -110,6 +110,7 @@ struct Sio {
 	int64_t doneAt, dsrAt, dsrUntil;
 	struct Pad pad[2];
 	struct Memcard card[2];
+	uint16_t sio1[3];  // mode, control, baud
 };
 
 struct Disc;
@@ -168,8 +169,8 @@ uint32_t busRead32(struct Psx* p, uint32_t address);
 uint16_t busRead16(struct Psx* p, uint32_t address);
 uint8_t busRead8(struct Psx* p, uint32_t address);
 void busWrite32(struct Psx* p, uint32_t address, uint32_t value);
-void busWrite16(struct Psx* p, uint32_t address, uint16_t value);
-void busWrite8(struct Psx* p, uint32_t address, uint8_t value);
+void busWrite16(struct Psx* p, uint32_t address, uint32_t value);
+void busWrite8(struct Psx* p, uint32_t address, uint32_t value);
 
 // dma.c
 uint32_t dmaRead(struct Psx* p, uint32_t address);
@@ -183,6 +184,7 @@ void timersRun(struct Psx* p);
 void timersHblank(struct Psx* p);
 void timersVblank(struct Psx* p, bool in);
 void timersDots(struct Psx* p, uint32_t dots);
+void timersHretrace(struct Psx* p, bool in);
 
 // gpu.c
 void gpuReset(struct Psx* p);

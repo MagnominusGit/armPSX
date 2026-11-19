@@ -248,7 +248,14 @@ void sioRun(struct Psx* p) {
 uint32_t sioRead(struct Psx* p, uint32_t address, int size) {
 	struct Sio* s = &p->sio;
 	if (address >= 0x1F801050) {
-		return address == 0x1F801054 ? 5 : 0;
+		// SIO1 (the serial port) has nothing on it: its registers just keep what's written.
+		switch (address & 0xE) {
+		case 0x4: return 5;
+		case 0x8: return p->sio.sio1[0] >> (address & 1) * 8;
+		case 0xA: return p->sio.sio1[1] >> (address & 1) * 8;
+		case 0xE: return p->sio.sio1[2] >> (address & 1) * 8;
+		}
+		return 0;
 	}
 	sioRun(p);
 	uint32_t v = 0;
@@ -275,6 +282,11 @@ uint32_t sioRead(struct Psx* p, uint32_t address, int size) {
 void sioWrite(struct Psx* p, uint32_t address, uint32_t value, int size) {
 	struct Sio* s = &p->sio;
 	if (address >= 0x1F801050) {
+		switch (address & 0xE) {
+		case 0x8: p->sio.sio1[0] = value & 0xFF; break;
+		case 0xA: p->sio.sio1[1] = value & 0xFFFF; break;
+		case 0xE: p->sio.sio1[2] = value & 0xFFFF; break;
+		}
 		return;
 	}
 	sioRun(p);

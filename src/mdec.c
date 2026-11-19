@@ -730,7 +730,7 @@ uint32_t MDEC_Read(const int64_t timestamp, uint32_t A)
 
   ret |= ((Command >> 25) & 0xF) << 23;
 
-  // Needs refactoring elsewhere to work right: ret |= ((DecodeWB + 4) % 6) << 16;
+  ret |= ((DecodeWB + 4) % 6) << 16;
 
   ret |= InCounter & 0xFFFF;
  }

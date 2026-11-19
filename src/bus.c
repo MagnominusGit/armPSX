@@ -4,7 +4,9 @@
 #include <string.h>
 #include "psx.h"
 
-// Physical memory map; the CPU's segments mirror it. Wait states per Mednafen.
+// Physical memory map; the CPU's segments mirror it. Wait states per Mednafen. Byte and halfword
+// stores reach I/O registers with the CPU register's whole value, as the I/O bus carries it all
+// (ps1-tests io-access-bitwidth on hardware).
 
 static inline uint32_t physical(uint32_t address) {
 	static const uint32_t mask[8] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x1FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
@@ -59,6 +61,9 @@ static uint32_t ioRead(struct Psx* p, uint32_t a, int size) {
 	}
 	if (a >= 0x1F801100 && a < 0x1F801140) {
 		return timerRead(p, a & ~3u) >> shift;
+	}
+	if (a >= 0x1F802000) {
+		return 0xFFFFFFFF;
 	}
 	return 0;
 }
@@ -191,16 +196,17 @@ void busWrite32(struct Psx* p, uint32_t address, uint32_t value) {
 	}
 }
 
-void busWrite16(struct Psx* p, uint32_t address, uint16_t value) {
+void busWrite16(struct Psx* p, uint32_t address, uint32_t value) {
 	uint32_t a = physical(address);
 	if (a < 0x800000) {
-		memcpy(p->ram + (a & (RAM_SIZE - 1)), &value, 2);
+		uint16_t h = value;
+		memcpy(p->ram + (a & (RAM_SIZE - 1)), &h, 2);
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {
 		ioWrite(p, a, value, 2);
 	}
 }
 
-void busWrite8(struct Psx* p, uint32_t address, uint8_t value) {
+void busWrite8(struct Psx* p, uint32_t address, uint32_t value) {
 	uint32_t a = physical(address);
 	if (a < 0x800000) {
 		p->ram[a & (RAM_SIZE - 1)] = value;

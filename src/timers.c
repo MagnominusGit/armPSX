@@ -118,17 +118,12 @@ void timersHblank(struct Psx* p) {
 	if (p->timer[1].mode & 0x100) {
 		clock(p, 1, 1);
 	}
-	if ((p->timer[0].mode & 7) == 3) {
-		p->timer[0].counter = 0;
-		if (p->timer[0].counter == p->timer[0].target) {
-			match(p, 0);
-		}
-	}
 }
 
-void timersVblank(struct Psx* p, bool in) {
-	struct Timer* t = &p->timer[1];
-	bool was = p->vblank;
+// Timer 0's sync modes follow the hblank the way timer 1's follow the vblank (Mednafen does only the
+// reset mode for timer 0; ps1-tests timers shows the other three on hardware).
+static void syncTo(struct Psx* p, int i, bool was, bool in) {
+	struct Timer* t = &p->timer[i];
 	switch (t->mode & 7) {
 	case 1:
 		t->counting = !in;
@@ -136,14 +131,14 @@ void timersVblank(struct Psx* p, bool in) {
 	case 3:
 		if (was && !in) {
 			t->counter = 0;
-			if (t->counter == t->target) match(p, 1);
+			if (t->counter == t->target) match(p, i);
 		}
 		break;
 	case 5:
 		t->counting = in;
 		if (was && !in) {
 			t->counter = 0;
-			if (t->counter == t->target) match(p, 1);
+			if (t->counter == t->target) match(p, i);
 		}
 		break;
 	case 7:
@@ -154,6 +149,16 @@ void timersVblank(struct Psx* p, bool in) {
 		}
 		break;
 	}
+}
+
+void timersHretrace(struct Psx* p, bool in) {
+	timersRun(p);
+	syncTo(p, 0, p->hretrace, in);
+	p->hretrace = in;
+}
+
+void timersVblank(struct Psx* p, bool in) {
+	syncTo(p, 1, p->vblank, in);
 	p->vblank = in;
 }
 
@@ -196,10 +201,11 @@ void timerWrite(struct Psx* p, uint32_t address, uint32_t value) {
 		t->irqDone = false;
 		t->counter = 0;
 		t->counting = 1;
-		if (i == 1) {
+		if (i < 2) {
+			bool in = i == 0 ? p->hretrace : p->vblank;
 			switch (t->mode & 7) {
-			case 1: t->counting = !p->vblank; break;
-			case 5: t->counting = p->vblank; break;
+			case 1: t->counting = !in; break;
+			case 5: t->counting = in; break;
 			case 7: t->counting = -1; break;
 			}
 		}
