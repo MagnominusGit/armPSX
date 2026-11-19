@@ -30,6 +30,8 @@ struct Cpu {
 	int64_t muldivDone;
 	int64_t gteDone;
 	struct { uint32_t tag, data; } icache[1024];
+	uint32_t icacheGen[256];  // changes of each 4-word line, for the recompiler's blocks
+	uint32_t icacheChanges;
 };
 
 struct Dma {
@@ -142,6 +144,7 @@ struct Psx {
 	uint32_t* pcRing;  // debugging: the last 256 PCs, when set
 	uint32_t pcRingAt, pcStop;
 	uint32_t watch;  // debugging: physical address whose writes are printed (0: none)
+	void* jit;  // the recompiler, when there is one
 	bool pal;
 	char region;  // the disc's: 'A', 'E' or 'I'
 	uint32_t exeEntry;
@@ -164,6 +167,13 @@ bool psxLoadExe(struct Psx* p, const uint8_t* data, size_t size);
 // cpu.c
 void cpuReset(struct Psx* p);
 void cpuRun(struct Psx* p, int64_t until);
+void cpuStep(struct Psx* p);
+void cpuExecute(struct Psx* p, uint32_t pc, uint32_t instr);
+int cpuJitExecute(struct Psx* p, uint32_t pc, uint32_t instr, int delay);
+bool jitCreate(struct Psx* p);
+void jitFree(struct Psx* p);
+void jitFlush(struct Psx* p);
+bool jitRun(struct Psx* p, int64_t until);
 
 // gte.c (Mednafen's)
 void GTE_Init(void);

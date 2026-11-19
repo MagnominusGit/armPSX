@@ -10,6 +10,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+	set(JIT_SOURCE src/jit_x64.c)
+else()
+	set(JIT_SOURCE src/jit_none.c)
+endif()
 add_subdirectory(deps/libchdr EXCLUDE_FROM_ALL)
 
 add_library(armpsx STATIC
@@ -21,6 +27,7 @@ add_library(armpsx STATIC
 	src/gpu.c
 	src/gte.c
 	src/mdec.c
+	${JIT_SOURCE}
 	src/psx.c
 	src/sio.c
 	src/spu.c

@@ -213,6 +213,10 @@ void busWrite32(struct Psx* p, uint32_t address, uint32_t value) {
 			for (int i = 0; i < 1024; i++) {
 				p->cpu.icache[i].tag |= 2;
 			}
+			for (int i = 0; i < 256; i++) {
+				p->cpu.icacheGen[i]++;
+			}
+			p->cpu.icacheChanges++;
 		}
 	}
 }

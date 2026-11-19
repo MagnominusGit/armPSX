@@ -195,6 +195,7 @@ void retro_unload_game(void) {
 	if (!psx) return;
 	discClose(psx->disc);
 	free(psx->exe);
+	jitFree(psx);
 	free(psx);
 	psx = NULL;
 }

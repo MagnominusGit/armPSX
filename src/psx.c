@@ -12,6 +12,10 @@ struct Psx* psxCreate(void) {
 	p->logCd = getenv("PSX_CDLOG") != NULL;
 	p->logDma = getenv("PSX_DMALOG") != NULL;
 	p->logGpu = getenv("PSX_GPULOG") != NULL;
+	const char* jit = getenv("PSX_JIT");
+	if (!jit || strcmp(jit, "0")) {
+		jitCreate(p);
+	}
 	return p;
 }
 
@@ -27,6 +31,7 @@ bool psxLoadBios(struct Psx* p, const char* path) {
 
 void psxReset(struct Psx* p) {
 	cpuReset(p);
+	jitFlush(p);
 	GTE_Power();
 	memset(p->ram, 0, sizeof p->ram);
 	memset(p->scratch, 0, sizeof p->scratch);
