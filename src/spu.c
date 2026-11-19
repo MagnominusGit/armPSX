@@ -82,6 +82,8 @@
 
 #define SPUIRQ_DBG(format, ...) { printf("[SPUIRQDBG] " format " -- Voice 22 CA=0x%06x,LA=0x%06x\n", ## __VA_ARGS__, Voices[22].CurAddr, Voices[22].LoopAddr); }
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "psx.h"
 
@@ -773,7 +775,6 @@ static void RunDecoder(SPU_Voice *voice)
    unsigned test_addr = (voice->CurAddr - 1) & 0x3FFFF;
    if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
    {
-    //SPUIRQ_DBG("SPU IRQ (VDA): 0x%06x", addr);
     IRQAsserted = true;
     spuIrq(IRQAsserted);
    }
@@ -817,7 +818,6 @@ static void RunDecoder(SPU_Voice *voice)
    unsigned test_addr = voice->CurAddr & 0x3FFFF;
    if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
    {
-    //SPUIRQ_DBG("SPU IRQ: 0x%06x", addr);
     IRQAsserted = true;
     spuIrq(IRQAsserted);
    }
@@ -1004,7 +1004,6 @@ static INLINE void CheckIRQAddr(uint32_t addr)
  {
   if(IRQAddr == addr)
   {
-   //SPUIRQ_DBG("SPU IRQ (ALT): 0x%06x", addr);
    IRQAsserted = true;
    spuIrq(IRQAsserted);
   }

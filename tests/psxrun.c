@@ -65,7 +65,9 @@ int main(int argc, char** argv) {
 	if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x44\xac\0\0\x10\xb1\x02\0\x04\0\x10\0data\0\0\0\0", 1, 44, wav);
 	static int16_t audio[4096 * 2];
 	clock_t start = clock();
+	int traceAt = getenv("PSXRUN_TRACE_AT") ? atoi(getenv("PSXRUN_TRACE_AT")) : -1;
 	for (int i = 1; i <= frames; i++) {
+		if (i == traceAt) p->traceIo = getenv("PSXRUN_TRACE_N") ? atoi(getenv("PSXRUN_TRACE_N")) : 200;
 		psxRunFrame(p);
 		int n = spuSamples(audio);
 		if (wav) {

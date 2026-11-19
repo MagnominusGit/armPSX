@@ -133,6 +133,7 @@ struct Psx {
 	struct Sio sio;
 	struct Disc* disc;
 	uint32_t frames;
+	int traceIo;  // I/O accesses still to print
 	bool pal;
 	uint32_t exeEntry;
 	uint8_t* exe;

@@ -1,6 +1,7 @@
 /* Copyright (c) 2026 Magnominus
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
+#include <stdio.h>
 #include <string.h>
 #include "psx.h"
 
@@ -13,7 +14,18 @@ static inline uint32_t physical(uint32_t address) {
 	return address & mask[address >> 29];
 }
 
+static uint32_t ioReadInner(struct Psx* p, uint32_t a, int size);
+
 static uint32_t ioRead(struct Psx* p, uint32_t a, int size) {
+	uint32_t v = ioReadInner(p, a, size);
+	if (p->traceIo > 0) {
+		p->traceIo--;
+		fprintf(stderr, "io r%d %08x = %08x pc %08x\n", size * 8, a, v, p->cpu.pc);
+	}
+	return v;
+}
+
+static uint32_t ioReadInner(struct Psx* p, uint32_t a, int size) {
 	if (p->cycles >= p->nextEvent) {
 		psxEvents(p);
 	}
@@ -69,6 +81,10 @@ static uint32_t ioRead(struct Psx* p, uint32_t a, int size) {
 }
 
 static void ioWrite(struct Psx* p, uint32_t a, uint32_t v, int size) {
+	if (p->traceIo > 0) {
+		p->traceIo--;
+		fprintf(stderr, "io w%d %08x = %08x pc %08x\n", size * 8, a, v, p->cpu.pc);
+	}
 	if (p->cycles >= p->nextEvent) {
 		psxEvents(p);
 	}
@@ -96,9 +112,9 @@ static void ioWrite(struct Psx* p, uint32_t a, uint32_t v, int size) {
 		sioWrite(p, a, v, size);
 	} else if (a >= 0x1F801070 && a < 0x1F801078) {
 		if (a & 4) {
-			p->iMask = (v << (shift & 8)) & 0x7FF;
+			p->iMask = (v << shift) & 0x7FF;
 		} else {
-			p->iStat &= (v << (shift & 8)) | (shift & 8 ? 0xFF : 0xFF00);
+			p->iStat &= v << shift;
 		}
 		if (p->cycles + 1 < p->nextEvent) {
 			p->nextEvent = p->cycles + 1;
