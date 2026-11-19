@@ -34,7 +34,8 @@ add_library(armpsx STATIC
 	src/timers.c
 )
 target_include_directories(armpsx PUBLIC src)
-target_link_libraries(armpsx PUBLIC chdr-static m)
+find_package(Threads REQUIRED)
+target_link_libraries(armpsx PUBLIC chdr-static m Threads::Threads)
 target_compile_options(armpsx PRIVATE -O2)
 # GCC's -O2 cost model won't vectorize the scanline output's 16- to 32-bit widening
 set_source_files_properties(src/gpu.c PROPERTIES COMPILE_OPTIONS $<$<C_COMPILER_ID:GNU>:-fvect-cost-model=dynamic>)

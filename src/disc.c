@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <ctype.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,8 +36,17 @@ struct Disc {
 	int fileCount;
 	chd_file* chd;
 	uint8_t* hunk;
-	uint32_t hunkBytes;
+	uint32_t hunkBytes, hunks;
 	int64_t hunkNumber;
+	// The next hunk, decoded by a thread of its own while the game runs: it owns ahead and the chd
+	// while busy
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t changed;
+	bool threaded, busy, quit;
+	uint8_t* ahead;
+	int64_t aheadNumber;  // the hunk ahead holds, or -1
+	int64_t want;         // the hunk the thread decodes while busy
 };
 
 static void makeToc(struct Disc* d) {
@@ -72,6 +82,52 @@ static void finishIndexes(struct Disc* d) {
 
 // .chd
 
+static void* readAhead(void* arg) {
+	struct Disc* d = arg;
+	pthread_mutex_lock(&d->lock);
+	for (;;) {
+		while (!d->busy && !d->quit) pthread_cond_wait(&d->changed, &d->lock);
+		if (d->quit) break;
+		int64_t hunk = d->want;
+		pthread_mutex_unlock(&d->lock);
+		bool ok = chd_read(d->chd, (uint32_t) hunk, d->ahead) == CHDERR_NONE;
+		pthread_mutex_lock(&d->lock);
+		d->aheadNumber = ok ? hunk : -1;
+		d->busy = false;
+		pthread_cond_broadcast(&d->changed);
+	}
+	pthread_mutex_unlock(&d->lock);
+	return NULL;
+}
+
+// d->hunk = the hunk (false when it can't be read); the one after it is decoded ahead.
+static bool loadHunk(struct Disc* d, int64_t hunk) {
+	if (hunk == d->hunkNumber) return true;
+	if (!d->threaded) {
+		d->hunkNumber = chd_read(d->chd, (uint32_t) hunk, d->hunk) == CHDERR_NONE ? hunk : -1;
+		return d->hunkNumber == hunk;
+	}
+	pthread_mutex_lock(&d->lock);
+	while (d->busy) pthread_cond_wait(&d->changed, &d->lock);
+	if (d->aheadNumber == hunk) {
+		uint8_t* t = d->hunk;
+		d->hunk = d->ahead;
+		d->ahead = t;
+		d->aheadNumber = d->hunkNumber;
+		d->hunkNumber = hunk;
+	} else {
+		d->hunkNumber = chd_read(d->chd, (uint32_t) hunk, d->hunk) == CHDERR_NONE ? hunk : -1;
+	}
+	if (d->hunkNumber == hunk && hunk + 1 < d->hunks && d->aheadNumber != hunk + 1) {
+		d->want = hunk + 1;
+		d->aheadNumber = -1;
+		d->busy = true;
+		pthread_cond_broadcast(&d->changed);
+	}
+	pthread_mutex_unlock(&d->lock);
+	return d->hunkNumber == hunk;
+}
+
 static struct Disc* openChd(const char* path) {
 	chd_file* chd;
 	if (chd_open(path, CHD_OPEN_READ, NULL, &chd) != CHDERR_NONE) {
@@ -80,6 +136,7 @@ static struct Disc* openChd(const char* path) {
 	struct Disc* d = calloc(1, sizeof *d);
 	d->chd = chd;
 	d->hunkBytes = chd_get_header(chd)->hunkbytes;
+	d->hunks = chd_get_header(chd)->totalhunks;
 	d->hunk = malloc(d->hunkBytes);
 	d->hunkNumber = -1;
 	int32_t plba = -150;
@@ -137,6 +194,11 @@ static struct Disc* openChd(const char* path) {
 	d->total = plba;
 	finishIndexes(d);
 	makeToc(d);
+	d->ahead = malloc(d->hunkBytes);
+	d->aheadNumber = -1;
+	pthread_mutex_init(&d->lock, NULL);
+	pthread_cond_init(&d->changed, NULL);
+	d->threaded = d->ahead && pthread_create(&d->thread, NULL, readAhead, d) == 0;
 	return d;
 }
 
@@ -356,9 +418,21 @@ struct Disc* discOpen(const char* path) {
 
 void discClose(struct Disc* d) {
 	if (!d) return;
+	if (d->threaded) {
+		pthread_mutex_lock(&d->lock);
+		d->quit = true;
+		pthread_cond_broadcast(&d->changed);
+		pthread_mutex_unlock(&d->lock);
+		pthread_join(d->thread, NULL);
+	}
+	if (d->chd) {
+		pthread_mutex_destroy(&d->lock);
+		pthread_cond_destroy(&d->changed);
+	}
 	for (int i = 0; i < d->fileCount; i++) fclose(d->files[i]);
 	if (d->chd) chd_close(d->chd);
 	free(d->hunk);
+	free(d->ahead);
 	free(d);
 }
 
@@ -446,14 +520,9 @@ static void readData(struct Disc* d, const struct Track* t, int32_t lba, uint8_t
 	if (d->chd) {
 		int64_t frame = t->fileOffset + sector;
 		uint32_t perHunk = d->hunkBytes / 2448;
-		int64_t hunk = frame / perHunk;
-		if (hunk != d->hunkNumber) {
-			if (chd_read(d->chd, (uint32_t) hunk, d->hunk) != CHDERR_NONE) {
-				memset(buf, 0, 2352);
-				d->hunkNumber = -1;
-				return;
-			}
-			d->hunkNumber = hunk;
+		if (!loadHunk(d, frame / perHunk)) {
+			memset(buf, 0, 2352);
+			return;
 		}
 		const uint8_t* s = d->hunk + (frame % perHunk) * 2448;
 		if (t->format == FORMAT_AUDIO) {
