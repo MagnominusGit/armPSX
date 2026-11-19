@@ -163,24 +163,32 @@ static void bPatchSlows(struct Compile* k) {
 	for (int i = 0; i < k->slowCount; i++) patchHere(&k->e, k->slows[i]);
 }
 
-// On the way in: the block runs only when its instructions up to the next through the
-// interpreter can't reach the limit.
-static void bDecline(struct Compile* k, int bound) {
-	struct Emitter* e = &k->e;
-	xLea(e, 8, RAX, M(R13, bound));
+// rax = the cycle count (or when the GTE is done, if that's later, with gte) plus bound, compared
+// with the limit.
+static void compareBound(struct Emitter* e, int bound, bool gte) {
+	if (gte) {
+		xLoad(e, 8, RAX, P(cpu.gteDone));
+		xAluRR(e, X_CMP, 8, R(RAX), R13);
+		xCmov(e, CC_L, 8, RAX, R(R13));
+		xLea(e, 8, RAX, M(RAX, bound));
+	} else {
+		xLea(e, 8, RAX, M(R13, bound));
+	}
 	xAluRR(e, X_CMP, 8, R(RAX), R14);
-	uint8_t* go = xJcc(e, CC_L, NULL);
-	xStoreI(e, 1, P(jitDeclined), 1);
-	xJmp(e, k->j->leave);
-	patchHere(e, go);
 }
 
-// After an instruction through the interpreter: on only when the next ones can't reach the limit.
-static void bCheck(struct Compile* k, int bound, int next) {
-	struct Emitter* e = &k->e;
-	xLea(e, 8, RAX, M(R13, bound));
-	xAluRR(e, X_CMP, 8, R(RAX), R14);
-	k->stubSites[next] = xJcc(e, CC_GE, NULL);
+// On the way in: the block's careful version takes over when its instructions up to the next through
+// the interpreter could reach the limit.
+static void bDecline(struct Compile* k, int bound, bool gte, uint8_t* careful) {
+	compareBound(&k->e, bound, gte);
+	xJcc(&k->e, CC_GE, careful);
+}
+
+// Before instruction next: the block leaves when the ones up to the next through the interpreter
+// could reach the limit.
+static void bCheck(struct Compile* k, int bound, bool gte, int next) {
+	compareBound(&k->e, bound, gte);
+	k->stubSites[next] = xJcc(&k->e, CC_GE, NULL);
 }
 
 // The instruction through cpuJitExecute (memory holds the state); the block leaves if it has to.

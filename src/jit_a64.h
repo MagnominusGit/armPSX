@@ -5,7 +5,8 @@
 //
 // Registers: x19 = p, x20 = the frame's limit, x21 = p->cycles, x22 = the limit (the next event or
 // the frame's limit, whichever is first), x23 = RAM, x24 = the block table, x25 = the scratchpad,
-// x26 = cpu.absorb. w0-w13 are scratch; calls into C keep x19-x28.
+// x26 = cpu.absorb. w0-w13 are scratch (the state's primitives use w0-w2 only); calls into C keep
+// x19-x28.
 
 #include "a64/emit.h"
 
@@ -77,49 +78,6 @@ static void loadLimit(struct Emitter* e) {
 	aCselX(e, X22, X20, X22, C_GT);
 }
 
-// commitLoad for the load the instruction before left in flight (see jit_x64.h); w0 and w1 only.
-static void commit(struct Emitter* e, int reg) {
-	if (reg == NO_LOAD) {
-		movI(e, X0, NO_LOAD);
-		aStrb(e, X0, X19, OFF(cpu.readFudge));
-		aLdrb(e, X0, X19, OFF(cpu.absorbWhich));
-		aLogicImm(e, A_ORR_IMM, X0, X0, NO_LOAD & 0x1F);
-		aStrb(e, X0, X19, OFF(cpu.absorbWhich));
-		return;
-	}
-	if (reg == DYNAMIC) {
-		aLdr(e, X0, X19, OFF(cpu.ldReg));
-		aLdr(e, X1, X19, OFF(cpu.ldValue));
-		aLdst(e, L_STR, X1, X19, X0, L_UXTW | SCALED);
-		aLdrb(e, X1, X19, OFF(cpu.ldAbsorb));
-		aLdst(e, L_STRB, X1, X26, X0, L_UXTW);
-		aStrb(e, X0, X19, OFF(cpu.readFudge));
-		aLogicImm(e, A_AND_IMM, X0, X0, 0x1F);
-		aLdrb(e, X1, X19, OFF(cpu.absorbWhich));
-		aDp(e, A_ORR, X1, X1, X0, S_LSL, 0);
-		aStrb(e, X1, X19, OFF(cpu.absorbWhich));
-	} else {
-		aLdr(e, X0, X19, OFF(cpu.ldValue));
-		aStr(e, X0, X19, GPR_OFF(reg));
-		aLdrb(e, X0, X19, OFF(cpu.ldAbsorb));
-		aStrb(e, X0, X26, reg);
-		storeByteI(e, OFF(cpu.readFudge), reg);
-		if (reg & 0x1F) {
-			aLdrb(e, X0, X19, OFF(cpu.absorbWhich));
-			logicImm(e, A_ORR_IMM, A_ORR, X0, X0, reg & 0x1F, X1);
-			aStrb(e, X0, X19, OFF(cpu.absorbWhich));
-		}
-	}
-	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
-	aStr(e, ZR, X19, GPR_OFF(0));
-}
-
-static void uses(struct Emitter* e, int reg) {
-	if (reg) {
-		aStrb(e, ZR, X26, reg);
-	}
-}
-
 static void loadGpr(struct Emitter* e, int host, int reg) {
 	if (reg) {
 		aLdr(e, host, X19, GPR_OFF(reg));
@@ -130,14 +88,161 @@ static void loadGpr(struct Emitter* e, int host, int reg) {
 
 struct Compile {
 	struct Emitter e;
-	uint8_t* leave;
-	uint8_t* stubSites[BLOCK_MAX];
+	struct Jit* j;
+	struct State st;
+	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
 };
 
-// The instruction through cpuJitExecute; the block leaves if it has to.
-static void helper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
+// The primitives jit.c's state uses (w0-w2 only).
+
+static void bAddCycles(struct Compile* k, int n) {
+	aDpImm(&k->e, A_ADD_IMM | W64, X21, X21, n);
+}
+
+static void bStoreAbsorb(struct Compile* k, int reg, int v) {
+	if (v) {
+		movI(&k->e, X0, v);
+		aStrb(&k->e, X0, X26, reg);
+	} else {
+		aStrb(&k->e, ZR, X26, reg);
+	}
+}
+
+// The fetch's cycle unless w0's absorb entry still hides some (then one less is hidden).
+static void absorbStepW0(struct Emitter* e) {
+	aLdst(e, L_LDRB, X1, X26, X0, L_UXTW);
+	aCmpImm(e, X1, 0);
+	aCset(e, X2, C_EQ);
+	aDp(e, A_ADD | W64, X21, X21, X2, S_LSL, 0);
+	aDpImm(e, A_SUB_IMM, X1, X1, 1);
+	aDp(e, A_ADD, X1, X1, X2, S_LSL, 0);
+	aLdst(e, L_STRB, X1, X26, X0, L_UXTW);
+}
+
+static void bAbsorbStepAt(struct Compile* k, int reg) {
+	movI(&k->e, X0, reg);
+	absorbStepW0(&k->e);
+}
+
+// w0 = memory's absorbWhich with or ORed in
+static void awIndirect(struct Emitter* e, int or) {
+	aLdrb(e, X0, X19, OFF(cpu.absorbWhich));
+	if (or) logicImm(e, A_ORR_IMM, A_ORR, X0, X0, or, X1);
+}
+
+static void bAbsorbStepIndirect(struct Compile* k, int or) {
+	awIndirect(&k->e, or);
+	absorbStepW0(&k->e);
+}
+
+static void bZeroAbsorbIndirect(struct Compile* k, int or) {
+	awIndirect(&k->e, or);
+	aLdst(&k->e, L_STRB, ZR, X26, X0, L_UXTW);
+}
+
+static void bStoreAw(struct Compile* k, int v) {
+	storeByteI(&k->e, OFF(cpu.absorbWhich), v);
+}
+
+static void bOrAw(struct Compile* k, int or) {
+	awIndirect(&k->e, or);
+	aStrb(&k->e, X0, X19, OFF(cpu.absorbWhich));
+}
+
+static void bStoreFudge(struct Compile* k, int v) {
+	storeByteI(&k->e, OFF(cpu.readFudge), v);
+}
+
+static void bCommitLoad(struct Compile* k, int reg) {
+	struct Emitter* e = &k->e;
+	aLdr(e, X0, X19, OFF(cpu.ldValue));
+	aStr(e, X0, X19, GPR_OFF(reg));
+	aLdrb(e, X0, X19, OFF(cpu.ldAbsorb));
+	aStrb(e, X0, X26, reg);
+	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
+	if (!reg) aStr(e, ZR, X19, GPR_OFF(0));
+}
+
+static void bCommitDynamic(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	aLdr(e, X0, X19, OFF(cpu.ldReg));
+	aLdr(e, X1, X19, OFF(cpu.ldValue));
+	aLdst(e, L_STR, X1, X19, X0, L_UXTW | SCALED);
+	aLdrb(e, X1, X19, OFF(cpu.ldAbsorb));
+	aLdst(e, L_STRB, X1, X26, X0, L_UXTW);
+	aStrb(e, X0, X19, OFF(cpu.readFudge));
+	aLogicImm(e, A_AND_IMM, X0, X0, 0x1F);
+	aLdrb(e, X1, X19, OFF(cpu.absorbWhich));
+	aDp(e, A_ORR, X1, X1, X0, S_LSL, 0);
+	aStrb(e, X1, X19, OFF(cpu.absorbWhich));
+	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
+	aStr(e, ZR, X19, GPR_OFF(0));
+}
+
+static void bSurchargeIndirect(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	aLdrb(e, X0, X19, OFF(cpu.readFudge));
+	aLsrImm(e, X0, X0, 4);
+	aLogicImm(e, A_AND_IMM, X0, X0, 2);
+	aDp(e, A_ADD | W64, X21, X21, X0, S_LSL, 0);
+}
+
+// The block's frame.
+
+static void bBegin(struct Compile* k, struct Jit* j, uint8_t* start, uint8_t* end) {
+	memset(k, 0, sizeof *k);
+	k->e.start = k->e.p = start;
+	k->e.end = end;
+	k->j = j;
+}
+
+static uint8_t* bHere(struct Compile* k) {
+	return k->e.p;
+}
+
+static uint8_t* bJump(struct Compile* k) {
+	return aB(&k->e, NULL);
+}
+
+static void bPatchHere(struct Compile* k, uint8_t* site) {
+	patchHere(&k->e, site);
+}
+
+static void slowAt(struct Compile* k, uint8_t* site) {
+	k->slows[k->slowCount++] = site;
+}
+
+static void bPatchSlows(struct Compile* k) {
+	for (int i = 0; i < k->slowCount; i++) patchHere(&k->e, k->slows[i]);
+}
+
+// x0 = the cycle count (or when the GTE is done, if that's later, with gte) plus bound, compared
+// with the limit.
+static void compareBound(struct Emitter* e, int bound, bool gte) {
+	if (gte) {
+		aLdrX(e, X0, X19, OFF(cpu.gteDone));
+		aCmpX(e, X0, X21);
+		aCselX(e, X0, X21, X0, C_LT);
+		aAddImmX(e, X0, X0, (uint32_t) bound);
+	} else {
+		aAddImmX(e, X0, X21, (uint32_t) bound);
+	}
+	aCmpX(e, X0, X22);
+}
+
+static void bDecline(struct Compile* k, int bound, bool gte, uint8_t* careful) {
+	compareBound(&k->e, bound, gte);
+	aBcond(&k->e, C_GE, careful);
+}
+
+static void bCheck(struct Compile* k, int bound, bool gte, int next) {
+	compareBound(&k->e, bound, gte);
+	k->stubSites[next] = aBcond(&k->e, C_GE, NULL);
+}
+
+static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	struct Emitter* e = &k->e;
 	aStrX(e, X21, X19, OFF(cycles));
 	aMovX(e, X0, X19);
@@ -147,14 +252,49 @@ static void helper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	callC(e, (const void*) cpuJitExecute);
 	aLdrX(e, X21, X19, OFF(cycles));
 	uint8_t* stay = aCbz(e, X0, NULL);
-	aB(e, k->leave);
+	aB(e, k->j->leave);
 	patchHere(e, stay);
 	loadLimit(e);
 }
 
-static void slowAt(struct Compile* k, uint8_t* site) {
-	k->slows[k->slowCount++] = site;
+static void bEnd(struct Compile* k, struct Block* b) {
+	struct Emitter* e = &k->e;
+	if (b->delay) {
+		aLdr(e, X0, X19, OFF(cpu.next));
+		aStr(e, X0, X19, OFF(cpu.pc));
+		aDpImm(e, A_ADD_IMM, X0, X0, 4);
+		aStr(e, X0, X19, OFF(cpu.next));
+	} else {
+		uint32_t endPc = b->pc + 4 * b->count;
+		storeWordI(e, OFF(cpu.pc), endPc);
+		storeWordI(e, OFF(cpu.next), endPc + 4);
+	}
+	aStrb(e, ZR, X19, OFF(cpu.branched));
+	aB(e, k->j->dispatch);
 }
+
+static uint8_t* bFinish(struct Compile* k, struct Block* b) {
+	struct Emitter* e = &k->e;
+	for (int i = 1; i < b->count; i++) {
+		if (!k->stubSites[i]) continue;
+		patchHere(e, k->stubSites[i]);
+		storeWordI(e, OFF(cpu.pc), b->pc + 4 * i);
+		if (b->delay && i == b->count - 1) {
+			storeByteI(e, OFF(cpu.branched), 1);
+		} else {
+			storeWordI(e, OFF(cpu.next), b->pc + 4 * i + 4);
+			aStrb(e, ZR, X19, OFF(cpu.branched));
+		}
+		aB(e, k->j->leave);
+	}
+	return e->p > e->end ? NULL : e->p;
+}
+
+static void flushCode(uint8_t* start, uint8_t* end) {
+	__builtin___clear_cache((char*) start, (char*) end);
+}
+
+// The instructions.
 
 // w9 = the RAM offset of the address in w10, or the slow path when it isn't RAM; the scratchpad is
 // tried first and taken at *scratchSite. w2-w4 are scratch.
@@ -190,8 +330,8 @@ static void address(struct Compile* k, uint32_t instr, int width) {
 	}
 }
 
-// The load in flight's register after "if (c->ldReg == rt) c->ldReg = 0".
-static int cancelSame(struct Emitter* e, int pending, int rt) {
+static int cancelSame(struct Compile* k, int pending, int rt) {
+	struct Emitter* e = &k->e;
 	if (pending == DYNAMIC) {
 		aLdr(e, X0, X19, OFF(cpu.ldReg));
 		aCmpImm(e, X0, rt);
@@ -203,7 +343,7 @@ static int cancelSame(struct Emitter* e, int pending, int rt) {
 	return pending == rt ? 0 : pending;
 }
 
-static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
 	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
@@ -211,29 +351,21 @@ static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending
 	address(k, instr, width);
 	uint8_t* scratchSite;
 	ramOffset(k, &scratchSite);
+	struct State start = k->st;
 	uint8_t* done = NULL;
 	for (int pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
+			k->st = start;
 			patchHere(e, scratchSite);
 			aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
 		}
 		aLdst(e, loads[op - 0x20], X5, pass == 0 ? X23 : X25, X9, L_UXTW);
-		uses(e, rs);
-		int reg = cancelSame(e, pending, rt);
-		commit(e, reg);
-		aLdrb(e, X0, X19, OFF(cpu.absorbWhich));
-		aLdst(e, L_STRB, ZR, X26, X0, L_UXTW);
-		aStrb(e, ZR, X19, OFF(cpu.absorbWhich));
+		stUses(k, rs);
+		stCommit(k, cancelSame(k, pending, rt));
+		int surcharge = stBeginRead(k);
 		if (pass == 0) {
-			if (reg == DYNAMIC) {
-				aLdrb(e, X0, X19, OFF(cpu.readFudge));
-				aLsrImm(e, X0, X0, 4);
-				aLogicImm(e, A_AND_IMM, X0, X0, 2);
-				aDp(e, A_ADD | W64, X21, X21, X0, S_LSL, 0);
-				aDpImm(e, A_ADD_IMM | W64, X21, X21, 5);
-			} else {
-				aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + ((reg >> 4) & 2));
-			}
+			if (surcharge < 0) bSurchargeIndirect(k);
+			aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + (surcharge > 0 ? surcharge : 0));
 			storeByteI(e, OFF(cpu.ldAbsorb), 5);
 		} else {
 			aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
@@ -245,7 +377,7 @@ static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending
 	patchHere(e, done);
 }
 
-static void emitStore(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
 	int width = op == 0x2B ? 4 : op == 0x29 ? 2 : 1;
@@ -261,15 +393,15 @@ static void emitStore(struct Compile* k, uint32_t pc, uint32_t instr, int pendin
 	aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
 	patchHere(e, write);
 	loadGpr(e, X5, rt);
-	uses(e, rs);
-	uses(e, rt);
-	commit(e, pending);
+	stUses(k, rs);
+	stUses(k, rt);
+	stCommit(k, pending);
 	if (width == 4) aStr(e, X5, X11, 0);
 	else if (width == 2) aStrh(e, X5, X11, 0);
 	else aStrb(e, X5, X11, 0);
 }
 
-static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
 	int sa = instr >> 6 & 31, fn = instr & 63;
@@ -284,39 +416,37 @@ static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 			else if (fn == 0) aLslImm(e, X5, X7, sa);
 			else if (fn == 2) aLsrImm(e, X5, X7, sa);
 			else aAsrImm(e, X5, X7, sa);
-			uses(e, rt); uses(e, rd);
+			stUses(k, rt); stUses(k, rd);
 			break;
 		case 0x04: case 0x06: case 0x07:
 			loadGpr(e, X7, rt);
 			loadGpr(e, X6, rs);
 			aDp(e, fn == 4 ? A_LSLV : fn == 6 ? A_LSRV : A_ASRV, X5, X7, X6, S_LSL, 0);
-			uses(e, rs); uses(e, rt); uses(e, rd);
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
 			break;
-		case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: {
+		case 0x11: case 0x13:
+			loadGpr(e, X5, rs);
+			stUses(k, rs);
+			stCommit(k, pending);
+			aStr(e, X5, X19, GPR_OFF(fn == 0x11 ? 32 : 33));
+			return;
+		case 0x2A: case 0x2B:
+			loadGpr(e, X6, rs);
+			loadGpr(e, X7, rt);
+			aCmp(e, X6, X7);
+			aCset(e, X5, fn == 0x2A ? C_LT : C_LO);
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
+			break;
+		default: {
 			loadGpr(e, X6, rs);
 			loadGpr(e, X7, rt);
 			static const uint32_t alu[8] = { A_ADDS, A_ADD, A_SUBS, A_SUB, A_AND, A_ORR, A_EOR, A_ORR };
 			aDp(e, alu[fn & 7], X5, X6, X7, S_LSL, 0);
 			if (fn == 0x20 || fn == 0x22) slowAt(k, aBcond(e, C_VS, NULL));
 			if (fn == 0x27) aMvn(e, X5, X5);
-			uses(e, rs); uses(e, rt); uses(e, rd);
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
 			break;
 		}
-		case 0x2A: case 0x2B:
-			loadGpr(e, X6, rs);
-			loadGpr(e, X7, rt);
-			aCmp(e, X6, X7);
-			aCset(e, X5, fn == 0x2A ? C_LT : C_LO);
-			uses(e, rs); uses(e, rt); uses(e, rd);
-			break;
-		case 0x11: case 0x13:
-			loadGpr(e, X5, rs);
-			uses(e, rs);
-			commit(e, pending);
-			aStr(e, X5, X19, GPR_OFF(fn == 0x11 ? 32 : 33));
-			return true;
-		default:
-			return false;
 		}
 	} else {
 		dst = rt;
@@ -347,19 +477,16 @@ static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 				logicImm(e, imms[op - 0x0C], regs[op - 0x0C], X5, X6, immu, X7);
 			}
 			break;
-		case 0x0F:
-			movI(e, X5, immu << 16);
-			uses(e, rt);
-			goto result;
 		default:
-			return false;
+			movI(e, X5, immu << 16);
+			stUses(k, rt);
+			goto result;
 		}
-		uses(e, rs); uses(e, rt);
+		stUses(k, rs); stUses(k, rt);
 	}
 result:
-	commit(e, pending);
+	stCommit(k, pending);
 	if (dst) aStr(e, X5, X19, GPR_OFF(dst));
-	return true;
 }
 
 static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
@@ -368,28 +495,28 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	uint32_t after = pc + 8, target = pc + 4 + ((uint32_t) (int32_t) (int16_t) instr << 2);
 	uint32_t jump = ((pc + 4) & 0xF0000000) | (instr & 0x3FFFFFF) << 2;
 	if (op == 0x02 || op == 0x03) {
-		if (op == 0x03) uses(e, 31);
-		commit(e, pending);
+		if (op == 0x03) stUses(k, 31);
+		stCommit(k, pending);
 		if (op == 0x03) storeWordI(e, GPR_OFF(31), after);
 		storeWordI(e, OFF(cpu.next), jump);
 		return;
 	}
 	if (op == 0x00) {
 		loadGpr(e, X5, rs);
-		uses(e, rs);
-		uses(e, rd);
-		commit(e, pending);
+		stUses(k, rs);
+		stUses(k, rd);
+		stCommit(k, pending);
 		if ((instr & 63) == 0x09 && rd) storeWordI(e, GPR_OFF(rd), after);
 		aStr(e, X5, X19, OFF(cpu.next));
 		return;
 	}
 	loadGpr(e, X6, rs);
 	if (op == 0x04 || op == 0x05) loadGpr(e, X7, rt);
-	uses(e, rs);
+	stUses(k, rs);
 	bool link = op == 0x01 && (rt & 0x1E) == 0x10;
-	if (op == 0x04 || op == 0x05) uses(e, rt);
-	if (link) uses(e, 31);
-	commit(e, pending);
+	if (op == 0x04 || op == 0x05) stUses(k, rt);
+	if (link) stUses(k, 31);
+	stCommit(k, pending);
 	if (link) storeWordI(e, GPR_OFF(31), after);
 	int cc;
 	if (op == 0x04 || op == 0x05) {
@@ -405,14 +532,13 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	aStr(e, X0, X19, OFF(cpu.next));
 }
 
-static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitGte(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
-	if (!(instr & 0x02000000) && rs != 0 && rs != 2 && rs != 4 && rs != 6) return false;
 	aLdr(e, X0, X19, OFF(cpu.sr));
 	slowAt(k, aTbz(e, X0, 30, NULL));
 	if (instr & 0x02000000) {
-		commit(e, pending);
+		stCommit(k, pending);
 		aLdrX(e, X0, X19, OFF(cpu.gteDone));
 		aCmpX(e, X21, X0);
 		aCselX(e, X21, X0, X21, C_LT);
@@ -421,10 +547,10 @@ static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		aSxtw(e, X0, X0);
 		aDp(e, A_ADD | W64, X0, X0, X21, S_LSL, 0);
 		aStrX(e, X0, X19, OFF(cpu.gteDone));
-		return true;
+		return;
 	}
 	if (rs == 0 || rs == 2) {
-		commit(e, cancelSame(e, pending, rt));
+		stCommit(k, cancelSame(k, pending, rt));
 		aLdrX(e, X0, X19, OFF(cpu.gteDone));
 		aDp(e, A_SUBS | W64, X0, X0, X21, S_LSL, 0);
 		aCselX(e, X0, X0, ZR, C_GT);
@@ -434,102 +560,16 @@ static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		callC(e, (const void*) (rs == 0 ? GTE_ReadDR : GTE_ReadCR));
 		aStr(e, X0, X19, OFF(cpu.ldValue));
 		storeWordI(e, OFF(cpu.ldReg), rt);
-		return true;
+		return;
 	}
 	loadGpr(e, X5, rt);
-	commit(e, pending);
+	stCommit(k, pending);
 	aLdrX(e, X0, X19, OFF(cpu.gteDone));
 	aCmpX(e, X21, X0);
 	aCselX(e, X21, X0, X21, C_LT);
 	movI(e, X0, rd);
 	aMov(e, X1, X5);
 	callC(e, (const void*) (rs == 4 ? GTE_WriteDR : GTE_WriteCR));
-	return true;
-}
-
-static uint8_t* emitBlock(struct Psx* p, struct Jit* j, struct Block* b, uint8_t* start, uint8_t* end) {
-	uint32_t pc = b->pc;
-	struct Compile k = { 0 };
-	struct Emitter* e = &k.e;
-	e->start = e->p = start;
-	e->end = end;
-	uint8_t* entry = e->p;
-	k.leave = j->leave;
-	int pending = DYNAMIC;
-	for (int i = 0; i < b->count; i++) {
-		uint32_t a = pc + 4 * i, instr = b->words[i];
-		bool delay = b->delay && i == b->count - 1;
-		b->at[i] = (uint16_t) (e->p - entry);
-		// The limit, then the cycle the fetch takes unless a load's wait hides it
-		aCmpX(e, X21, X22);
-		k.stubSites[i] = aBcond(e, C_GE, NULL);
-		aLdrb(e, X0, X19, OFF(cpu.absorbWhich));
-		aLdst(e, L_LDRB, X1, X26, X0, L_UXTW);
-		aCmpImm(e, X1, 0);
-		aCset(e, X2, C_EQ);
-		aDp(e, A_ADD | W64, X21, X21, X2, S_LSL, 0);
-		aDpImm(e, A_SUB_IMM, X1, X1, 1);
-		aDp(e, A_ADD, X1, X1, X2, S_LSL, 0);
-		aLdst(e, L_STRB, X1, X26, X0, L_UXTW);
-		int op = instr >> 26;
-		k.slowCount = 0;
-		bool inline_ = false;
-		if (op >= 0x20 && op <= 0x25 && op != 0x22) {
-			emitLoad(&k, a, instr, pending);
-			inline_ = true;
-		} else if (op == 0x28 || op == 0x29 || op == 0x2B) {
-			emitStore(&k, a, instr, pending);
-			inline_ = true;
-		} else if (op == 0x12) {
-			inline_ = emitGte(&k, a, instr, pending);
-		} else if (kind(instr) == 0) {
-			inline_ = emitAlu(&k, a, instr, pending);
-		} else if (b->delay && i == b->count - 2) {
-			emitBranch(&k, a, instr, pending);
-			inline_ = true;
-		}
-		if (inline_) {
-			if (k.slowCount) {
-				uint8_t* over = aB(e, NULL);
-				for (int s = 0; s < k.slowCount; s++) patchHere(e, k.slows[s]);
-				helper(&k, a, instr, delay);
-				patchHere(e, over);
-			}
-		} else {
-			helper(&k, a, instr, delay);
-		}
-		pending = leavesLoad(instr);
-	}
-	// The end of the block: on to the next instruction, or where the branch sent the delay slot
-	if (b->delay) {
-		aLdr(e, X0, X19, OFF(cpu.next));
-		aStr(e, X0, X19, OFF(cpu.pc));
-		aDpImm(e, A_ADD_IMM, X0, X0, 4);
-		aStr(e, X0, X19, OFF(cpu.next));
-	} else {
-		uint32_t endPc = pc + 4 * b->count;
-		storeWordI(e, OFF(cpu.pc), endPc);
-		storeWordI(e, OFF(cpu.next), endPc + 4);
-	}
-	aStrb(e, ZR, X19, OFF(cpu.branched));
-	aB(e, j->dispatch);
-	// Leaving before an instruction when the limit is reached
-	for (int i = 0; i < b->count; i++) {
-		patchHere(e, k.stubSites[i]);
-		storeWordI(e, OFF(cpu.pc), pc + 4 * i);
-		if (b->delay && i == b->count - 1) {
-			storeByteI(e, OFF(cpu.branched), 1);
-		} else {
-			storeWordI(e, OFF(cpu.next), pc + 4 * i + 4);
-			aStrb(e, ZR, X19, OFF(cpu.branched));
-		}
-		aB(e, k.leave);
-	}
-	return e->p > e->end ? NULL : e->p;
-}
-
-static void flushCode(uint8_t* start, uint8_t* end) {
-	__builtin___clear_cache((char*) start, (char*) end);
 }
 
 // The way in, the way out and the dispatcher, as jit_x64.h has them.
@@ -590,7 +630,23 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	aBcond(&e, C_NE, loop);
 	aStr(&e, X4, X2, (unsigned) offsetof(struct Block, checked));
 	patchHere(&e, go);
-	aLdrX(&e, X3, X2, (unsigned) offsetof(struct Block, body));
+	// Clean: no load in flight and every absorb entry 0
+	aLdr(&e, X0, X19, OFF(cpu.ldReg));
+	aCmpImm(&e, X0, NO_LOAD);
+	uint8_t* generic = aBcond(&e, C_NE, NULL);
+	aLdrX(&e, X0, X26, 0);
+	aLdrX(&e, X1, X26, 8);
+	aDp(&e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+	aLdrX(&e, X1, X26, 16);
+	aDp(&e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+	aLdrX(&e, X1, X26, 24);
+	aDp(&e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+	uint8_t* generic2 = aCbnzX(&e, X0, NULL);
+	aLdrX(&e, X3, X2, (unsigned) offsetof(struct Block, body[CLEAN]));
+	aBr(&e, X3);
+	patchHere(&e, generic);
+	patchHere(&e, generic2);
+	aLdrX(&e, X3, X2, (unsigned) offsetof(struct Block, body[GENERIC]));
 	aBr(&e, X3);
 	j->used = (size_t) (e.p - j->arena + 15) & ~(size_t) 15;
 }

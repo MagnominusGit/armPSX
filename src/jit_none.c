@@ -22,3 +22,7 @@ bool jitRun(struct Psx* p, int64_t until) {
 uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 	return 0;
 }
+
+void jitStats(struct Psx* p, uint64_t* out) {
+	for (int i = 0; i < 6; i++) out[i] = 0;
+}

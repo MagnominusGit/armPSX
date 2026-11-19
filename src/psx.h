@@ -145,7 +145,6 @@ struct Psx {
 	uint32_t pcRingAt, pcStop;
 	uint32_t watch;  // debugging: physical address whose writes are printed (0: none)
 	void* jit;  // the recompiler, when there is one
-	bool jitDeclined;  // a block couldn't finish before the limit
 	bool pal;
 	char region;  // the disc's: 'A', 'E' or 'I'
 	uint32_t exeEntry;
@@ -176,6 +175,7 @@ void jitFree(struct Psx* p);
 void jitFlush(struct Psx* p);
 bool jitRun(struct Psx* p, int64_t until);
 uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr);
+void jitStats(struct Psx* p, uint64_t* out);
 
 // gte.c (Mednafen's)
 void GTE_Init(void);

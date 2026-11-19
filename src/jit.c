@@ -15,14 +15,14 @@
 // reads it. The ALU, branches, the GTE and RAM and scratchpad loads and stores run inline; the rest,
 // and every load or store that leaves the fast path, goes through cpuJitExecute.
 //
-// Every block comes twice: one for when no register hides any load time and no load is in flight
-// (most of the time; then all of it is known), one for anything else. The cycle limit is checked
-// once on the way in, against the most the block can take before its next instruction through the
-// interpreter, and again after each such instruction; a block that can't finish in time declines
-// and the interpreter takes those instructions.
+// Every block comes three times: one for when no register hides any load time and no load is in
+// flight (most of the time; then all of it is known), one for anything else, and a careful one
+// that checks the cycle limit before every instruction. The other two check it once on the way in,
+// against the most the block can take before its next instruction through the interpreter, and
+// again after each such instruction; near the limit they hand over to the careful one.
 
 enum { ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE = 1 << 19, NO_LOAD = 34, DYNAMIC = -1 };
-enum { GENERIC, CLEAN };
+enum { GENERIC, CLEAN, CAREFUL };
 
 struct Block {
 	uint32_t pc;
@@ -31,9 +31,9 @@ struct Block {
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
 	uint32_t checked;  // cpu.icacheChanges when its lines were last found unchanged
-	uint8_t* body[2];  // GENERIC, CLEAN
-	uint8_t* end[2];
-	uint16_t at[2][BLOCK_MAX];  // each instruction's code, from body
+	uint8_t* body[3];  // GENERIC, CLEAN, CAREFUL
+	uint8_t* end[3];
+	uint16_t at[3][BLOCK_MAX];  // each instruction's code, from body
 };
 
 struct Jit {
@@ -45,6 +45,8 @@ struct Jit {
 	struct Block** table;
 	struct Block* blocks;
 	int blockCount;
+	uint64_t stats[6];  // entries, declined, compiled, stale, uncached, flushes
+	int8_t gteCost[64];  // each GTE command's cycles
 };
 
 // What the compiler knows of the interpreter's state at a point in a block.
@@ -131,11 +133,25 @@ static bool fallible(uint32_t instr) {
 	return (op >= 0x20 && op <= 0x2B) || op == 0x12 || op == 0x08 || (op == 0 && (fn == 0x20 || fn == 0x22));
 }
 
-// The most cycles a compiled instruction takes: its fetch, a load's (2 more when no load came just
-// before, the bus's 3 and 2 more), the GTE's wait (its longest command is 44).
-static int costOf(uint32_t instr) {
-	int op = instr >> 26;
-	return 1 + (op >= 0x20 && op <= 0x25 ? 7 : 0) + (op == 0x12 ? 44 : 0);
+// The most cycles from instruction s's start to the start of the next instruction through the
+// interpreter (whose own check comes after it), or of the last one: each fetch, each load's (2 more
+// when no load came just before, the bus's 3 and 2 more), and each GTE wait, at most the command
+// before it in the block takes. The first GTE wait is the GTE's own (*gte): the check then starts
+// from when the GTE is done.
+static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, bool* gte) {
+	int sum = 0, last = -1;
+	*gte = false;
+	for (int t = s; t < b->count - 1 && inl[t]; t++) {
+		uint32_t instr = b->words[t];
+		int op = instr >> 26;
+		sum += 1 + (op >= 0x20 && op <= 0x25 ? 7 : 0);
+		if (op == 0x12) {
+			if (last >= 0) sum += last;
+			else *gte = true;
+			if (instr & 0x02000000) last = j->gteCost[instr & 0x3F];
+		}
+	}
+	return sum;
 }
 
 #if defined(__x86_64__)
@@ -262,37 +278,44 @@ static void stFlush(struct Compile* k) {
 	}
 }
 
-// One version of a block's code, from start; NULL when it doesn't fit before end.
+// One version of a block's code, from start; NULL when it doesn't fit before end. The careful one
+// is compiled first: the others hand over to it near the limit.
 static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* start, uint8_t* end) {
 	struct Compile k;
 	bBegin(&k, j, start, end);
 	bool inl[BLOCK_MAX];
-	int bound[BLOCK_MAX + 1];
 	for (int i = 0; i < b->count; i++) {
 		inl[i] = inlinable(b, i);
-	}
-	// bound[i]: the most cycles from instruction i's start to the start of the next instruction
-	// through the interpreter (whose own limit check comes after it), or of the last one
-	bound[b->count] = 0;
-	for (int i = b->count - 1; i >= 0; i--) {
-		bound[i] = !inl[i] || i == b->count - 1 ? 0 : costOf(b->words[i]) + bound[i + 1];
 	}
 	stUnknown(&k.st);
 	if (version == CLEAN) {
 		memset(k.st.absorb, 0, sizeof k.st.absorb);
 	}
-	bDecline(&k, bound[0]);
+	if (version != CAREFUL) {
+		bool gte;
+		int bound = boundFrom(j, b, inl, 0, &gte);
+		bDecline(&k, bound, gte, b->body[CAREFUL]);
+	}
 	int pending = version == CLEAN ? NO_LOAD : DYNAMIC;
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = b->pc + 4 * i, instr = b->words[i];
 		bool delay = b->delay && i == b->count - 1;
+		if (version == CAREFUL && i) {
+			stFlush(&k);
+			bCheck(&k, 0, false, i);
+		}
 		b->at[version][i] = (uint16_t) (bHere(&k) - start);
 		stAbsorbStep(&k);
+		bool after = version != CAREFUL && i + 1 < b->count && !delay;
 		if (!inl[i]) {
 			stFlush(&k);
 			bHelper(&k, a, instr, delay);
 			stUnknown(&k.st);
-			if (i + 1 < b->count && !delay) bCheck(&k, bound[i + 1], i + 1);
+			if (after) {
+				bool gte;
+				int bound = boundFrom(j, b, inl, i + 1, &gte);
+				bCheck(&k, bound, gte, i + 1);
+			}
 		} else {
 			if (fallible(instr)) stFlushCycles(&k);
 			struct State before = k.st;
@@ -313,7 +336,11 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 				stFlush(&k);
 				k.st = fast;
 				bHelper(&k, a, instr, delay);
-				if (i + 1 < b->count && !delay) bCheck(&k, bound[i + 1], i + 1);
+				if (after) {
+					bool gte;
+					int bound = boundFrom(j, b, inl, i + 1, &gte);
+					bCheck(&k, bound, gte, i + 1);
+				}
 				bPatchHere(&k, over);
 			}
 		}
@@ -353,7 +380,9 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		b->gen[i] = c->icacheGen[((pc >> 4) + i) & 255];
 	}
 
-	for (int version = GENERIC; version <= CLEAN; version++) {
+	static const int order[3] = { CAREFUL, GENERIC, CLEAN };
+	for (int o = 0; o < 3; o++) {
+		int version = order[o];
 		uint8_t* start = j->arena + j->used;
 		uint8_t* end = emitBlock(j, b, version, start, j->arena + ARENA_SIZE);
 		if (!end) {
@@ -393,6 +422,12 @@ bool jitCreate(struct Psx* p) {
 	j->arena = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	j->table = calloc(TABLE_SIZE, sizeof *j->table);
 	j->blocks = calloc(BLOCKS_MAX, sizeof *j->blocks);
+	// The GTE's commands take a fixed time each; finding it out here leaves the GTE as psxReset
+	// starts it anyway.
+	for (int i = 0; i < 64; i++) {
+		j->gteCost[i] = (int8_t) GTE_Instruction(0x4A000000 | i);
+	}
+	GTE_Power();
 	if (j->arena != MAP_FAILED && j->table && j->blocks) {
 		emitShared(p, j);
 		flushCode(j->arena, j->arena + j->used);
@@ -423,6 +458,7 @@ void jitFlush(struct Psx* p) {
 	if (!j) return;
 	memset(j->table, 0, TABLE_SIZE * sizeof *j->table);
 	j->blockCount = 0;
+	j->stats[5]++;
 	emitShared(p, j);
 	flushCode(j->arena, j->arena + j->used);
 }
@@ -437,20 +473,27 @@ bool jitRun(struct Psx* p, int64_t until) {
 	struct Block** slot = &j->table[(pc >> 2) & (TABLE_SIZE - 1)];
 	struct Block* b = *slot;
 	if (!b || b->pc != pc) {
-		if (!cached(c, pc)) return false;
+		if (!cached(c, pc)) {
+			j->stats[4]++;
+			return false;
+		}
+		j->stats[2]++;
 		b = compile(p, j, pc);
 		if (!b) return false;
 		*slot = b;
 	} else if (b->checked != c->icacheChanges) {
-		if (!current(c, b)) return false;
+		if (!current(c, b)) {
+			j->stats[3]++;
+			return false;
+		}
 		b->checked = c->icacheChanges;
 	}
 	uint64_t absorb[4];
 	memcpy(absorb, c->absorb, sizeof absorb);
 	bool clean = c->ldReg == NO_LOAD && !(absorb[0] | absorb[1] | absorb[2] | absorb[3]);
-	p->jitDeclined = false;
 	j->enter(p, until, b->body[clean]);
-	return !p->jitDeclined;
+	j->stats[0]++;
+	return true;
 }
 
 // For profiling: the guest instruction whose code holds address (0 when it isn't a block's).
@@ -460,7 +503,7 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 	if (!j || a < j->arena || a >= j->arena + ARENA_SIZE) return 0;
 	for (int i = 0; i < j->blockCount; i++) {
 		struct Block* b = &j->blocks[i];
-		for (int v = 0; v < 2; v++) {
+		for (int v = 0; v < 3; v++) {
 			if (a >= b->body[v] && a < b->end[v]) {
 				int w = 0;
 				while (w + 1 < b->count && a >= b->body[v] + b->at[v][w + 1]) w++;
@@ -471,4 +514,10 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 	}
 	*instr = 0;
 	return 1;
+}
+
+// For psxrun: what the recompiler did.
+void jitStats(struct Psx* p, uint64_t* out) {
+	struct Jit* j = p->jit;
+	for (int i = 0; i < 6; i++) out[i] = j ? j->stats[i] : 0;
 }

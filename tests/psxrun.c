@@ -215,6 +215,12 @@ int main(int argc, char** argv) {
 		fclose(wav);
 	}
 	if (getenv("PSXRUN_PROF")) profReport(p);
+	if (getenv("PSXRUN_JITSTATS")) {
+		uint64_t s[6];
+		jitStats(p, s);
+		fprintf(stderr, "jit: %llu entries, %llu declined, %llu compiled, %llu stale, %llu uncached, %llu flushes\n",
+			(unsigned long long) s[0], (unsigned long long) s[1], (unsigned long long) s[2], (unsigned long long) s[3], (unsigned long long) s[4], (unsigned long long) s[5]);
+	}
 	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
 	if (getenv("PSXRUN_STATE")) {
 		fprintf(stderr, "sr %08x cause %08x epc %08x istat %03x imask %03x dicr %08x\n", p->cpu.sr, p->cpu.cause, p->cpu.epc, p->iStat, p->iMask, p->dma.dicr);
