@@ -165,6 +165,8 @@ int main(int argc, char** argv) {
 	if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x44\xac\0\0\x10\xb1\x02\0\x04\0\x10\0data\0\0\0\0", 1, 44, wav);
 	static int16_t audio[4096 * 2];
 	clock_t start = clock();
+	struct timespec wallStart;
+	clock_gettime(CLOCK_MONOTONIC, &wallStart);
 	if (getenv("PSXRUN_WATCH")) p->watch = strtoul(getenv("PSXRUN_WATCH"), NULL, 16);
 	if (getenv("PSXRUN_PCSTOP")) {
 		p->pcRing = calloc(256, 4);
@@ -204,7 +206,10 @@ int main(int argc, char** argv) {
 			}
 		}
 	}
-	double secs = (double) (clock() - start) / CLOCKS_PER_SEC;
+	double cpu = (double) (clock() - start) / CLOCKS_PER_SEC;
+	struct timespec wallEnd;
+	clock_gettime(CLOCK_MONOTONIC, &wallEnd);
+	double secs = (double) (wallEnd.tv_sec - wallStart.tv_sec) + (wallEnd.tv_nsec - wallStart.tv_nsec) / 1e9;
 	const char* vram = getenv("PSXRUN_VRAM");
 	if (vram) {
 		FILE* f = fopen(vram, "wb");
@@ -234,7 +239,7 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "jit: %llu entries, %llu declined, %llu compiled, %llu stale, %llu uncached, %llu flushes\n",
 			(unsigned long long) s[0], (unsigned long long) s[1], (unsigned long long) s[2], (unsigned long long) s[3], (unsigned long long) s[4], (unsigned long long) s[5]);
 	}
-	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
+	fprintf(stderr, "%d frames in %.2f s (%.1f fps), %.2f s CPU, pc %08x\n", frames, secs, frames / secs, cpu, p->cpu.pc);
 	if (getenv("PSXRUN_STATE")) {
 		fprintf(stderr, "sr %08x cause %08x epc %08x istat %03x imask %03x dicr %08x\n", p->cpu.sr, p->cpu.cause, p->cpu.epc, p->iStat, p->iMask, p->dma.dicr);
 		fprintf(stderr, "gpu inCommand %d code %08x fifo %d drawTime %d dmaControl %u fifo0 %08x rw %u,%u %ux%u cur %u,%u\n", p->gpu.inCommand, p->gpu.inCommandCode, p->gpu.fifoCount, p->gpu.drawTime, p->gpu.dmaControl, p->gpu.fifo[p->gpu.fifoRead & 31], p->gpu.rwX, p->gpu.rwY, p->gpu.rwW, p->gpu.rwH, p->gpu.rwCurX, p->gpu.rwCurY);
