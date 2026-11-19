@@ -95,6 +95,11 @@ static uint32_t fetch(struct Psx* p, uint32_t address) {
 	return c->icache[line + first].data;
 }
 
+// The fetch the interpreter does, for the recompiler: a miss fills the line and takes its cycles.
+uint32_t cpuFetch(struct Psx* p, uint32_t address) {
+	return fetch(p, address);
+}
+
 static void isolatedWrite(struct Psx* p, uint32_t address, uint32_t value) {
 	struct Cpu* c = &p->cpu;
 	if (!(c->biu & 0x800)) {
@@ -220,6 +225,10 @@ static inline bool irqPending(struct Psx* p) {
 	uint32_t cause = (c->cause & ~0x400u) | ((p->iStat & p->iMask) ? 0x400 : 0);
 	c->cause = cause;
 	return (c->sr & 1) && (c->sr & cause & 0xFF00);
+}
+
+bool cpuIrqPending(struct Psx* p) {
+	return irqPending(p);
 }
 
 // MFHI/MFLO waiting on a multiply or divide; the wait's cycles still use up hidden load time.

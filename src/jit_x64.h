@@ -21,6 +21,9 @@ struct Compile {
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
+	// Each new line's check, for its way out: where, what follows it, and the state there
+	struct { uint8_t* site; uint8_t* cont; int i, k; struct State st; } lines[BLOCK_MAX / 4 + 2];
+	int lineCount;
 };
 
 static void movI(struct Emitter* e, int reg, uint32_t v) {
@@ -191,6 +194,22 @@ static void bCheck(struct Compile* k, int bound, bool gte, int next) {
 	k->stubSites[next] = xJcc(&k->e, CC_GE, NULL);
 }
 
+// Before instruction i, the first of the block's line k: on while the line's generation is the one
+// it was last found as compiled at.
+static void bLineCheck(struct Compile* k, struct Block* b, int line, int i) {
+	struct Emitter* e = &k->e;
+	uint32_t pc = b->pc + 4 * i;
+	xLoad(e, 4, RAX, P(cpu.icacheGen[(pc >> 4) & 255]));
+	xMovI64(e, RCX, (uint64_t) (uintptr_t) &b->gen[line]);
+	xAluRM(e, X_CMP, 4, RAX, M(RCX, 0));
+	k->lines[k->lineCount].site = xJcc(e, CC_NE, NULL);
+	k->lines[k->lineCount].cont = e->p;
+	k->lines[k->lineCount].i = i;
+	k->lines[k->lineCount].k = line;
+	k->lines[k->lineCount].st = k->st;
+	k->lineCount++;
+}
+
 // The instruction through cpuJitExecute (memory holds the state); the block leaves if it has to.
 static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	struct Emitter* e = &k->e;
@@ -225,9 +244,37 @@ static void bEnd(struct Compile* k, struct Block* b) {
 	xJmp(e, k->j->dispatch);
 }
 
-// Leaving before instruction i near the limit (memory holds the state there).
+// Leaving before instruction i near the limit (memory holds the state there), and each new line's
+// way out when its check fails: memory gets the state, then jitLineMiss says where to go on.
 static uint8_t* bFinish(struct Compile* k, struct Block* b) {
 	struct Emitter* e = &k->e;
+	for (int l = 0; l < k->lineCount; l++) {
+		int i = k->lines[l].i;
+		uint32_t pc = b->pc + 4 * i;
+		patchHere(e, k->lines[l].site);
+		struct State keep = k->st;
+		k->st = k->lines[l].st;
+		stFlush(k);
+		k->st = keep;
+		xStoreI(e, 4, P(cpu.pc), pc);
+		if (b->delay && i == b->count - 1) {
+			xStoreI(e, 1, P(cpu.branched), 1);
+		} else {
+			xStoreI(e, 4, P(cpu.next), pc + 4);
+			xStoreI(e, 1, P(cpu.branched), 0);
+		}
+		xStore(e, 8, P(cycles), R13);
+		xMovRR(e, 8, RDI, RBX);
+		xMovI64(e, RSI, (uint64_t) (uintptr_t) b);
+		movI(e, RDX, k->lines[l].k);
+		movI(e, RCX, i);
+		callC(e, (const void*) jitLineMiss);
+		xLoad(e, 8, R13, P(cycles));
+		loadLimit(e);
+		xAluI(e, X_CMP, 8, R(RAX), 1);
+		xJcc(e, CC_E, k->lines[l].cont);
+		xJmpR(e, RAX);
+	}
 	for (int i = 1; i < b->count; i++) {
 		if (!k->stubSites[i]) continue;
 		patchHere(e, k->stubSites[i]);
@@ -238,6 +285,13 @@ static uint8_t* bFinish(struct Compile* k, struct Block* b) {
 		} else {
 			xStoreI(e, 4, P(cpu.next), b->pc + 4 * i + 4);
 			xStoreI(e, 1, P(cpu.branched), 0);
+			// to go on from here
+			xMovI64(e, RAX, (uint64_t) (uintptr_t) &k->j->resumeBlock);
+			xMovI64(e, RCX, (uint64_t) (uintptr_t) b);
+			xStore(e, 8, M(RAX, 0), RCX);
+			xStoreI(e, 4, M(RAX, (int32_t) (offsetof(struct Jit, resumeIndex) - offsetof(struct Jit, resumeBlock))), i);
+			xLoad(e, 4, RCX, P(cpu.icacheChanges));
+			xStore(e, 4, M(RAX, (int32_t) (offsetof(struct Jit, resumeChanges) - offsetof(struct Jit, resumeBlock))), RCX);
 		}
 		xJmp(e, k->j->leave);
 	}
@@ -569,25 +623,29 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	xJcc(&e, CC_E, j->leave);
 	xAluRM(&e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct Block, pc)));
 	xJcc(&e, CC_NE, j->leave);
-	xLoad(&e, 4, RAX, P(cpu.icacheChanges));
-	xAluRM(&e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct Block, checked)));
+	xLoad(&e, 4, RSI, P(cpu.icacheChanges));
+	xAluRM(&e, X_CMP, 4, RSI, M(RDX, (int32_t) offsetof(struct Block, checked)));
 	uint8_t* go = xJcc(&e, CC_E, NULL);
-	// The cache changed since: the block's own lines decide
-	xLoad(&e, 4, RCX, M(RDX, (int32_t) offsetof(struct Block, pc)));
+	// The cache changed since: the block's first line decides
+	xMovRR(&e, 4, RCX, RAX);
 	xShiftI(&e, X_SHR, 4, R(RCX), 4);
-	xLoad(&e, 4, RSI, M(RDX, (int32_t) offsetof(struct Block, lines)));
-	xLea(&e, 8, RDI, M(RDX, (int32_t) offsetof(struct Block, gen)));
-	uint8_t* loop = e.p;
-	xMovzx(&e, R8, 1, R(RCX));
-	xLoad(&e, 4, R8, MI(RBX, R8, 4, (int32_t) offsetof(struct Psx, cpu.icacheGen)));
-	xAluRM(&e, X_CMP, 4, R8, M(RDI, 0));
-	xJcc(&e, CC_NE, j->leave);
-	xAluI(&e, X_ADD, 8, R(RDI), 4);
-	xAluI(&e, X_ADD, 4, R(RCX), 1);
-	xAluI(&e, X_SUB, 4, R(RSI), 1);
-	xJcc(&e, CC_NE, loop);
-	xStore(&e, 4, M(RDX, (int32_t) offsetof(struct Block, checked)), RAX);
+	xMovzx(&e, RCX, 1, R(RCX));
+	xLoad(&e, 4, R8, MI(RBX, RCX, 4, (int32_t) offsetof(struct Psx, cpu.icacheGen)));
+	xAluRM(&e, X_CMP, 4, R8, M(RDX, (int32_t) offsetof(struct Block, gen)));
+	uint8_t* miss = xJcc(&e, CC_NE, NULL);
+	xStore(&e, 4, M(RDX, (int32_t) offsetof(struct Block, checked)), RSI);
 	patchHere(&e, go);
+	uint8_t* clean = xJmp(&e, NULL);
+	// Not as compiled: jitEnterMiss fills it or finishes the instruction
+	patchHere(&e, miss);
+	xStore(&e, 8, P(cycles), R13);
+	xMovRR(&e, 8, RDI, RBX);
+	xMovRR(&e, 4, RSI, RAX);
+	callC(&e, (const void*) jitEnterMiss);
+	xLoad(&e, 8, R13, P(cycles));
+	loadLimit(&e);
+	xJmpR(&e, RAX);
+	patchHere(&e, clean);
 	// Clean: no load in flight and every absorb entry 0
 	xAluI(&e, X_CMP, 4, P(cpu.ldReg), NO_LOAD);
 	uint8_t* generic = xJcc(&e, CC_NE, NULL);

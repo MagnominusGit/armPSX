@@ -47,6 +47,11 @@ struct Jit {
 	int blockCount;
 	uint64_t stats[6];  // entries, declined, compiled, stale, uncached, flushes
 	int8_t gteCost[64];  // each GTE command's cycles
+	// Where a block last left near the limit: it goes on from there in its careful version, so the
+	// places it stops at don't each get a block of their own
+	struct Block* resumeBlock;
+	int32_t resumeIndex;
+	uint32_t resumeChanges;
 };
 
 // What the compiler knows of the interpreter's state at a point in a block.
@@ -153,6 +158,9 @@ static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, boo
 	}
 	return sum;
 }
+
+static uint8_t* jitEnterMiss(struct Psx* p, uint32_t pc);
+static uint8_t* jitLineMiss(struct Psx* p, struct Block* b, int k, int i);
 
 #if defined(__x86_64__)
 #include "jit_x64.h"
@@ -301,8 +309,16 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		uint32_t a = b->pc + 4 * i, instr = b->words[i];
 		bool delay = b->delay && i == b->count - 1;
 		if (version == CAREFUL && i) {
+			// Memory has everything before each instruction, and the code assumes nothing: a line
+			// that missed goes on here, after its fill
 			stFlush(&k);
+			stUnknown(&k.st);
 			bCheck(&k, 0, false, i);
+		}
+		if (i && !(a & 0xF)) {
+			// A new cache line: on while it's as last checked
+			stFlushCycles(&k);
+			bLineCheck(&k, b, (a >> 4) - (b->pc >> 4), i);
 		}
 		b->at[version][i] = (uint16_t) (bHere(&k) - start);
 		stAbsorbStep(&k);
@@ -351,9 +367,39 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	return bFinish(&k, b);
 }
 
-static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
+// What a fetch at a runs: the cache's word when it holds it, otherwise memory's, which a fill brings in.
+static uint32_t fetchWord(struct Psx* p, uint32_t a) {
+	if (cached(&p->cpu, a)) return cachedWord(&p->cpu, a);
+	uint32_t phys = a & 0x1FFFFFFF, w;
+	memcpy(&w, phys < 0x800000 ? p->ram + (phys & (RAM_SIZE - 1)) : p->bios + (phys & (BIOS_SIZE - 1)), 4);
+	return w;
+}
+
+// Whether the cache holds the block's words in its line k.
+static bool lineHeld(struct Cpu* c, struct Block* b, int k) {
+	for (int w = 0; w < b->count; w++) {
+		uint32_t a = b->pc + 4 * w;
+		if ((a >> 4) - (b->pc >> 4) != (uint32_t) k) continue;
+		if (!cached(c, a) || cachedWord(c, a) != b->words[w]) return false;
+	}
+	return true;
+}
+
+// Whether the block's line k is as compiled (its generation brought up to date when it is).
+static bool lineCurrent(struct Cpu* c, struct Block* b, int k) {
+	uint32_t gen = c->icacheGen[((b->pc >> 4) + k) & 255];
+	if (gen == b->gen[k]) return true;
+	if (!lineHeld(c, b, k)) return false;
+	b->gen[k] = gen;
+	return true;
+}
+
+// A block compiled into the arena; NULL when it doesn't fit and flushing isn't allowed (the
+// recompiled code is running).
+static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, bool mayFlush) {
 	struct Cpu* c = &p->cpu;
 	if (j->blockCount == BLOCKS_MAX || j->used + 64 * 1024 > ARENA_SIZE) {
+		if (!mayFlush) return NULL;
 		jitFlush(p);
 	}
 	struct Block* b = &j->blocks[j->blockCount];
@@ -361,14 +407,14 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	b->count = 0;
 	b->delay = false;
 	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {
-		if (!fetchable(a) || !cached(c, a) || (a != pc && special(p, a))) break;
-		uint32_t instr = cachedWord(c, a);
+		if (!fetchable(a) || (a != pc && special(p, a))) break;
+		uint32_t instr = fetchWord(p, a);
 		b->words[b->count++] = instr;
 		if (kind(instr) == 2) {
-			// The delay slot comes along when the cache holds it and it isn't a branch too.
+			// The delay slot comes along unless it's a branch too.
 			uint32_t d = a + 4;
-			if (fetchable(d) && cached(c, d) && !special(p, d) && kind(cachedWord(c, d)) != 2) {
-				b->words[b->count++] = cachedWord(c, d);
+			if (fetchable(d) && !special(p, d) && kind(fetchWord(p, d)) != 2) {
+				b->words[b->count++] = fetchWord(p, d);
 				b->delay = true;
 			}
 			break;
@@ -377,7 +423,8 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	if (!b->count) return NULL;
 	b->lines = ((pc + 4 * b->count - 4) >> 4) - (pc >> 4) + 1;
 	for (int i = 0; i < b->lines; i++) {
-		b->gen[i] = c->icacheGen[((pc >> 4) + i) & 255];
+		// A line the cache doesn't hold as the block has it yet gets a generation that can't match
+		b->gen[i] = c->icacheGen[((pc >> 4) + i) & 255] - !lineHeld(c, b, i);
 	}
 
 	static const int order[3] = { CAREFUL, GENERIC, CLEAN };
@@ -386,7 +433,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		uint8_t* start = j->arena + j->used;
 		uint8_t* end = emitBlock(j, b, version, start, j->arena + ARENA_SIZE);
 		if (!end) {
-			jitFlush(p);
+			if (mayFlush) jitFlush(p);
 			return NULL;
 		}
 		flushCode(start, end);
@@ -394,26 +441,63 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		b->body[version] = start;
 		b->end[version] = end;
 	}
-	b->checked = c->icacheChanges;
+	// Checked only when the cache holds its first line as compiled
+	b->checked = c->icacheChanges - !lineHeld(c, b, 0);
 	j->blockCount++;
 	return b;
 }
 
-// Whether the block's lines still hold what it was compiled from.
-static bool current(struct Cpu* c, struct Block* b) {
-	for (int i = 0; i < b->lines; i++) {
-		if (c->icacheGen[((b->pc >> 4) + i) & 255] != b->gen[i]) {
-			for (int w = 0; w < b->count; w++) {
-				uint32_t a = b->pc + 4 * w;
-				if (!cached(c, a) || cachedWord(c, a) != b->words[w]) return false;
-			}
-			for (int l = 0; l < b->lines; l++) {
-				b->gen[l] = c->icacheGen[((b->pc >> 4) + l) & 255];
-			}
-			return true;
+static uint8_t* enterAt(struct Psx* p, struct Jit* j, uint32_t pc);
+
+// The dispatcher's way into a block whose first line changed: see enterAt.
+static uint8_t* jitEnterMiss(struct Psx* p, uint32_t pc) {
+	return enterAt(p, p->jit, pc);
+}
+
+// A block's line k, from its instruction i on, isn't as its last check found it (memory holds the
+// state, the limit check passed): on (1) when the cache still holds what the block was compiled
+// from; otherwise instruction i's fetch fills the line as the interpreter's would, and the block goes
+// on from there in its careful version, or the interpreter finishes the instruction when the cache
+// now holds other code.
+static uint8_t* jitLineMiss(struct Psx* p, struct Block* b, int k, int i) {
+	struct Cpu* c = &p->cpu;
+	struct Jit* j = p->jit;
+	if (lineCurrent(c, b, k)) return (uint8_t*) 1;
+	uint32_t pc = b->pc + 4 * i;
+	if (!cached(c, pc)) cpuFetch(p, pc);
+	if (lineCurrent(c, b, k)) return b->body[CAREFUL] + b->at[CAREFUL][i];
+	cpuStep(p);
+	return cpuIrqPending(p) ? j->leave : j->dispatch;
+}
+
+static bool cleanState(struct Cpu* c) {
+	uint64_t absorb[4];
+	memcpy(absorb, c->absorb, sizeof absorb);
+	return c->ldReg == NO_LOAD && !(absorb[0] | absorb[1] | absorb[2] | absorb[3]);
+}
+
+// Where the recompiled code goes on at the start of the instruction at pc (memory holds the state,
+// the limit check passed): the instruction's fetch fills its line if it misses, as the interpreter's
+// would; then the block from pc runs if the cache holds its first line as compiled, or else the
+// interpreter finishes the instruction (its fetch now hits) and the dispatcher goes on. Nothing
+// else runs between the fetch and the instruction. A delay slot is the interpreter's.
+static uint8_t* enterAt(struct Psx* p, struct Jit* j, uint32_t pc) {
+	struct Cpu* c = &p->cpu;
+	if (!c->branched) {
+		if (!cached(c, pc)) cpuFetch(p, pc);
+		struct Block** slot = &j->table[(pc >> 2) & (TABLE_SIZE - 1)];
+		struct Block* b = *slot;
+		if (!b || b->pc != pc || (b->checked != c->icacheChanges && !lineCurrent(c, b, 0))) {
+			struct Block* n = compileBlock(p, j, pc, false);
+			if (n) *slot = b = n;
+		}
+		if (b && b->pc == pc && (b->checked == c->icacheChanges || lineCurrent(c, b, 0))) {
+			b->checked = c->icacheChanges;
+			return b->body[cleanState(c)];
 		}
 	}
-	return true;
+	cpuStep(p);
+	return cpuIrqPending(p) ? j->leave : j->dispatch;
 }
 
 bool jitCreate(struct Psx* p) {
@@ -458,6 +542,7 @@ void jitFlush(struct Psx* p) {
 	if (!j) return;
 	memset(j->table, 0, TABLE_SIZE * sizeof *j->table);
 	j->blockCount = 0;
+	j->resumeBlock = NULL;
 	j->stats[5]++;
 	emitShared(p, j);
 	flushCode(j->arena, j->arena + j->used);
@@ -470,29 +555,33 @@ bool jitRun(struct Psx* p, int64_t until) {
 	if (p->watch || p->pcRing || !(c->biu & 0x800) || !fetchable(pc) || special(p, pc)) {
 		return false;
 	}
+	struct Block* r = j->resumeBlock;
+	j->resumeBlock = NULL;
+	// (its line's check comes after the limit's, so the line still has to be as compiled)
+	if (r && pc == r->pc + 4 * (uint32_t) j->resumeIndex && c->icacheChanges == j->resumeChanges &&
+	    lineCurrent(c, r, (pc >> 4) - (r->pc >> 4))) {
+		j->stats[0]++;
+		j->enter(p, until, r->body[CAREFUL] + r->at[CAREFUL][j->resumeIndex]);
+		return true;
+	}
 	struct Block** slot = &j->table[(pc >> 2) & (TABLE_SIZE - 1)];
 	struct Block* b = *slot;
 	if (!b || b->pc != pc) {
-		if (!cached(c, pc)) {
-			j->stats[4]++;
-			return false;
-		}
-		j->stats[2]++;
-		b = compile(p, j, pc);
+		b = compileBlock(p, j, pc, true);
 		if (!b) return false;
 		*slot = b;
-	} else if (b->checked != c->icacheChanges) {
-		if (!current(c, b)) {
-			j->stats[3]++;
-			return false;
-		}
-		b->checked = c->icacheChanges;
+		j->stats[2]++;
 	}
-	uint64_t absorb[4];
-	memcpy(absorb, c->absorb, sizeof absorb);
-	bool clean = c->ldReg == NO_LOAD && !(absorb[0] | absorb[1] | absorb[2] | absorb[3]);
-	j->enter(p, until, b->body[clean]);
 	j->stats[0]++;
+	if (b->checked == c->icacheChanges || lineCurrent(c, b, 0)) {
+		b->checked = c->icacheChanges;
+		j->enter(p, until, b->body[cleanState(c)]);
+	} else {
+		// The first line isn't as compiled: a fill, or new code
+		j->stats[3]++;
+		uint8_t* to = enterAt(p, j, pc);
+		if (to != j->dispatch && to != j->leave) j->enter(p, until, to);
+	}
 	return true;
 }
 

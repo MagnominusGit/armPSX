@@ -168,6 +168,8 @@ bool psxLoadExe(struct Psx* p, const uint8_t* data, size_t size);
 void cpuReset(struct Psx* p);
 void cpuRun(struct Psx* p, int64_t until);
 void cpuStep(struct Psx* p);
+uint32_t cpuFetch(struct Psx* p, uint32_t address);
+bool cpuIrqPending(struct Psx* p);
 void cpuExecute(struct Psx* p, uint32_t pc, uint32_t instr);
 int cpuJitExecute(struct Psx* p, uint32_t pc, uint32_t instr, int delay);
 bool jitCreate(struct Psx* p);
