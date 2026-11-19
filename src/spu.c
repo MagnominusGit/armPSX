@@ -1356,8 +1356,11 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
    //
    int l, r;
 
-   if(Noise_Mode & (1 << voice_num))
-    voice_pvs = (int16_t)LFSR;
+   // (A silent envelope makes the sample 0 whatever the interpolation gives.)
+   if(!(int16_t)voice->ADSR.EnvLevel)
+    voice_pvs = 0;
+   else if(Noise_Mode & (1 << voice_num))
+    voice_pvs = ((int16_t)LFSR * (int16_t)voice->ADSR.EnvLevel) >> 15;
    else
    {
     const int si = voice->DecodeReadPos;
@@ -1367,9 +1370,8 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 	         (voice->DecodeBuffer[(si + 1) & 0x1F] * FIR_Table[pi][1]) +
 	         (voice->DecodeBuffer[(si + 2) & 0x1F] * FIR_Table[pi][2]) +   
  	         (voice->DecodeBuffer[(si + 3) & 0x1F] * FIR_Table[pi][3])) >> 15;
+    voice_pvs = (voice_pvs * (int16_t)voice->ADSR.EnvLevel) >> 15;
    }
-
-   voice_pvs = (voice_pvs * (int16_t)voice->ADSR.EnvLevel) >> 15;
    voice->PreLRSample = voice_pvs;
 
    if(voice_num == 1 || voice_num == 3)
