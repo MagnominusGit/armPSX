@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #define ALWAYS static inline __attribute__((always_inline))
 
@@ -63,6 +66,8 @@ ALWAYS void plot(struct Gpu* g, int blend, bool maskEval, bool textured, uint32_
 		*dest = (textured ? fore : (fore & 0x7FFF)) | g->maskSet;
 	}
 }
+
+static const int8_t ditherTable[4][4] = { { -4, 0, -3, 1 }, { 2, -2, 3, -1 }, { -3, 1, -4, 0 }, { 3, -1, 2, -2 } };
 
 ALWAYS uint16_t modTexel(struct Gpu* g, uint16_t texel, int32_t r, int32_t gr, int32_t b, int dx, int dy) {
 	uint16_t out = texel & 0x8000;
@@ -193,6 +198,62 @@ ALWAYS void addDy(struct Interp* i, const struct Deltas* d, uint32_t n, bool gou
 	if (gouraud) { i->r += d->drdy * n; i->g += d->dgdy * n; i->b += d->dbdy * n; }
 }
 
+#if defined(__SSE2__)
+// Opaque, shaded texture spans 8 pixels at a time: the texels one by one, then modTexel and plot's
+// write for all 8 in vector registers (the same results). A channel's ((t & mask) * c) >> n is
+// ((t >> shift) & 31) * c >> 4, which fits 16 bits.
+ALWAYS __m128i shadeChannel(__m128i t, __m128i c, __m128i off) {
+	__m128i v = _mm_srli_epi16(_mm_mullo_epi16(_mm_and_si128(t, _mm_set1_epi16(31)), c), 4);
+	v = _mm_srai_epi16(_mm_add_epi16(v, off), 3);
+	return _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), _mm_set1_epi16(31));
+}
+
+ALWAYS void spanVector(struct Gpu* g, int y, int32_t x, int32_t w, struct Interp ig, const struct Deltas* d, bool gouraud,
+                       int texMode, bool maskEval) {
+	uint16_t* dest = &g->vram[(y & 511) * 1024 + x];
+	__m128i offsets[4];
+	for (int phase = 0; phase < 4; phase++) {
+		int16_t o[8];
+		for (int k = 0; k < 8; k++) o[k] = g->dither ? ditherTable[y & 3][(phase + k) & 3] : 0;
+		offsets[phase] = _mm_loadu_si128((const __m128i*) o);
+	}
+	const __m128i top = _mm_set1_epi16((short) 0x8000), set = _mm_set1_epi16((short) g->maskSet);
+	int32_t i = 0;
+	for (; i + 8 <= w; i += 8) {
+		uint16_t t[8], cr[8], cg[8], cb[8];
+		for (int k = 0; k < 8; k++) {
+			t[k] = texel(g, true, texMode, ig.u >> (COORD_FBS + COORD_POST_PADDING), ig.v >> (COORD_FBS + COORD_POST_PADDING));
+			cr[k] = (uint16_t) (ig.r >> (COORD_FBS + COORD_POST_PADDING));
+			cg[k] = (uint16_t) (ig.g >> (COORD_FBS + COORD_POST_PADDING));
+			cb[k] = (uint16_t) (ig.b >> (COORD_FBS + COORD_POST_PADDING));
+			addDx(&ig, d, 1, gouraud, true);
+		}
+		__m128i tex = _mm_loadu_si128((const __m128i*) t);
+		__m128i off = offsets[(x + i) & 3];
+		__m128i c0 = shadeChannel(tex, _mm_loadu_si128((const __m128i*) cr), off);
+		__m128i c1 = shadeChannel(_mm_srli_epi16(tex, 5), _mm_loadu_si128((const __m128i*) cg), off);
+		__m128i c2 = shadeChannel(_mm_srli_epi16(tex, 10), _mm_loadu_si128((const __m128i*) cb), off);
+		__m128i out = _mm_or_si128(_mm_and_si128(tex, top), _mm_or_si128(c0, _mm_or_si128(_mm_slli_epi16(c1, 5), _mm_slli_epi16(c2, 10))));
+		out = _mm_or_si128(out, set);
+		__m128i bg = _mm_loadu_si128((const __m128i*) (dest + i));
+		__m128i skip = _mm_cmpeq_epi16(tex, _mm_setzero_si128());
+		if (maskEval) skip = _mm_or_si128(skip, _mm_srai_epi16(bg, 15));
+		_mm_storeu_si128((__m128i*) (dest + i), _mm_or_si128(_mm_andnot_si128(skip, out), _mm_and_si128(skip, bg)));
+	}
+	for (; i < w; i++) {
+		uint16_t t = texel(g, true, texMode, ig.u >> (COORD_FBS + COORD_POST_PADDING), ig.v >> (COORD_FBS + COORD_POST_PADDING));
+		if (t) {
+			int dx = (x + i) & 3, dy = y & 3;
+			if (!g->dither) { dx = 3; dy = 2; }
+			t = modTexel(g, t, ig.r >> (COORD_FBS + COORD_POST_PADDING), ig.g >> (COORD_FBS + COORD_POST_PADDING),
+			             ig.b >> (COORD_FBS + COORD_POST_PADDING), dx, dy);
+			plot(g, -1, maskEval, true, (uint32_t) (x + i), (uint32_t) y, t);
+		}
+		addDx(&ig, d, 1, gouraud, true);
+	}
+}
+#endif
+
 ALWAYS void drawSpan(struct Gpu* g, bool draw, int y, int32_t xStart, int32_t xBound, struct Interp ig, const struct Deltas* d,
                      bool gouraud, bool textured, int blend, bool texMult, int texMode, bool maskEval) {
 	if (lineSkip(g, y)) return;
@@ -212,6 +273,12 @@ ALWAYS void drawSpan(struct Gpu* g, bool draw, int y, int32_t xStart, int32_t xB
 	else if (blend >= 0 || maskEval) g->drawTime -= w + ((w + 1) >> 1);
 	else g->drawTime -= w;
 	if (!draw && !textured) return;
+#if defined(__SSE2__)
+	if (draw && textured && texMult && blend < 0 && w >= 8) {
+		spanVector(g, y, x, w, ig, d, gouraud, texMode, maskEval);
+		return;
+	}
+#endif
 	do {
 		uint32_t r = ig.r >> (COORD_FBS + COORD_POST_PADDING);
 		uint32_t gg = ig.g >> (COORD_FBS + COORD_POST_PADDING);
@@ -1244,7 +1311,6 @@ static void startDrawThread(struct Psx* p) {
 
 void gpuReset(struct Psx* p) {
 	struct Gpu* g = &p->gpu;
-	static const int8_t ditherTable[4][4] = { { -4, 0, -3, 1 }, { 2, -2, 3, -1 }, { -3, 1, -4, 0 }, { 3, -1, 2, -2 } };
 	for (int y = 0; y < 4; y++) {
 		for (int x = 0; x < 4; x++) {
 			for (int v = 0; v < 512; v++) {
