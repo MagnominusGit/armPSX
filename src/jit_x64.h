@@ -4,7 +4,8 @@
 // The x86-64 backend of jit.c.
 //
 // Registers: rbx = p, rbp = the frame's limit, r13 = p->cycles, r14 = the limit (the next event or
-// the frame's limit, whichever is first), r12 = the block table, r15 = RAM.
+// the frame's limit, whichever is first), r12 = the block table, r15 = RAM. rax, rcx, rdx, rsi, rdi
+// and r8 are scratch.
 
 #include "x64/emit.h"
 
@@ -12,6 +13,15 @@
 #define GPR(i) M(RBX, (int32_t) (offsetof(struct Psx, cpu.r) + 4 * (i)))
 #define ABSORB(i) M(RBX, (int32_t) (offsetof(struct Psx, cpu.absorb) + (i)))
 #define ABSORB_AT(reg) MI(RBX, reg, 1, (int32_t) offsetof(struct Psx, cpu.absorb))
+
+struct Compile {
+	struct Emitter e;
+	struct Jit* j;
+	struct State st;
+	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
+	uint8_t* slows[BLOCK_MAX * 2];
+	int slowCount;
+};
 
 static void movI(struct Emitter* e, int reg, uint32_t v) {
 	xMovIKeepFlags(e, reg, v);
@@ -29,43 +39,6 @@ static void loadLimit(struct Emitter* e) {
 	xCmov(e, CC_G, 8, R14, R(RBP));
 }
 
-// commitLoad for the load the instruction before left in flight: reg is its register, NO_LOAD for
-// none, DYNAMIC when it isn't known here (the block's first instruction).
-static void commit(struct Emitter* e, int reg) {
-	if (reg == NO_LOAD) {
-		xStoreI(e, 1, P(cpu.readFudge), NO_LOAD);
-		xAluI(e, X_OR, 1, P(cpu.absorbWhich), NO_LOAD & 0x1F);
-		return;
-	}
-	if (reg == DYNAMIC) {
-		xLoad(e, 4, RAX, P(cpu.ldReg));
-		xLoad(e, 4, R8, P(cpu.ldValue));
-		xStore(e, 4, MI(RBX, RAX, 4, (int32_t) offsetof(struct Psx, cpu.r)), R8);
-		xMovzx(e, R8, 1, P(cpu.ldAbsorb));
-		xStore(e, 1, ABSORB_AT(RAX), R8);
-		xStore(e, 1, P(cpu.readFudge), RAX);
-		xAluI(e, X_AND, 4, R(RAX), 0x1F);
-		xAluRR(e, X_OR, 1, P(cpu.absorbWhich), RAX);
-	} else {
-		xLoad(e, 4, RAX, P(cpu.ldValue));
-		xStore(e, 4, GPR(reg), RAX);
-		xMovzx(e, RAX, 1, P(cpu.ldAbsorb));
-		xStore(e, 1, ABSORB(reg), RAX);
-		xStoreI(e, 1, P(cpu.readFudge), reg);
-		if (reg & 0x1F) {
-			xAluI(e, X_OR, 1, P(cpu.absorbWhich), reg & 0x1F);
-		}
-	}
-	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
-	xStoreI(e, 4, GPR(0), 0);
-}
-
-static void uses(struct Emitter* e, int reg) {
-	if (reg) {
-		xStoreI(e, 1, ABSORB(reg), 0);
-	}
-}
-
 static void loadGpr(struct Emitter* e, int host, int reg) {
 	if (reg) {
 		xLoad(e, 4, host, GPR(reg));
@@ -74,17 +47,144 @@ static void loadGpr(struct Emitter* e, int host, int reg) {
 	}
 }
 
-struct Compile {
-	struct Emitter e;
-	uint8_t* leave;
-	uint8_t* stubSites[BLOCK_MAX];
-	struct { uint8_t* site; uint32_t pc, instr; } slows[BLOCK_MAX * 2];
-	int slowCount;
-};
+// The primitives jit.c's state uses.
 
-// The instruction through cpuJitExecute; the block leaves if it has to (always after a delay slot,
-// which leaves pc at the branch's target).
-static void helper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
+static void bAddCycles(struct Compile* k, int n) {
+	xAluI(&k->e, X_ADD, 8, R(R13), n);
+}
+
+static void bStoreAbsorb(struct Compile* k, int reg, int v) {
+	xStoreI(&k->e, 1, ABSORB(reg), v);
+}
+
+// The fetch's cycle unless rax's absorb entry still hides some (then one less is hidden).
+static void absorbStepRax(struct Emitter* e) {
+	xMovzx(e, RCX, 1, ABSORB_AT(RAX));
+	xAluI(e, X_CMP, 4, R(RCX), 1);
+	xAluI(e, X_ADC, 8, R(R13), 0);
+	xAluI(e, X_CMP, 4, R(RCX), 1);
+	xAluI(e, X_ADC, 4, R(RCX), -1);
+	xStore(e, 1, ABSORB_AT(RAX), RCX);
+}
+
+static void bAbsorbStepAt(struct Compile* k, int reg) {
+	movI(&k->e, RAX, reg);
+	absorbStepRax(&k->e);
+}
+
+// rax = memory's absorbWhich with or ORed in
+static void awIndirect(struct Emitter* e, int or) {
+	xMovzx(e, RAX, 1, P(cpu.absorbWhich));
+	if (or) xAluI(e, X_OR, 4, R(RAX), or);
+}
+
+static void bAbsorbStepIndirect(struct Compile* k, int or) {
+	awIndirect(&k->e, or);
+	absorbStepRax(&k->e);
+}
+
+static void bZeroAbsorbIndirect(struct Compile* k, int or) {
+	awIndirect(&k->e, or);
+	xStoreI(&k->e, 1, ABSORB_AT(RAX), 0);
+}
+
+static void bStoreAw(struct Compile* k, int v) {
+	xStoreI(&k->e, 1, P(cpu.absorbWhich), v);
+}
+
+static void bOrAw(struct Compile* k, int or) {
+	xAluI(&k->e, X_OR, 1, P(cpu.absorbWhich), or);
+}
+
+static void bStoreFudge(struct Compile* k, int v) {
+	xStoreI(&k->e, 1, P(cpu.readFudge), v);
+}
+
+// The memory part of commitLoad for a known register.
+static void bCommitLoad(struct Compile* k, int reg) {
+	struct Emitter* e = &k->e;
+	xLoad(e, 4, RAX, P(cpu.ldValue));
+	xStore(e, 4, GPR(reg), RAX);
+	xMovzx(e, RAX, 1, P(cpu.ldAbsorb));
+	xStore(e, 1, ABSORB(reg), RAX);
+	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
+	if (!reg) xStoreI(e, 4, GPR(0), 0);
+}
+
+// commitLoad as the interpreter does it, for whatever load is in flight.
+static void bCommitDynamic(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	xLoad(e, 4, RAX, P(cpu.ldReg));
+	xLoad(e, 4, R8, P(cpu.ldValue));
+	xStore(e, 4, MI(RBX, RAX, 4, (int32_t) offsetof(struct Psx, cpu.r)), R8);
+	xMovzx(e, R8, 1, P(cpu.ldAbsorb));
+	xStore(e, 1, ABSORB_AT(RAX), R8);
+	xStore(e, 1, P(cpu.readFudge), RAX);
+	xAluI(e, X_AND, 4, R(RAX), 0x1F);
+	xAluRR(e, X_OR, 1, P(cpu.absorbWhich), RAX);
+	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
+	xStoreI(e, 4, GPR(0), 0);
+}
+
+static void bSurchargeIndirect(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	xMovzx(e, RAX, 1, P(cpu.readFudge));
+	xShiftI(e, X_SHR, 4, R(RAX), 4);
+	xAluI(e, X_AND, 4, R(RAX), 2);
+	xAluRR(e, X_ADD, 8, R(R13), RAX);
+}
+
+// The block's frame.
+
+static void bBegin(struct Compile* k, struct Jit* j, uint8_t* start, uint8_t* end) {
+	memset(k, 0, sizeof *k);
+	k->e.start = k->e.p = start;
+	k->e.end = end;
+	k->j = j;
+}
+
+static uint8_t* bHere(struct Compile* k) {
+	return k->e.p;
+}
+
+static uint8_t* bJump(struct Compile* k) {
+	return xJmp(&k->e, NULL);
+}
+
+static void bPatchHere(struct Compile* k, uint8_t* site) {
+	patchHere(&k->e, site);
+}
+
+static void slowJump(struct Compile* k, int cc) {
+	k->slows[k->slowCount++] = xJcc(&k->e, cc, NULL);
+}
+
+static void bPatchSlows(struct Compile* k) {
+	for (int i = 0; i < k->slowCount; i++) patchHere(&k->e, k->slows[i]);
+}
+
+// On the way in: the block runs only when its instructions up to the next through the
+// interpreter can't reach the limit.
+static void bDecline(struct Compile* k, int bound) {
+	struct Emitter* e = &k->e;
+	xLea(e, 8, RAX, M(R13, bound));
+	xAluRR(e, X_CMP, 8, R(RAX), R14);
+	uint8_t* go = xJcc(e, CC_L, NULL);
+	xStoreI(e, 1, P(jitDeclined), 1);
+	xJmp(e, k->j->leave);
+	patchHere(e, go);
+}
+
+// After an instruction through the interpreter: on only when the next ones can't reach the limit.
+static void bCheck(struct Compile* k, int bound, int next) {
+	struct Emitter* e = &k->e;
+	xLea(e, 8, RAX, M(R13, bound));
+	xAluRR(e, X_CMP, 8, R(RAX), R14);
+	k->stubSites[next] = xJcc(e, CC_GE, NULL);
+}
+
+// The instruction through cpuJitExecute (memory holds the state); the block leaves if it has to.
+static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	struct Emitter* e = &k->e;
 	xStore(e, 8, P(cycles), R13);
 	xMovRR(e, 8, RDI, RBX);
@@ -95,23 +195,55 @@ static void helper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	xLoad(e, 8, R13, P(cycles));
 	xTest(e, 4, R(RAX), RAX);
 	uint8_t* stay = xJcc(e, CC_E, NULL);
-	xJmp(e, k->leave);
+	xJmp(e, k->j->leave);
 	patchHere(e, stay);
 	loadLimit(e);
 }
 
-static uint8_t* slowJump(struct Compile* k, int cc, uint32_t pc, uint32_t instr) {
-	uint8_t* site = xJcc(&k->e, cc, NULL);
-	k->slows[k->slowCount].site = site;
-	k->slows[k->slowCount].pc = pc;
-	k->slows[k->slowCount].instr = instr;
-	k->slowCount++;
-	return site;
+// The end of the block: on to the next instruction, or where the branch sent the delay slot.
+static void bEnd(struct Compile* k, struct Block* b) {
+	struct Emitter* e = &k->e;
+	if (b->delay) {
+		xLoad(e, 4, RAX, P(cpu.next));
+		xStore(e, 4, P(cpu.pc), RAX);
+		xAluI(e, X_ADD, 4, R(RAX), 4);
+		xStore(e, 4, P(cpu.next), RAX);
+	} else {
+		uint32_t end = b->pc + 4 * b->count;
+		xStoreI(e, 4, P(cpu.pc), end);
+		xStoreI(e, 4, P(cpu.next), end + 4);
+	}
+	xStoreI(e, 1, P(cpu.branched), 0);
+	xJmp(e, k->j->dispatch);
 }
 
-// edx = the RAM offset of the address in ecx, or a jump to the slow path when it isn't RAM (r8 and
-// eax are scratch). With scratch set, the scratchpad is tried first and taken at *scratchSite.
-static void ramOffset(struct Compile* k, uint32_t pc, uint32_t instr, uint8_t** scratchSite) {
+// Leaving before instruction i near the limit (memory holds the state there).
+static uint8_t* bFinish(struct Compile* k, struct Block* b) {
+	struct Emitter* e = &k->e;
+	for (int i = 1; i < b->count; i++) {
+		if (!k->stubSites[i]) continue;
+		patchHere(e, k->stubSites[i]);
+		xStoreI(e, 4, P(cpu.pc), b->pc + 4 * i);
+		if (b->delay && i == b->count - 1) {
+			// before the delay slot: cpu.next is the branch's, and the branch has just run
+			xStoreI(e, 1, P(cpu.branched), 1);
+		} else {
+			xStoreI(e, 4, P(cpu.next), b->pc + 4 * i + 4);
+			xStoreI(e, 1, P(cpu.branched), 0);
+		}
+		xJmp(e, k->j->leave);
+	}
+	return e->p > e->end ? NULL : e->p;
+}
+
+static void flushCode(uint8_t* start, uint8_t* end) {
+}
+
+// The instructions.
+
+// edx = the RAM offset of the address in ecx, or the slow path when it isn't RAM (r8 and eax are
+// scratch); the scratchpad is tried first and taken at *scratchSite.
+static void ramOffset(struct Compile* k, uint8_t** scratchSite) {
 	struct Emitter* e = &k->e;
 	// The scratchpad: (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000
 	xMovRR(e, 4, RAX, RCX);
@@ -125,33 +257,54 @@ static void ramOffset(struct Compile* k, uint32_t pc, uint32_t instr, uint8_t** 
 	xMovRR(e, 4, RDX, RCX);
 	xAluI(e, X_AND, 4, R(RDX), 0x1FFFFFFF);
 	xAluI(e, X_CMP, 4, R(RDX), 0x800000);
-	slowJump(k, CC_AE, pc, instr);
+	slowJump(k, CC_AE);
 	xMovRR(e, 4, RAX, RCX);
 	xShiftI(e, X_SHR, 4, R(RAX), 29);
 	xMovI(e, R8, 0x31);
 	emitOp2(e, 4, 0x0F, 0xA3, RAX, R(R8));  // bt r8d, eax
-	slowJump(k, CC_AE, pc, instr);
+	slowJump(k, CC_AE);
 	xAluI(e, X_AND, 4, R(RDX), RAM_SIZE - 1);
 }
 
-// Loads: the address, the fast paths, then the load in flight as the interpreter leaves it.
-static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void address(struct Compile* k, uint32_t instr, int width) {
 	struct Emitter* e = &k->e;
-	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
+	int rs = instr >> 21 & 31;
 	int32_t imm = (int16_t) instr;
-	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	loadGpr(e, RCX, rs);
 	if (imm) xAluI(e, X_ADD, 4, R(RCX), imm);
 	if (width > 1) {
 		xTestI(e, 1, R(RCX), width - 1);
-		slowJump(k, CC_NE, pc, instr);
+		slowJump(k, CC_NE);
 	}
+}
+
+// The load in flight's register after "if (c->ldReg == rt) c->ldReg = 0".
+static int cancelSame(struct Compile* k, int pending, int rt) {
+	struct Emitter* e = &k->e;
+	if (pending == DYNAMIC) {
+		xAluI(e, X_CMP, 4, P(cpu.ldReg), rt);
+		uint8_t* other = xJcc(e, CC_NE, NULL);
+		xStoreI(e, 4, P(cpu.ldReg), 0);
+		patchHere(e, other);
+		return DYNAMIC;
+	}
+	return pending == rt ? 0 : pending;
+}
+
+// Loads: the address, the fast paths (RAM, the scratchpad), then the load in flight as the
+// interpreter leaves it.
+static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
+	struct Emitter* e = &k->e;
+	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
+	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
+	address(k, instr, width);
 	uint8_t* scratchSite;
-	ramOffset(k, pc, instr, &scratchSite);
+	ramOffset(k, &scratchSite);
+	struct State start = k->st;
 	uint8_t* done = NULL;
 	for (int pass = 0; pass < 2; pass++) {
-		// pass 0: RAM (edx = offset); pass 1: the scratchpad
 		if (pass == 1) {
+			k->st = start;
 			patchHere(e, scratchSite);
 			xMovRR(e, 4, RDX, RCX);
 			xAluI(e, X_AND, 4, R(RDX), 0x3FF);
@@ -161,32 +314,12 @@ static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending
 		if (width == 4) xLoad(e, 4, RSI, src);
 		else if (op == 0x20 || op == 0x21) xMovsx(e, RSI, width, src);
 		else xMovzx(e, RSI, width, src);
-		uses(e, rs);
-		int reg = pending;
-		if (pending == DYNAMIC) {
-			xAluI(e, X_CMP, 4, P(cpu.ldReg), rt);
-			uint8_t* other = xJcc(e, CC_NE, NULL);
-			xStoreI(e, 4, P(cpu.ldReg), 0);
-			patchHere(e, other);
-		} else if (pending == rt) {
-			reg = 0;
-		}
-		commit(e, reg);
-		// beginRead: the absorb in use ends
-		xMovzx(e, RAX, 1, P(cpu.absorbWhich));
-		xStoreI(e, 1, ABSORB_AT(RAX), 0);
-		xStoreI(e, 1, P(cpu.absorbWhich), 0);
+		stUses(k, rs);
+		stCommit(k, cancelSame(k, pending, rt));
+		int surcharge = stBeginRead(k);
 		if (pass == 0) {
-			// 2 more when no load came right before, the bus's 3 and 2 more; 5 to hide
-			if (reg == DYNAMIC) {
-				xMovzx(e, RAX, 1, P(cpu.readFudge));
-				xShiftI(e, X_SHR, 4, R(RAX), 4);
-				xAluI(e, X_AND, 4, R(RAX), 2);
-				xAluRR(e, X_ADD, 8, R(R13), RAX);
-			} else if ((reg >> 4) & 2) {
-				xAluI(e, X_ADD, 8, R(R13), 2);
-			}
-			xAluI(e, X_ADD, 8, R(R13), 5);
+			if (surcharge < 0) bSurchargeIndirect(k);
+			xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
 			xStoreI(e, 1, P(cpu.ldAbsorb), 5);
 		} else {
 			xStoreI(e, 1, P(cpu.ldAbsorb), 0);
@@ -198,21 +331,15 @@ static void emitLoad(struct Compile* k, uint32_t pc, uint32_t instr, int pending
 	patchHere(e, done);
 }
 
-static void emitStore(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
-	int32_t imm = (int16_t) instr;
 	int width = op == 0x2B ? 4 : op == 0x29 ? 2 : 1;
-	loadGpr(e, RCX, rs);
-	if (imm) xAluI(e, X_ADD, 4, R(RCX), imm);
-	if (width > 1) {
-		xTestI(e, 1, R(RCX), width - 1);
-		slowJump(k, CC_NE, pc, instr);
-	}
+	address(k, instr, width);
 	xTestI(e, 4, P(cpu.sr), 0x10000);
-	slowJump(k, CC_NE, pc, instr);
+	slowJump(k, CC_NE);
 	uint8_t* scratchSite;
-	ramOffset(k, pc, instr, &scratchSite);
+	ramOffset(k, &scratchSite);
 	xAluRR(e, X_ADD, 8, R(RDX), R15);
 	uint8_t* write = xJmp(e, NULL);
 	patchHere(e, scratchSite);
@@ -222,14 +349,14 @@ static void emitStore(struct Compile* k, uint32_t pc, uint32_t instr, int pendin
 	xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 	patchHere(e, write);
 	loadGpr(e, RSI, rt);
-	uses(e, rs);
-	uses(e, rt);
-	commit(e, pending);
+	stUses(k, rs);
+	stUses(k, rt);
+	stCommit(k, pending);
 	xStore(e, width, M(RDX, 0), RSI);
 }
 
 // The ALU: operands first (before the load in flight lands), then the commit and the result.
-static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
 	int sa = instr >> 6 & 31, fn = instr & 63;
@@ -241,41 +368,40 @@ static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		case 0x00: case 0x02: case 0x03:
 			loadGpr(e, RSI, rt);
 			if (sa) xShiftI(e, fn == 0 ? X_SHL : fn == 2 ? X_SHR : X_SAR, 4, R(RSI), sa);
-			uses(e, rt); uses(e, rd);
+			stUses(k, rt); stUses(k, rd);
 			break;
 		case 0x04: case 0x06: case 0x07:
 			loadGpr(e, RSI, rt);
 			loadGpr(e, RCX, rs);
 			xShiftCl(e, fn == 4 ? X_SHL : fn == 6 ? X_SHR : X_SAR, 4, R(RSI));
-			uses(e, rs); uses(e, rt); uses(e, rd);
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
 			break;
-		case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: {
+		case 0x11: case 0x13:
+			// MTHI/MTLO
 			loadGpr(e, RSI, rs);
-			loadGpr(e, RCX, rt);
-			static const int alu[8] = { X_ADD, X_ADD, X_SUB, X_SUB, X_AND, X_OR, X_XOR, X_OR };
-			xAluRR(e, alu[fn & 7], 4, R(RSI), RCX);
-			if (fn == 0x20 || fn == 0x22) slowJump(k, CC_O, pc, instr);
-			if (fn == 0x27) xNot(e, 4, R(RSI));
-			uses(e, rs); uses(e, rt); uses(e, rd);
-			break;
-		}
+			stUses(k, rs);
+			stCommit(k, pending);
+			xStore(e, 4, GPR(fn == 0x11 ? 32 : 33), RSI);
+			return;
 		case 0x2A: case 0x2B:
 			loadGpr(e, RAX, rs);
 			loadGpr(e, RCX, rt);
 			xMovI(e, RSI, 0);
 			xAluRR(e, X_CMP, 4, R(RAX), RCX);
 			xSetcc(e, fn == 0x2A ? CC_L : CC_B, R(RSI));
-			uses(e, rs); uses(e, rt); uses(e, rd);
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
 			break;
-		case 0x11: case 0x13:
-			// MTHI/MTLO
+		default: {
+			// 0x20-0x27
 			loadGpr(e, RSI, rs);
-			uses(e, rs);
-			commit(e, pending);
-			xStore(e, 4, GPR(fn == 0x11 ? 32 : 33), RSI);
-			return true;
-		default:
-			return false;
+			loadGpr(e, RCX, rt);
+			static const int alu[8] = { X_ADD, X_ADD, X_SUB, X_SUB, X_AND, X_OR, X_XOR, X_OR };
+			xAluRR(e, alu[fn & 7], 4, R(RSI), RCX);
+			if (fn == 0x20 || fn == 0x22) slowJump(k, CC_O);
+			if (fn == 0x27) xNot(e, 4, R(RSI));
+			stUses(k, rs); stUses(k, rt); stUses(k, rd);
+			break;
+		}
 		}
 	} else {
 		dst = rt;
@@ -283,7 +409,7 @@ static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		case 0x08: case 0x09:
 			loadGpr(e, RSI, rs);
 			xAluI(e, X_ADD, 4, R(RSI), (int32_t) imm);
-			if (op == 0x08) slowJump(k, CC_O, pc, instr);
+			if (op == 0x08) slowJump(k, CC_O);
 			break;
 		case 0x0A: case 0x0B:
 			loadGpr(e, RAX, rs);
@@ -300,19 +426,17 @@ static bool emitAlu(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 				xMovI(e, RSI, 0);
 			}
 			break;
-		case 0x0F:
-			movI(e, RSI, immu << 16);
-			uses(e, rt);
-			goto result;
 		default:
-			return false;
+			// LUI
+			movI(e, RSI, immu << 16);
+			stUses(k, rt);
+			goto result;
 		}
-		uses(e, rs); uses(e, rt);
+		stUses(k, rs); stUses(k, rt);
 	}
 result:
-	commit(e, pending);
+	stCommit(k, pending);
 	if (dst) xStore(e, 4, GPR(dst), RSI);
-	return true;
 }
 
 // Branches and jumps: the interpreter's order (operands, the commit, the link), then cpu.next = where
@@ -323,8 +447,8 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	uint32_t after = pc + 8, target = pc + 4 + ((uint32_t) (int32_t) (int16_t) instr << 2);
 	uint32_t jump = ((pc + 4) & 0xF0000000) | (instr & 0x3FFFFFF) << 2;
 	if (op == 0x02 || op == 0x03) {
-		if (op == 0x03) uses(e, 31);
-		commit(e, pending);
+		if (op == 0x03) stUses(k, 31);
+		stCommit(k, pending);
 		if (op == 0x03) xStoreI(e, 4, GPR(31), after);
 		xStoreI(e, 4, P(cpu.next), jump);
 		return;
@@ -332,20 +456,20 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	if (op == 0x00) {
 		// JR/JALR
 		loadGpr(e, RSI, rs);
-		uses(e, rs);
-		uses(e, rd);
-		commit(e, pending);
+		stUses(k, rs);
+		stUses(k, rd);
+		stCommit(k, pending);
 		if ((instr & 63) == 0x09 && rd) xStoreI(e, 4, GPR(rd), after);
 		xStore(e, 4, P(cpu.next), RSI);
 		return;
 	}
 	loadGpr(e, RSI, rs);
 	if (op == 0x04 || op == 0x05) loadGpr(e, RDI, rt);
-	uses(e, rs);
+	stUses(k, rs);
 	bool link = op == 0x01 && (rt & 0x1E) == 0x10;
-	if (op == 0x04 || op == 0x05) uses(e, rt);
-	if (link) uses(e, 31);
-	commit(e, pending);
+	if (op == 0x04 || op == 0x05) stUses(k, rt);
+	if (link) stUses(k, 31);
+	stCommit(k, pending);
 	if (link) xStoreI(e, 4, GPR(31), after);
 	int cc;
 	if (op == 0x04 || op == 0x05) {
@@ -363,14 +487,13 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 
 // COP2: the GTE's commands and moves, when the GTE is usable (otherwise the interpreter raises the
 // exception). Calls into gte.c keep rbx, rbp and r12-r15.
-static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+static void emitGte(struct Compile* k, uint32_t instr, int pending) {
 	struct Emitter* e = &k->e;
 	int rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
-	if (!(instr & 0x02000000) && rs != 0 && rs != 2 && rs != 4 && rs != 6) return false;
 	xTestI(e, 4, P(cpu.sr), 0x40000000);
-	slowJump(k, CC_E, pc, instr);
+	slowJump(k, CC_E);
 	if (instr & 0x02000000) {
-		commit(e, pending);
+		stCommit(k, pending);
 		xLoad(e, 8, RAX, P(cpu.gteDone));
 		xAluRR(e, X_CMP, 8, R(R13), RAX);
 		xCmov(e, CC_L, 8, R13, R(RAX));
@@ -379,19 +502,10 @@ static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		xMovsxd(e, RAX, R(RAX));
 		xAluRR(e, X_ADD, 8, R(RAX), R13);
 		xStore(e, 8, P(cpu.gteDone), RAX);
-		return true;
+		return;
 	}
 	if (rs == 0 || rs == 2) {
-		int reg = pending;
-		if (pending == DYNAMIC) {
-			xAluI(e, X_CMP, 4, P(cpu.ldReg), rt);
-			uint8_t* other = xJcc(e, CC_NE, NULL);
-			xStoreI(e, 4, P(cpu.ldReg), 0);
-			patchHere(e, other);
-		} else if (pending == rt) {
-			reg = 0;
-		}
-		commit(e, reg);
+		stCommit(k, cancelSame(k, pending, rt));
 		// The GTE's wait, which the next instructions may hide
 		movI(e, RCX, 0);
 		xLoad(e, 8, RAX, P(cpu.gteDone));
@@ -403,110 +517,21 @@ static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending)
 		callC(e, (const void*) (rs == 0 ? GTE_ReadDR : GTE_ReadCR));
 		xStore(e, 4, P(cpu.ldValue), RAX);
 		xStoreI(e, 4, P(cpu.ldReg), rt);
-		return true;
+		return;
 	}
 	loadGpr(e, RSI, rt);
-	commit(e, pending);
+	stCommit(k, pending);
 	xLoad(e, 8, RAX, P(cpu.gteDone));
 	xAluRR(e, X_CMP, 8, R(R13), RAX);
 	xCmov(e, CC_L, 8, R13, R(RAX));
 	movI(e, RDI, rd);
 	callC(e, (const void*) (rs == 4 ? GTE_WriteDR : GTE_WriteCR));
-	return true;
-}
-
-// A block's code, from start; NULL when it doesn't fit before end.
-static uint8_t* emitBlock(struct Psx* p, struct Jit* j, struct Block* b, uint8_t* start, uint8_t* end) {
-	uint32_t pc = b->pc;
-	struct Compile k = { 0 };
-	struct Emitter* e = &k.e;
-	e->start = e->p = start;
-	e->end = end;
-	uint8_t* entry = e->p;
-	k.leave = j->leave;
-	int pending = DYNAMIC;
-	for (int i = 0; i < b->count; i++) {
-		uint32_t a = pc + 4 * i, instr = b->words[i];
-		bool delay = b->delay && i == b->count - 1;
-		b->at[i] = (uint16_t) (e->p - entry);
-		// The limit, then the cycle the fetch takes unless a load's wait hides it
-		xAluRR(e, X_CMP, 8, R(R13), R14);
-		k.stubSites[i] = xJcc(e, CC_GE, NULL);
-		xMovzx(e, RAX, 1, P(cpu.absorbWhich));
-		xMovzx(e, RCX, 1, ABSORB_AT(RAX));
-		xAluI(e, X_CMP, 4, R(RCX), 1);
-		xAluI(e, X_ADC, 8, R(R13), 0);
-		xAluI(e, X_CMP, 4, R(RCX), 1);
-		xAluI(e, X_ADC, 4, R(RCX), -1);
-		xStore(e, 1, ABSORB_AT(RAX), RCX);
-		int op = instr >> 26;
-		k.slowCount = 0;
-		bool inline_ = false;
-		if (op >= 0x20 && op <= 0x25 && op != 0x22) {
-			emitLoad(&k, a, instr, pending);
-			inline_ = true;
-		} else if (op == 0x28 || op == 0x29 || op == 0x2B) {
-			emitStore(&k, a, instr, pending);
-			inline_ = true;
-		} else if (op == 0x12) {
-			inline_ = emitGte(&k, a, instr, pending);
-		} else if (kind(instr) == 0) {
-			inline_ = emitAlu(&k, a, instr, pending);
-		} else if (b->delay && i == b->count - 2) {
-			emitBranch(&k, a, instr, pending);
-			inline_ = true;
-		}
-		if (inline_) {
-			if (k.slowCount) {
-				uint8_t* over = xJmp(e, NULL);
-				for (int s = 0; s < k.slowCount; s++) patchHere(e, k.slows[s].site);
-				helper(&k, a, instr, delay);
-				patchHere(e, over);
-			}
-		} else {
-			helper(&k, a, instr, delay);
-		}
-		pending = leavesLoad(instr);
-	}
-	// The end of the block: on to the next instruction, or where the branch sent the delay slot
-	if (b->delay) {
-		xLoad(e, 4, RAX, P(cpu.next));
-		xStore(e, 4, P(cpu.pc), RAX);
-		xAluI(e, X_ADD, 4, R(RAX), 4);
-		xStore(e, 4, P(cpu.next), RAX);
-	} else {
-		uint32_t end = pc + 4 * b->count;
-		movI(e, RAX, end);
-		xStore(e, 4, P(cpu.pc), RAX);
-		movI(e, RAX, end + 4);
-		xStore(e, 4, P(cpu.next), RAX);
-	}
-	xStoreI(e, 1, P(cpu.branched), 0);
-	xJmp(e, j->dispatch);
-	// Leaving before an instruction when the limit is reached
-	for (int i = 0; i < b->count; i++) {
-		patchHere(e, k.stubSites[i]);
-		movI(e, RAX, pc + 4 * i);
-		xStore(e, 4, P(cpu.pc), RAX);
-		if (b->delay && i == b->count - 1) {
-			// before the delay slot: cpu.next is the branch's, and the branch has just run
-			xStoreI(e, 1, P(cpu.branched), 1);
-		} else {
-			movI(e, RAX, pc + 4 * i + 4);
-			xStore(e, 4, P(cpu.next), RAX);
-			xStoreI(e, 1, P(cpu.branched), 0);
-		}
-		xJmp(e, k.leave);
-	}
-	return e->p > e->end ? NULL : e->p;
-}
-
-static void flushCode(uint8_t* start, uint8_t* end) {
 }
 
 // The code every block shares: the way in (registers set, then the block's body), the way out, and
 // the dispatcher a block ends with, which goes straight on to the next block while the limit allows
-// and the next block's lines are as it last found them.
+// and the next block's lines are as it last found them, into its clean version when nothing hides
+// any load time and no load is in flight.
 static void emitShared(struct Psx* p, struct Jit* j) {
 	struct Emitter e = { j->arena, j->arena, j->arena + ARENA_SIZE };
 	j->enter = (void (*)(struct Psx*, int64_t, uint8_t*)) (void*) e.p;
@@ -546,8 +571,8 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	xLea(&e, 8, RDI, M(RDX, (int32_t) offsetof(struct Block, gen)));
 	uint8_t* loop = e.p;
 	xMovzx(&e, R8, 1, R(RCX));
-	xLoad(&e, 4, R9, MI(RBX, R8, 4, (int32_t) offsetof(struct Psx, cpu.icacheGen)));
-	xAluRM(&e, X_CMP, 4, R9, M(RDI, 0));
+	xLoad(&e, 4, R8, MI(RBX, R8, 4, (int32_t) offsetof(struct Psx, cpu.icacheGen)));
+	xAluRM(&e, X_CMP, 4, R8, M(RDI, 0));
 	xJcc(&e, CC_NE, j->leave);
 	xAluI(&e, X_ADD, 8, R(RDI), 4);
 	xAluI(&e, X_ADD, 4, R(RCX), 1);
@@ -555,7 +580,17 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	xJcc(&e, CC_NE, loop);
 	xStore(&e, 4, M(RDX, (int32_t) offsetof(struct Block, checked)), RAX);
 	patchHere(&e, go);
-	xJmpM(&e, M(RDX, (int32_t) offsetof(struct Block, body)));
+	// Clean: no load in flight and every absorb entry 0
+	xAluI(&e, X_CMP, 4, P(cpu.ldReg), NO_LOAD);
+	uint8_t* generic = xJcc(&e, CC_NE, NULL);
+	xLoad(&e, 8, RAX, ABSORB(0));
+	xAluRM(&e, X_OR, 8, RAX, ABSORB(8));
+	xAluRM(&e, X_OR, 8, RAX, ABSORB(16));
+	xAluRM(&e, X_OR, 8, RAX, ABSORB(24));
+	uint8_t* generic2 = xJcc(&e, CC_NE, NULL);
+	xJmpM(&e, M(RDX, (int32_t) offsetof(struct Block, body[CLEAN])));
+	patchHere(&e, generic);
+	patchHere(&e, generic2);
+	xJmpM(&e, M(RDX, (int32_t) offsetof(struct Block, body[GENERIC])));
 	j->used = (size_t) (e.p - j->arena + 15) & ~(size_t) 15;
 }
-

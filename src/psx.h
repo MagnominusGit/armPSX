@@ -145,6 +145,7 @@ struct Psx {
 	uint32_t pcRingAt, pcStop;
 	uint32_t watch;  // debugging: physical address whose writes are printed (0: none)
 	void* jit;  // the recompiler, when there is one
+	bool jitDeclined;  // a block couldn't finish before the limit
 	bool pal;
 	char region;  // the disc's: 'A', 'E' or 'I'
 	uint32_t exeEntry;
