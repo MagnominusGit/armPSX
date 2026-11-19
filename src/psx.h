@@ -112,17 +112,6 @@ struct Sio {
 
 struct Disc;
 
-struct Mdec {
-	uint32_t status, command;
-	int words;
-	uint16_t in[16384];
-	int inCount;
-	uint32_t out[16384];
-	int outCount, outRead;
-	uint8_t lumQuant[64], colQuant[64];
-	int16_t scale[64];
-	bool enableIn, enableOut;
-};
 
 struct Psx {
 	struct Cpu cpu;
@@ -140,7 +129,6 @@ struct Psx {
 	struct Gpu gpu;
 	struct Sio sio;
 	struct Disc* disc;
-	struct Mdec mdec;
 	uint32_t frames;
 	bool pal;
 	uint32_t exeEntry;
@@ -231,7 +219,8 @@ void cdromRun(struct Psx* p);
 // mdec.c
 uint32_t mdecRead(struct Psx* p, uint32_t address);
 void mdecWrite(struct Psx* p, uint32_t address, uint32_t value);
-uint32_t mdecDmaRead(struct Psx* p);
+uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset);
+void mdecReset(struct Psx* p);
 void mdecDmaWrite(struct Psx* p, uint32_t value);
 
 #endif

@@ -31,7 +31,7 @@ static void ramWrite(struct Psx* p, uint32_t address, uint32_t v) {
 
 static uint32_t deviceRead(struct Psx* p, int channel) {
 	switch (channel) {
-	case MDEC_OUT: return mdecDmaRead(p);
+	case MDEC_OUT: { uint32_t offset; return mdecDmaRead(p, &offset); }
 	case GPU: return gpuRead(p, 0x1F801810);
 	case CDROM: return cdromDmaRead(p);
 	case SPU: return spuDmaRead(p);
@@ -101,6 +101,10 @@ static void run(struct Psx* p, int channel) {
 		for (uint32_t i = 0; i < count; i++) {
 			if (toDevice) {
 				deviceWrite(p, channel, ramRead(p, address));
+			} else if (channel == MDEC_OUT) {
+				uint32_t offset;
+				uint32_t v = mdecDmaRead(p, &offset);
+				ramWrite(p, address + (offset << 2), v);
 			} else {
 				ramWrite(p, address, deviceRead(p, channel));
 			}

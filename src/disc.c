@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <libchdr/chd.h>
 #include "disc.h"
 
@@ -317,7 +318,18 @@ static bool hasExtension(const char* path, const char* ext) {
 	return n > e && !strcasecmp(path + n - e, ext);
 }
 
+// A folder named like a list file holds that list file and its discs.
+static const char* folderList(const char* path, char* out, size_t size) {
+	struct stat st;
+	if (stat(path, &st) || !S_ISDIR(st.st_mode)) return path;
+	const char* slash = strrchr(path, '/');
+	snprintf(out, size, "%s/%s", path, slash ? slash + 1 : path);
+	return out;
+}
+
 int discCount(const char* path) {
+	char inner[1024];
+	path = folderList(path, inner, sizeof inner);
 	if (!hasExtension(path, ".m3u")) return 1;
 	int n = 0;
 	char entry[1024];
@@ -326,6 +338,8 @@ int discCount(const char* path) {
 }
 
 struct Disc* discOpenIndex(const char* path, int index) {
+	char inner[1024];
+	path = folderList(path, inner, sizeof inner);
 	if (hasExtension(path, ".m3u")) {
 		char entry[1024];
 		if (!m3uEntry(path, index, entry, sizeof entry)) return NULL;
