@@ -730,8 +730,12 @@ static void commandFill(struct Gpu* g, const uint32_t* cb) {
 		if (lineSkip(g, yy)) continue;
 		g->drawTime -= (w >> 3) + 9;
 		if (g->drawParity >= 0 && (yy & 1) != g->drawParity) continue;
-		for (int32_t x = 0; x < w && g->drawPixels; x++) {
-			g->vram[yy * 1024 + ((x + dx) & 1023)] = value;
+		if (!g->drawPixels) continue;
+		uint16_t* row = &g->vram[yy * 1024];
+		if (dx + w <= 1024) {
+			for (int32_t x = 0; x < w; x++) row[dx + x] = value;
+		} else {
+			for (int32_t x = 0; x < w; x++) row[(x + dx) & 1023] = value;
 		}
 	}
 }
@@ -1543,7 +1547,8 @@ void gpuRun(struct Psx* p) {
 		int32_t lines = (int32_t) g->linesPerField;
 		uint32_t targets[3] = { g->vEnd, g->vStart, 0 };
 		for (int i = 0; i < 3; i++) {
-			int32_t d = (int32_t) ((targets[i] + g->linesPerField - g->scanline) % g->linesPerField);
+			int32_t d = (int32_t) targets[i] - (int32_t) g->scanline;
+			if (d <= 0) d += (int32_t) g->linesPerField;
 			if (d > 0 && d < lines) lines = d;
 		}
 		int64_t lineCycles = ((int64_t) (g->displayMode & 8 ? 3405 : 3413) << 16) / g->clockRatio;
