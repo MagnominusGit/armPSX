@@ -1,6 +1,8 @@
 /* Copyright (c) 2026 Magnominus
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "psx.h"
 
@@ -139,8 +141,9 @@ static void run(struct Psx* p, int channel) {
 	if (channel == OTC) {
 		clocks = words;
 	}
-	if (sync == 0) {
-		// Immediate transfers hold the CPU.
+	if (sync == 0 || (channel == GPU && sync == 1)) {
+		// Immediate transfers hold the CPU; so, nearly, do GPU block transfers (Mednafen steals
+		// cycles from every CPU read while one runs).
 		p->cycles += clocks;
 		finish(p, channel);
 	} else {
@@ -206,8 +209,14 @@ void dmaRun(struct Psx* p) {
 static void maybeStart(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	uint32_t chcr = d->chcr[channel];
-	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->doneAt[channel] || d->remaining[channel]) {
+	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->remaining[channel]) {
 		return;
+	}
+	if (d->doneAt[channel]) {
+		// Started again while the last transfer's time hasn't run out: its data has moved already.
+		d->doneAt[channel] = 0;
+		finish(p, channel);
+		d->chcr[channel] = chcr;
 	}
 	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000)) {
 		return;
@@ -247,6 +256,7 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 	case 0: d->madr[channel] = value & 0xFFFFFF; break;
 	case 4: d->bcr[channel] = value; break;
 	case 8:
+		if (getenv("PSX_DMALOG")) fprintf(stderr, "dma%d chcr=%08x madr=%06x bcr=%08x at %lld doneAt %lld dpcr %08x\n", channel, value, d->madr[channel], d->bcr[channel], (long long) p->cycles, (long long) d->doneAt[channel], d->dpcr);
 		if (channel == OTC) {
 			value = (value & 0x51000000) | 2;
 		}

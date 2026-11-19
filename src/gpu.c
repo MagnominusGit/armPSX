@@ -68,17 +68,20 @@ ALWAYS uint16_t modTexel(struct Gpu* g, uint16_t texel, int32_t r, int32_t gr, i
 	return out;
 }
 
+// The CLUT cache reloads when the palette moves or more entries are needed than it holds: 8-bit to
+// 4-bit keeps it (ps1-tests clut-cache on hardware).
 ALWAYS void updateClut(struct Gpu* g, int texMode, uint16_t raw) {
 	if (texMode < 2) {
-		uint32_t tag = (raw & 0x7FFF) | (uint32_t) texMode << 16;
-		if (g->clutTag != tag) {
+		uint32_t tag = raw & 0x7FFF, count = texMode ? 256 : 16;
+		if (g->clutTag != tag || g->clutCount < count) {
 			const uint16_t* line = &g->vram[((raw >> 6) & 0x1FF) * 1024];
-			uint32_t cx = (raw & 0x3F) << 4, count = texMode ? 256 : 16;
+			uint32_t cx = (raw & 0x3F) << 4;
 			g->drawTime -= count;
 			for (uint32_t i = 0; i < count; i++) {
 				g->clut[i] = line[(cx + i) & 0x3FF];
 			}
 			g->clutTag = tag;
+			g->clutCount = count;
 		}
 	}
 }

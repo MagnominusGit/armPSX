@@ -54,7 +54,7 @@ struct GpuVertex {
 struct Gpu {
 	uint16_t vram[512 * 1024];
 	uint16_t clut[256];
-	uint32_t clutTag;
+	uint32_t clutTag, clutCount;
 	struct { uint32_t xAnd, xAdd, yAnd, yAdd; } window;
 	struct { uint16_t data[4]; uint32_t tag; } texCache[256];
 	uint32_t dmaControl;
