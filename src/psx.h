@@ -152,6 +152,7 @@ struct Psx {
 	size_t exeSize;
 	char tty[256];
 	int ttyLength;
+	bool ttyOut;  // PSX_TTY: the BIOS's console output goes to stderr
 };
 
 // psx.c

@@ -276,20 +276,100 @@ static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) 
 	loadLimit(e);
 }
 
-static void bEnd(struct Compile* k, struct Block* b) {
+// x2 = a block (memory holds the state): into its clean version when nothing hides any load time and
+// no load is in flight, otherwise its generic one.
+static void enterVersion(struct Emitter* e, int version) {
+	if (version == DYNAMIC) {
+		aLdr(e, X0, X19, OFF(cpu.ldReg));
+		aCmpImm(e, X0, NO_LOAD);
+		uint8_t* generic = aBcond(e, C_NE, NULL);
+		aLdrX(e, X0, X26, 0);
+		aLdrX(e, X1, X26, 8);
+		aDp(e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+		aLdrX(e, X1, X26, 16);
+		aDp(e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+		aLdrX(e, X1, X26, 24);
+		aDp(e, A_ORR | W64, X0, X0, X1, S_LSL, 0);
+		uint8_t* generic2 = aCbnzX(e, X0, NULL);
+		aLdrX(e, X3, X2, (unsigned) offsetof(struct Block, body[CLEAN]));
+		aBr(e, X3);
+		patchHere(e, generic);
+		patchHere(e, generic2);
+		version = GENERIC;
+	}
+	aLdrX(e, X3, X2, (unsigned) offsetof(struct Block, body[version]));
+	aBr(e, X3);
+}
+
+static void linkTo(struct Compile* k, struct Block* b, int s, uint32_t pc, int version) {
 	struct Emitter* e = &k->e;
-	if (b->delay) {
-		aLdr(e, X0, X19, OFF(cpu.next));
-		aStr(e, X0, X19, OFF(cpu.pc));
-		aDpImm(e, A_ADD_IMM, X0, X0, 4);
-		aStr(e, X0, X19, OFF(cpu.next));
-	} else {
+	aCmpX(e, X21, X22);
+	uint8_t* in = aBcond(e, C_LT, NULL);
+	aB(e, k->j->leave);
+	patchHere(e, in);
+	aMovImm64(e, X2, (uint64_t) (uintptr_t) &b->link[s]);
+	aLdrX(e, X2, X2, 0);
+	uint8_t* none = aCbzX(e, X2, NULL);
+	aLdr(e, X4, X19, OFF(cpu.icacheChanges));
+	aLdr(e, X5, X2, (unsigned) offsetof(struct Block, checked));
+	aCmp(e, X4, X5);
+	uint8_t* changed = aBcond(e, C_NE, NULL);
+	uint8_t* go = e->p;
+	enterVersion(e, version);
+	patchHere(e, changed);
+	aAddImmX(e, X11, X19, OFF(cpu.icacheGen));
+	aLdr(e, X12, X11, 4 * ((pc >> 4) & 255));
+	aLdr(e, X13, X2, (unsigned) offsetof(struct Block, gen));
+	aCmp(e, X12, X13);
+	uint8_t* miss = aBcond(e, C_NE, NULL);
+	aStr(e, X4, X2, (unsigned) offsetof(struct Block, checked));
+	aB(e, go);
+	patchHere(e, none);
+	patchHere(e, miss);
+	aStrX(e, X21, X19, OFF(cycles));
+	aMovX(e, X0, X19);
+	aMovImm64(e, X1, (uint64_t) (uintptr_t) &b->link[s]);
+	movI(e, X2, pc);
+	callC(e, (const void*) jitLink);
+	aLdrX(e, X21, X19, OFF(cycles));
+	loadLimit(e);
+	aBr(e, X0);
+}
+
+static void bEnd(struct Compile* k, struct Block* b, int version) {
+	struct Emitter* e = &k->e;
+	if (!b->delay) {
 		uint32_t endPc = b->pc + 4 * b->count;
 		storeWordI(e, OFF(cpu.pc), endPc);
 		storeWordI(e, OFF(cpu.next), endPc + 4);
+		aStrb(e, ZR, X19, OFF(cpu.branched));
+		linkTo(k, b, 0, endPc, version);
+		return;
 	}
+	uint32_t pc = b->pc + 4 * (b->count - 2), instr = b->words[b->count - 2];
+	int op = instr >> 26;
+	aLdr(e, X0, X19, OFF(cpu.next));
+	aStr(e, X0, X19, OFF(cpu.pc));
+	aDpImm(e, A_ADD_IMM, X1, X0, 4);
+	aStr(e, X1, X19, OFF(cpu.next));
 	aStrb(e, ZR, X19, OFF(cpu.branched));
-	aB(e, k->j->dispatch);
+	if (op == 0x00) {
+		aB(e, k->j->dispatch);
+		return;
+	}
+	uint32_t after = pc + 8, target = pc + 4 + ((uint32_t) (int32_t) (int16_t) instr << 2);
+	if (op == 0x02 || op == 0x03) {
+		linkTo(k, b, 0, ((pc + 4) & 0xF0000000) | (instr & 0x3FFFFFF) << 2, version);
+	} else if (target == after) {
+		linkTo(k, b, 0, target, version);
+	} else {
+		movI(e, X1, target);
+		aCmp(e, X0, X1);
+		uint8_t* other = aBcond(e, C_NE, NULL);
+		linkTo(k, b, 0, target, version);
+		patchHere(e, other);
+		linkTo(k, b, 1, after, version);
+	}
 }
 
 static uint8_t* bFinish(struct Compile* k, struct Block* b) {

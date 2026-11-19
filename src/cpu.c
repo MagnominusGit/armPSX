@@ -301,9 +301,7 @@ static void cop0Write(struct Cpu* c, int reg, uint32_t value) {
 static void tty(struct Psx* p, char ch) {
 	if (ch == '\n' || p->ttyLength == (int) sizeof p->tty - 1) {
 		p->tty[p->ttyLength] = 0;
-		if (getenv("PSX_TTY")) {
-			fprintf(stderr, "tty: %s\n", p->tty);
-		}
+		fprintf(stderr, "tty: %s\n", p->tty);
 		p->ttyLength = 0;
 	} else if (ch != '\r') {
 		p->tty[p->ttyLength++] = ch;
@@ -721,10 +719,12 @@ void cpuStep(struct Psx* p) {
 		psxLoadExe(p, p->exe, p->exeSize);
 		return;
 	}
-	if ((pc & 0x1FFFFFFF) == 0xB0 && c->r[9] == 0x3D) {
-		tty(p, c->r[4]);
-	} else if ((pc & 0x1FFFFFFF) == 0xA0 && c->r[9] == 0x3C) {
-		tty(p, c->r[4]);
+	if (p->ttyOut) {
+		if ((pc & 0x1FFFFFFF) == 0xB0 && c->r[9] == 0x3D) {
+			tty(p, c->r[4]);
+		} else if ((pc & 0x1FFFFFFF) == 0xA0 && c->r[9] == 0x3C) {
+			tty(p, c->r[4]);
+		}
 	}
 	uint32_t instr = 0;
 	if (pc & 3) {

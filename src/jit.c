@@ -28,12 +28,14 @@ struct Block {
 	uint32_t pc;
 	int count, lines;
 	bool delay;  // it ends with a branch and its delay slot
+	bool uncached;  // in the BIOS ROM through KSEG1: no lines, every fetch from the bus
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
 	uint32_t checked;  // cpu.icacheChanges when its lines were last found unchanged
 	uint8_t* body[3];  // GENERIC, CLEAN, CAREFUL
 	uint8_t* end[3];
 	uint16_t at[3][BLOCK_MAX];  // each instruction's code, from body
+	struct Block* link[2];  // the blocks it last went on to: the branch's target (or its end), and its end
 };
 
 struct Jit {
@@ -76,12 +78,16 @@ static void stAfterWait(struct Compile* k);
 
 static bool special(struct Psx* p, uint32_t pc) {
 	uint32_t phys = pc & 0x1FFFFFFF;
-	return phys == 0xA0 || phys == 0xB0 || (p->exe && pc == 0x80030000);
+	return (p->ttyOut && (phys == 0xA0 || phys == 0xB0)) || (p->exe && pc == 0x80030000);
 }
 
 static bool fetchable(uint32_t pc) {
 	uint32_t phys = pc & 0x1FFFFFFF;
 	return !(pc & 3) && pc < 0xA0000000 && (phys < 0x800000 || (phys >= 0x1FC00000 && phys < 0x1FC80000));
+}
+
+static bool romUncached(uint32_t pc) {
+	return !(pc & 3) && pc >= 0xBFC00000 && pc < 0xBFC80000;
 }
 
 static bool cached(struct Cpu* c, uint32_t pc) {
@@ -143,9 +149,9 @@ static bool fallible(uint32_t instr) {
 }
 
 // The most cycles from instruction s's start to the start of the next instruction through the
-// interpreter (whose own check comes after it), or of the last one: each fetch, each load's (2 more
-// when no load came just before, the bus's 3 and 2 more), and each GTE wait, at most the command
-// before it in the block takes. The first GTE wait is the GTE's own (*gte): the check then starts
+// interpreter (whose own check comes after it), or of the last one: each fetch (5 from the ROM
+// through KSEG1, where the bus takes 4), each load's (2 more when no load came just before, the
+// bus's 3 and 2 more), and each GTE wait, at most the command before it in the block takes. The first GTE wait is the GTE's own (*gte): the check then starts
 // from when the GTE is done.
 static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, bool* gte) {
 	int sum = 0, last = -1;
@@ -154,7 +160,7 @@ static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, boo
 		uint32_t instr = b->words[t];
 		int op = instr >> 26, fn = instr & 63;
 		if (op == 0 && (fn == 0x10 || fn == 0x12)) sum += 37;  // the longest multiply or divide
-		sum += 1 + (op >= 0x20 && op <= 0x25 ? 7 : op == 0x32 ? 6 : 0);
+		sum += (b->uncached ? 5 : 1) + (op >= 0x20 && op <= 0x25 ? 7 : op == 0x32 ? 6 : 0);
 		if (op == 0x12 || op == 0x32 || op == 0x3A) {
 			if (last >= 0) sum += last;
 			else *gte = true;
@@ -166,6 +172,7 @@ static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, boo
 
 static uint8_t* jitEnterMiss(struct Psx* p, uint32_t pc);
 static uint8_t* jitLineMiss(struct Psx* p, struct Block* b, int k, int i);
+static uint8_t* jitLink(struct Psx* p, struct Block** slot, uint32_t pc);
 
 #if defined(__x86_64__)
 #include "jit_x64.h"
@@ -267,6 +274,26 @@ static int stBeginRead(struct Compile* k) {
 	return s->fudge >= 0 ? (s->fudge >> 4) & 2 : -1;
 }
 
+// An uncached fetch: the register absorbWhich names hides nothing more, absorbWhich is 0, and the
+// bus takes 4 cycles.
+static void stUncachedFetch(struct Compile* k) {
+	struct State* s = &k->st;
+	if (s->aw >= 0) {
+		if (s->absorb[s->aw]) {
+			bStoreAbsorb(k, s->aw, 0);
+			s->absorb[s->aw] = 0;
+		}
+	} else if (!allZero(s)) {
+		bZeroAbsorbIndirect(k, s->awOr);
+	}
+	if (s->aw) {
+		s->aw = 0;
+		s->awOr = 0;
+		s->awDirty = true;
+	}
+	s->cycles += 4;
+}
+
 // After MFHI/MFLO's wait, which takes from the absorb absorbWhich names while it waits.
 static void stAfterWait(struct Compile* k) {
 	struct State* s = &k->st;
@@ -328,12 +355,13 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			stUnknown(&k.st);
 			bCheck(&k, 0, false, i);
 		}
-		if (i && !(a & 0xF)) {
+		if (i && !(a & 0xF) && !b->uncached) {
 			// A new cache line: on while it's as last checked
 			stFlushCycles(&k);
 			bLineCheck(&k, b, (a >> 4) - (b->pc >> 4), i);
 		}
 		b->at[version][i] = (uint16_t) (bHere(&k) - start);
+		if (b->uncached) stUncachedFetch(&k);
 		stAbsorbStep(&k);
 		bool after = version != CAREFUL && i + 1 < b->count && !delay;
 		if (!inl[i]) {
@@ -377,13 +405,18 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		pending = leavesLoad(instr);
 	}
 	stFlush(&k);
-	bEnd(&k, b);
+	// The next block's version, when the state here decides it
+	int next = pending != NO_LOAD ? GENERIC : allZero(&k.st) ? CLEAN : DYNAMIC;
+	for (int r = 0; r < 32 && next == DYNAMIC; r++) {
+		if (k.st.absorb[r] > 0) next = GENERIC;
+	}
+	bEnd(&k, b, next);
 	return bFinish(&k, b);
 }
 
 // What a fetch at a runs: the cache's word when it holds it, otherwise memory's, which a fill brings in.
 static uint32_t fetchWord(struct Psx* p, uint32_t a) {
-	if (cached(&p->cpu, a)) return cachedWord(&p->cpu, a);
+	if (!romUncached(a) && cached(&p->cpu, a)) return cachedWord(&p->cpu, a);
 	uint32_t phys = a & 0x1FFFFFFF, w;
 	memcpy(&w, phys < 0x800000 ? p->ram + (phys & (RAM_SIZE - 1)) : p->bios + (phys & (BIOS_SIZE - 1)), 4);
 	return w;
@@ -391,6 +424,7 @@ static uint32_t fetchWord(struct Psx* p, uint32_t a) {
 
 // Whether the cache holds the block's words in its line k.
 static bool lineHeld(struct Cpu* c, struct Block* b, int k) {
+	if (b->uncached) return true;
 	int first = k ? 4 * k - (int) ((b->pc >> 2) & 3) : 0;
 	int last = 4 * (k + 1) - (int) ((b->pc >> 2) & 3);
 	if (last > b->count) last = b->count;
@@ -422,14 +456,16 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 	b->pc = pc;
 	b->count = 0;
 	b->delay = false;
+	b->link[0] = b->link[1] = NULL;
+	b->uncached = romUncached(pc);
 	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {
-		if (!fetchable(a) || (a != pc && special(p, a))) break;
+		if (!(b->uncached ? romUncached(a) : fetchable(a)) || (a != pc && special(p, a))) break;
 		uint32_t instr = fetchWord(p, a);
 		b->words[b->count++] = instr;
 		if (kind(instr) == 2) {
 			// The delay slot comes along unless it's a branch too.
 			uint32_t d = a + 4;
-			if (fetchable(d) && !special(p, d) && kind(fetchWord(p, d)) != 2) {
+			if ((b->uncached ? romUncached(d) : fetchable(d)) && !special(p, d) && kind(fetchWord(p, d)) != 2) {
 				b->words[b->count++] = fetchWord(p, d);
 				b->delay = true;
 			}
@@ -486,6 +522,18 @@ static uint8_t* jitLineMiss(struct Psx* p, struct Block* b, int k, int i) {
 	return cpuIrqPending(p) ? j->leave : j->dispatch;
 }
 
+// A block's end found its link to the block at pc missing or out of date (memory holds the state,
+// the limit check passed): as the dispatcher would go on, and the link is the table's block.
+static uint8_t* jitLink(struct Psx* p, struct Block** slot, uint32_t pc) {
+	struct Jit* j = p->jit;
+	struct Block* t = j->table[(pc >> 2) & (TABLE_SIZE - 1)];
+	if ((!t || t->pc != pc) && (!(fetchable(pc) || romUncached(pc)) || special(p, pc))) return j->leave;
+	uint8_t* to = enterAt(p, j, pc);
+	t = j->table[(pc >> 2) & (TABLE_SIZE - 1)];
+	if (t && t->pc == pc) *slot = t;
+	return to;
+}
+
 static bool cleanState(struct Cpu* c) {
 	uint64_t absorb[4];
 	memcpy(absorb, c->absorb, sizeof absorb);
@@ -500,7 +548,7 @@ static bool cleanState(struct Cpu* c) {
 static uint8_t* enterAt(struct Psx* p, struct Jit* j, uint32_t pc) {
 	struct Cpu* c = &p->cpu;
 	if (!c->branched) {
-		if (!cached(c, pc)) cpuFetch(p, pc);
+		if (!romUncached(pc) && !cached(c, pc)) cpuFetch(p, pc);
 		struct Block** slot = &j->table[(pc >> 2) & (TABLE_SIZE - 1)];
 		struct Block* b = *slot;
 		if (!b || b->pc != pc || (b->checked != c->icacheChanges && !lineCurrent(c, b, 0))) {
@@ -568,7 +616,7 @@ bool jitRun(struct Psx* p, int64_t until) {
 	struct Jit* j = p->jit;
 	struct Cpu* c = &p->cpu;
 	uint32_t pc = c->pc;
-	if (p->watch || p->pcRing || !(c->biu & 0x800) || !fetchable(pc) || special(p, pc)) {
+	if (p->watch || p->pcRing || !(c->biu & 0x800) || !(fetchable(pc) || romUncached(pc)) || special(p, pc)) {
 		return false;
 	}
 	struct Block* r = j->resumeBlock;

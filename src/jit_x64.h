@@ -227,21 +227,93 @@ static void bHelper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) 
 	loadLimit(e);
 }
 
-// The end of the block: on to the next instruction, or where the branch sent the delay slot.
-static void bEnd(struct Compile* k, struct Block* b) {
+// rdx = a block (memory holds the state): into its clean version when nothing hides any load time and
+// no load is in flight, otherwise its generic one.
+static void enterVersion(struct Emitter* e, int version) {
+	if (version == DYNAMIC) {
+		xAluI(e, X_CMP, 4, P(cpu.ldReg), NO_LOAD);
+		uint8_t* generic = xJcc(e, CC_NE, NULL);
+		xLoad(e, 8, RAX, ABSORB(0));
+		xAluRM(e, X_OR, 8, RAX, ABSORB(8));
+		xAluRM(e, X_OR, 8, RAX, ABSORB(16));
+		xAluRM(e, X_OR, 8, RAX, ABSORB(24));
+		uint8_t* generic2 = xJcc(e, CC_NE, NULL);
+		xJmpM(e, M(RDX, (int32_t) offsetof(struct Block, body[CLEAN])));
+		patchHere(e, generic);
+		patchHere(e, generic2);
+		version = GENERIC;
+	}
+	xJmpM(e, M(RDX, (int32_t) offsetof(struct Block, body[version])));
+}
+
+// On to the block at pc through the block's link s, while the limit allows and the linked block's
+// first line is as it last found it; jitLink otherwise. The state is memory's and next's version.
+static void linkTo(struct Compile* k, struct Block* b, int s, uint32_t pc, int version) {
 	struct Emitter* e = &k->e;
-	if (b->delay) {
-		xLoad(e, 4, RAX, P(cpu.next));
-		xStore(e, 4, P(cpu.pc), RAX);
-		xAluI(e, X_ADD, 4, R(RAX), 4);
-		xStore(e, 4, P(cpu.next), RAX);
-	} else {
+	xAluRR(e, X_CMP, 8, R(R13), R14);
+	xJcc(e, CC_GE, k->j->leave);
+	xMovI64(e, RDX, (uint64_t) (uintptr_t) &b->link[s]);
+	xLoad(e, 8, RDX, M(RDX, 0));
+	xTest(e, 8, R(RDX), RDX);
+	uint8_t* none = xJcc(e, CC_E, NULL);
+	xLoad(e, 4, RSI, P(cpu.icacheChanges));
+	xAluRM(e, X_CMP, 4, RSI, M(RDX, (int32_t) offsetof(struct Block, checked)));
+	uint8_t* changed = xJcc(e, CC_NE, NULL);
+	uint8_t* go = e->p;
+	enterVersion(e, version);
+	patchHere(e, changed);
+	xLoad(e, 4, RCX, P(cpu.icacheGen[(pc >> 4) & 255]));
+	xAluRM(e, X_CMP, 4, RCX, M(RDX, (int32_t) offsetof(struct Block, gen)));
+	uint8_t* miss = xJcc(e, CC_NE, NULL);
+	xStore(e, 4, M(RDX, (int32_t) offsetof(struct Block, checked)), RSI);
+	xJmp(e, go);
+	patchHere(e, none);
+	patchHere(e, miss);
+	xStore(e, 8, P(cycles), R13);
+	xMovRR(e, 8, RDI, RBX);
+	xMovI64(e, RSI, (uint64_t) (uintptr_t) &b->link[s]);
+	movI(e, RDX, pc);
+	callC(e, (const void*) jitLink);
+	xLoad(e, 8, R13, P(cycles));
+	loadLimit(e);
+	xJmpR(e, RAX);
+}
+
+// The end of the block: on to the next instruction, or where the branch sent the delay slot, in
+// version when that's known.
+static void bEnd(struct Compile* k, struct Block* b, int version) {
+	struct Emitter* e = &k->e;
+	if (!b->delay) {
 		uint32_t end = b->pc + 4 * b->count;
 		xStoreI(e, 4, P(cpu.pc), end);
 		xStoreI(e, 4, P(cpu.next), end + 4);
+		xStoreI(e, 1, P(cpu.branched), 0);
+		linkTo(k, b, 0, end, version);
+		return;
 	}
+	uint32_t pc = b->pc + 4 * (b->count - 2), instr = b->words[b->count - 2];
+	int op = instr >> 26;
+	xLoad(e, 4, RAX, P(cpu.next));
+	xStore(e, 4, P(cpu.pc), RAX);
+	xLea(e, 4, RCX, M(RAX, 4));
+	xStore(e, 4, P(cpu.next), RCX);
 	xStoreI(e, 1, P(cpu.branched), 0);
-	xJmp(e, k->j->dispatch);
+	if (op == 0x00) {
+		xJmp(e, k->j->dispatch);
+		return;
+	}
+	uint32_t after = pc + 8, target = pc + 4 + ((uint32_t) (int32_t) (int16_t) instr << 2);
+	if (op == 0x02 || op == 0x03) {
+		linkTo(k, b, 0, ((pc + 4) & 0xF0000000) | (instr & 0x3FFFFFF) << 2, version);
+	} else if (target == after) {
+		linkTo(k, b, 0, target, version);
+	} else {
+		xAluI(e, X_CMP, 4, R(RAX), (int32_t) target);
+		uint8_t* other = xJcc(e, CC_NE, NULL);
+		linkTo(k, b, 0, target, version);
+		patchHere(e, other);
+		linkTo(k, b, 1, after, version);
+	}
 }
 
 // Leaving before instruction i near the limit (memory holds the state there), and each new line's

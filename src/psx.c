@@ -12,6 +12,7 @@ struct Psx* psxCreate(void) {
 	p->logCd = getenv("PSX_CDLOG") != NULL;
 	p->logDma = getenv("PSX_DMALOG") != NULL;
 	p->logGpu = getenv("PSX_GPULOG") != NULL;
+	p->ttyOut = getenv("PSX_TTY") != NULL;
 	const char* jit = getenv("PSX_JIT");
 	if (!jit || strcmp(jit, "0")) {
 		jitCreate(p);
