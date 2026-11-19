@@ -103,6 +103,15 @@ ALWAYS uint16_t texel(struct Gpu* g, bool draw, int texMode, uint32_t u, uint32_
 	uint32_t fx = (uExt >> (2 - texMode)) & 1023;
 	uint32_t fy = (v & g->window.yAnd) + g->window.yAdd;
 	uint32_t gro = fy * 1024 + fx;
+	if (draw && g->roughTime) {
+		// The Fast mode draws from VRAM itself, without the texture cache
+		uint16_t w = g->vram[gro & (512 * 1024 - 1)];
+		if (texMode != 2) {
+			w = texMode == 0 ? (w >> ((uExt & 3) * 4)) & 0xF : (w >> ((uExt & 1) * 8)) & 0xFF;
+			w = g->clut[w];
+		}
+		return w;
+	}
 	uint32_t index = texMode == 0 ? (((gro >> 2) & 3) | ((gro >> 8) & 0xFC)) : (((gro >> 2) & 7) | ((gro >> 7) & 0xF8));
 	struct { uint16_t data[4]; uint32_t tag; }* c = (void*) &g->texCache[index];
 	if (c->tag != (gro & ~3u)) {
