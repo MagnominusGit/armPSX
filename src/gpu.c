@@ -1081,6 +1081,14 @@ uint32_t gpuRead(struct Psx* p, uint32_t address) {
 	return v;
 }
 
+// 15-bit pixels to the frame's.
+static void outputPixels(uint32_t* restrict dest, const uint16_t* restrict src, int32_t n) {
+	for (int32_t x = 0; x < n; x++) {
+		uint32_t v = src[x];
+		dest[x] = (v & 0x1F) << 19 | (v & 0x3E0) << 6 | (v & 0x7C00) >> 7;
+	}
+}
+
 static void outputLine(struct Psx* p) {
 	struct Gpu* g = &p->gpu;
 	uint32_t dmc = (g->displayMode & 0x40) ? 4 : (g->displayMode & 3);
@@ -1112,6 +1120,8 @@ static void outputLine(struct Psx* p) {
 			dest[x] = (s & 0xFF) << 16 | (s & 0xFF00) | (s >> 16 & 0xFF);
 			fbx = (fbx + 3) & 0x7FF;
 		}
+	} else if ((fbx >> 1) + (xe - xs) <= 1024) {
+		outputPixels(dest + xs, src + (fbx >> 1), xe - xs);
 	} else {
 		for (int32_t x = xs; x < xe; x++) {
 			uint32_t s = src[fbx >> 1];
