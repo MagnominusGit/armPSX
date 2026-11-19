@@ -37,6 +37,9 @@ struct Dma {
 	uint32_t dpcr, dicr;
 	int64_t doneAt[7];  // the cycle a running block or list transfer finishes (0: none)
 	uint32_t remaining[7], cursor[7];  // MDEC transfers waiting on the MDEC
+	bool listActive, listEnd;  // a GPU list being fed as the GPU takes it
+	uint32_t listNext;  // its next node
+	int64_t listAt;  // when it goes on
 };
 
 struct Timer {
@@ -135,7 +138,7 @@ struct Psx {
 	uint32_t frames;
 	int64_t frameStart;  // the cycle the current frame began
 	int traceIo;  // I/O accesses still to print
-	bool logCd, logDma;  // PSX_CDLOG, PSX_DMALOG
+	bool logCd, logDma, logGpu;  // PSX_CDLOG, PSX_DMALOG, PSX_GPULOG
 	uint32_t* pcRing;  // debugging: the last 256 PCs, when set
 	uint32_t pcRingAt, pcStop;
 	uint32_t watch;  // debugging: physical address whose writes are printed (0: none)
@@ -235,6 +238,7 @@ uint32_t mdecRead(struct Psx* p, uint32_t address);
 void mdecWrite(struct Psx* p, uint32_t address, uint32_t value);
 uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset);
 void mdecReset(struct Psx* p);
+bool gpuDmaCanWrite(struct Psx* p);
 bool mdecCanWrite(struct Psx* p);
 bool mdecCanRead(struct Psx* p);
 void mdecClock(struct Psx* p, void (*step)(struct Psx*));

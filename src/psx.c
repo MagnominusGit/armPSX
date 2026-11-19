@@ -11,6 +11,7 @@ struct Psx* psxCreate(void) {
 	GTE_Init();
 	p->logCd = getenv("PSX_CDLOG") != NULL;
 	p->logDma = getenv("PSX_DMALOG") != NULL;
+	p->logGpu = getenv("PSX_GPULOG") != NULL;
 	return p;
 }
 

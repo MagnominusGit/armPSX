@@ -4,6 +4,7 @@
  *
  * The GPU, ported to C from Mednafen's PS1 module (gpu.cpp, gpu_common.inc, gpu_polygon.cpp,
  * gpu_sprite.cpp, gpu_line.cpp; Copyright (C) 2011-2017 Mednafen Team, GPL-2.0-or-later). */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
@@ -769,6 +770,7 @@ static void execute(struct Psx* p, const uint32_t* cb, uint32_t cc) {
 	} else if (cc >= 0x80 && cc < 0xA0) {
 		commandCopy(g, cb);
 	} else if (cc >= 0xA0 && cc < 0xC0) {
+		if (p->logGpu) fprintf(stderr, "gpu vram write %08x %08x %08x frame %u at %lld\n", cb[0], cb[1], cb[2], p->frames, (long long) (p->cycles - p->frameStart));
 		commandTransfer(g, cb, true);
 	} else if (cc >= 0xC0 && cc < 0xE0) {
 		commandTransfer(g, cb, false);
@@ -876,17 +878,14 @@ static void processFifo(struct Psx* p) {
 	}
 }
 
-// GP0 words go through the FIFO; a full FIFO makes the GPU catch up first, as the DMA would wait.
+// GP0 words go through the FIFO; a word that finds it full is lost (Mednafen's WriteCB).
 void gpuGp0(struct Psx* p, uint32_t word) {
 	struct Gpu* g = &p->gpu;
 	if (g->fifoCount >= 16) {
-		int32_t saved = g->drawTime;
-		if (g->drawTime < 0) {
-			g->drawTime = 0;
-		}
-		processFifo(p);
-		g->drawTime += saved < 0 ? saved : 0;
-		if (g->fifoCount >= 32) {
+		int len, fifoLen;
+		bool ss;
+		commandInfo(fifoPeek(g) >> 24, &len, &fifoLen, &ss);
+		if (g->inCommand != CMD_NONE || g->fifoCount - 16 >= fifoLen) {
 			return;
 		}
 	}
@@ -903,6 +902,10 @@ static bool fifoReady(struct Gpu* g) {
 	bool ss;
 	commandInfo(fifoPeek(g) >> 24, &len, &fifoLen, &ss);
 	return g->fifoCount < fifoLen;
+}
+
+bool gpuDmaCanWrite(struct Psx* p) {
+	return fifoReady(&p->gpu);
 }
 
 static void softReset(struct Psx* p) {

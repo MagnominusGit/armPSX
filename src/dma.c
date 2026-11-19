@@ -71,6 +71,39 @@ static void finish(struct Psx* p, int channel) {
 
 static void mdecPump(struct Psx* p);
 
+// A GPU list starts each node only when the GPU's FIFO is ready (Mednafen's ChCan), then moves the
+// node's words, so a busy GPU holds the list back while the CPU runs. Each header costs 10 clocks
+// (15 with data).
+static void gpuListPump(struct Psx* p) {
+	struct Dma* d = &p->dma;
+	gpuRun(p);
+	int64_t cost = 0, wait = 0;
+	while (cost < 2048) {
+		if (d->listEnd) {
+			d->listActive = false;
+			d->listAt = 0;
+			d->doneAt[GPU] = p->cycles + cost + 1;
+			psxSchedule(p, d->doneAt[GPU]);
+			return;
+		}
+		if (!gpuDmaCanWrite(p)) {
+			wait = p->gpu.drawTime < 0 ? (1 - (int64_t) p->gpu.drawTime) / 2 : 32;
+			break;
+		}
+		uint32_t header = ramRead(p, d->listNext);
+		uint32_t address = d->listNext + 4, n = header >> 24;
+		d->listNext = header & 0xFFFFFF;
+		d->listEnd = header & 0x800000;
+		d->madr[GPU] = d->listNext;
+		for (uint32_t i = 0; i < n; i++) {
+			deviceWrite(p, GPU, ramRead(p, address + i * 4));
+		}
+		cost += (n ? 15 : 10) + n * wordCost(GPU, d->chcr[GPU]);
+	}
+	d->listAt = p->cycles + (cost > wait ? cost : wait);
+	psxSchedule(p, d->listAt);
+}
+
 static void run(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	uint32_t chcr = d->chcr[channel];
@@ -90,26 +123,12 @@ static void run(struct Psx* p, int channel) {
 		words = count;
 	} else if (sync == 2) {
 		// Linked list (GPU): each node is a header (next address, word count) and its words.
-		// The GPU takes words only while it keeps up, so the list ends about when the GPU has drawn
-		// all but its last node (Mednafen's FIFO pacing).
-		int guard = 0;
-		int32_t backlog = 0;
-		for (;;) {
-			uint32_t header = ramRead(p, address);
-			uint32_t n = header >> 24;
-			if (n && p->gpu.drawTime < 0) backlog = -p->gpu.drawTime / 2;
-			for (uint32_t i = 0; i < n; i++) {
-				deviceWrite(p, channel, ramRead(p, address + 4 + i * 4));
-			}
-			words += n + 1;
-			clocks += (n ? 15 : 10) + n * wordCost(channel, chcr);
-			address = header & 0xFFFFFF;
-			if ((address & 0x800000) || ++guard > 0x100000) {
-				break;
-			}
-		}
-		d->madr[channel] = 0xFFFFFF;
-		if (backlog > clocks) clocks = backlog;
+		// Linked list (GPU): fed node by node while the GPU's FIFO takes words (gpuListPump).
+		d->listActive = true;
+		d->listEnd = false;
+		d->listNext = address;
+		gpuListPump(p);
+		return;
 	} else if ((channel == MDEC_IN || channel == MDEC_OUT) && sync == 1) {
 		uint32_t size = d->bcr[channel] & 0xFFFF, blocks = d->bcr[channel] >> 16;
 		d->remaining[channel] = (size ? size : 0x10000) * (blocks ? blocks : 0x10000);
@@ -213,6 +232,13 @@ void dmaRun(struct Psx* p) {
 		psxSchedule(p, p->cycles + 128);
 	}
 	struct Dma* d = &p->dma;
+	if (d->listActive) {
+		if (p->cycles >= d->listAt) {
+			gpuListPump(p);
+		} else {
+			psxSchedule(p, d->listAt);
+		}
+	}
 	for (int i = 0; i < 7; i++) {
 		if (d->doneAt[i]) {
 			if (p->cycles >= d->doneAt[i]) {
@@ -231,7 +257,7 @@ static void maybeStart(struct Psx* p, int channel) {
 	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->remaining[channel]) {
 		return;
 	}
-	if (d->doneAt[channel]) {
+	if (d->doneAt[channel] || (channel == GPU && d->listActive)) {
 		// A write while the transfer runs only updates the register; the transfer goes on.
 		return;
 	}
@@ -282,6 +308,7 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 		if (!(value & 0x01000000)) {
 			d->remaining[channel] = 0;
 			d->doneAt[channel] = 0;
+			if (channel == GPU) d->listActive = false;
 		}
 		maybeStart(p, channel);
 		break;
