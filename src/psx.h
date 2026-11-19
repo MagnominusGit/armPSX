@@ -122,6 +122,10 @@ struct Sio {
 struct Disc;
 struct GpuThread;
 
+// How closely the emulation follows the hardware: Fast (the default) as PCSX-ReARMed does, Balanced as
+// SwanStation does, Exact as Mednafen does.
+enum { MODE_FAST, MODE_BALANCED, MODE_EXACT };
+
 
 struct Psx {
 	struct Cpu cpu;
@@ -138,6 +142,7 @@ struct Psx {
 	bool vblank, hretrace;
 	struct Gpu gpu;
 	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
+	int mode;  // MODE_*, from PSX_MODE (fast, balanced or exact) or the frontend
 	struct Sio sio;
 	struct Disc* disc;
 	uint32_t frames;
@@ -160,6 +165,7 @@ struct Psx {
 
 // psx.c
 struct Psx* psxCreate(void);
+int psxMode(const char* name);
 bool psxLoadBios(struct Psx* p, const char* path);
 void psxReset(struct Psx* p);
 void psxRunFrame(struct Psx* p);

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "psx.h"
 
 struct Psx* psxCreate(void) {
@@ -13,11 +14,18 @@ struct Psx* psxCreate(void) {
 	p->logDma = getenv("PSX_DMALOG") != NULL;
 	p->logGpu = getenv("PSX_GPULOG") != NULL;
 	p->ttyOut = getenv("PSX_TTY") != NULL;
+	p->mode = psxMode(getenv("PSX_MODE"));
 	const char* jit = getenv("PSX_JIT");
 	if (!jit || strcmp(jit, "0")) {
 		jitCreate(p);
 	}
 	return p;
+}
+
+int psxMode(const char* name) {
+	if (name && !strcasecmp(name, "exact")) return MODE_EXACT;
+	if (name && !strcasecmp(name, "balanced")) return MODE_BALANCED;
+	return MODE_FAST;
 }
 
 bool psxLoadBios(struct Psx* p, const char* path) {

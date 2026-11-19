@@ -103,6 +103,11 @@ void retro_set_environment(retro_environment_t cb) {
 	static const struct retro_controller_description pads[] = { { "PlayStation Controller", RETRO_DEVICE_JOYPAD } };
 	static const struct retro_controller_info ports[] = { { pads, 1 }, { pads, 1 }, { NULL, 0 } };
 	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
+	static const struct retro_variable options[] = {
+		{ "armpsx_mode", "Mode (restart); Fast|Balanced|Exact" },
+		{ NULL, NULL },
+	};
+	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*) options);
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -153,6 +158,8 @@ bool retro_load_game(const struct retro_game_info* game) {
 	enum retro_pixel_format format = RETRO_PIXEL_FORMAT_XRGB8888;
 	if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format)) return false;
 	psx = psxCreate();
+	struct retro_variable mode = { "armpsx_mode", NULL };
+	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &mode) && mode.value) psx->mode = psxMode(mode.value);
 	snprintf(gamePath, sizeof gamePath, "%s", game->path);
 	if (hasExtension(game->path, ".exe")) {
 		FILE* f = fopen(game->path, "rb");

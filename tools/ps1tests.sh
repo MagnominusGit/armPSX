@@ -3,6 +3,7 @@
 # with its real-hardware log (psx.log) or VRAM picture (vram.png).
 RUN=$1 BIOS=$2 BIN=$3 REF=$4 FRAMES=${5:-600}
 OUT=${OUT:-/tmp/ps1tests}
+export PSX_MODE=${PSX_MODE:-exact}
 mkdir -p "$OUT"
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 cd "$BIN" || exit 1
