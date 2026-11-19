@@ -484,6 +484,61 @@ static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 			stCommit(k, pending);
 			aStr(e, X5, X19, GPR_OFF(fn == 0x11 ? 32 : 33));
 			return;
+		case 0x10: case 0x12:
+			stUses(k, rd);
+			stCommit(k, pending);
+			stFlush(k);
+			aStrX(e, X21, X19, OFF(cycles));
+			aMovX(e, X0, X19);
+			callC(e, (const void*) cpuJitWaitMuldiv);
+			aLdrX(e, X21, X19, OFF(cycles));
+			stAfterWait(k);
+			if (rd) {
+				aLdr(e, X0, X19, GPR_OFF(fn == 0x10 ? 32 : 33));
+				aStr(e, X0, X19, GPR_OFF(rd));
+			}
+			return;
+		case 0x18: case 0x19:
+			loadGpr(e, X6, rs);
+			loadGpr(e, X7, rt);
+			if (fn == 0x18) {
+				aAsrImm(e, X8, X6, 31);
+				aDp(e, A_EOR, X8, X6, X8, S_LSL, 0);
+			} else {
+				aMov(e, X8, X6);
+			}
+			aLogicImm(e, A_ORR_IMM, X8, X8, 0x400);
+			aClz(e, X8, X8);
+			// 7, plus 3 below 21 leading zeros, plus 4 more below 12
+			movI(e, X9, 7);
+			aCmpImm(e, X8, 21);
+			aCset(e, X10, C_LO);
+			aDp(e, A_ADD, X9, X9, X10, S_LSL, 0);
+			aDp(e, A_ADD, X9, X9, X10, S_LSL, 1);
+			aCmpImm(e, X8, 12);
+			aCset(e, X10, C_LO);
+			aDp(e, A_ADD, X9, X9, X10, S_LSL, 2);
+			aDp(e, A_ADD | W64, X9, X21, X9, S_LSL, 0);
+			aStrX(e, X9, X19, OFF(cpu.muldivDone));
+			if (fn == 0x18) aSmull(e, X5, X6, X7);
+			else aUmull(e, X5, X6, X7);
+			aStr(e, X5, X19, GPR_OFF(33));
+			aLsrImmX(e, X5, X5, 32);
+			aStr(e, X5, X19, GPR_OFF(32));
+			stUses(k, rs); stUses(k, rt);
+			stCommit(k, pending);
+			return;
+		case 0x1A: case 0x1B:
+			loadGpr(e, X1, rs);
+			loadGpr(e, X2, rt);
+			aMovX(e, X0, X19);
+			movI(e, X3, fn == 0x1A);
+			callC(e, (const void*) cpuJitDivide);
+			aDpImm(e, A_ADD_IMM | W64, X0, X21, 37);
+			aStrX(e, X0, X19, OFF(cpu.muldivDone));
+			stUses(k, rs); stUses(k, rt);
+			stCommit(k, pending);
+			return;
 		case 0x2A: case 0x2B:
 			loadGpr(e, X6, rs);
 			loadGpr(e, X7, rt);
@@ -584,6 +639,71 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	movI(e, X1, target);
 	aCsel(e, X0, X1, X0, cc);
 	aStr(e, X0, X19, OFF(cpu.next));
+}
+
+static void waitGte(struct Emitter* e) {
+	aLdrX(e, X0, X19, OFF(cpu.gteDone));
+	aCmpX(e, X21, X0);
+	aCselX(e, X21, X0, X21, C_LT);
+}
+
+// LWC2/SWC2 (see jit_x64.h). Calls keep x19-x28 only, so SWC2 keeps its address on the stack across
+// the GTE call.
+static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
+	struct Emitter* e = &k->e;
+	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
+	aLdr(e, X0, X19, OFF(cpu.sr));
+	slowAt(k, aTbz(e, X0, 30, NULL));
+	address(k, instr, 4);
+	if (op == 0x3A) {
+		aLdr(e, X0, X19, OFF(cpu.sr));
+		slowAt(k, aTbnz(e, X0, 16, NULL));
+	}
+	uint8_t* scratchSite;
+	ramOffset(k, &scratchSite);
+	if (op == 0x3A) {
+		aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
+		uint8_t* write = aB(e, NULL);
+		patchHere(e, scratchSite);
+		aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+		aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
+		patchHere(e, write);
+		stUses(k, rs);
+		stCommit(k, pending);
+		waitGte(e);
+		aPush(e, X11, X30, 16);
+		movI(e, X0, rt);
+		callC(e, (const void*) GTE_ReadDR);
+		aPop(e, X11, X30, 16);
+		aStr(e, X0, X11, 0);
+		return;
+	}
+	struct State start = k->st;
+	uint8_t* done = NULL;
+	for (int pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			k->st = start;
+			patchHere(e, scratchSite);
+			aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+		}
+		aLdst(e, L_LDR, X5, pass == 0 ? X23 : X25, X9, L_UXTW);
+		stUses(k, rs);
+		stCommit(k, pending);
+		int surcharge = stBeginRead(k);
+		if (pass == 0) {
+			if (surcharge < 0) bSurchargeIndirect(k);
+			aDpImm(e, A_ADD_IMM | W64, X21, X21, 4 + (surcharge > 0 ? surcharge : 0));
+			storeByteI(e, OFF(cpu.ldAbsorb), 4);
+		} else {
+			aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
+		}
+		if (pass == 0) done = aB(e, NULL);
+	}
+	patchHere(e, done);
+	waitGte(e);
+	movI(e, X0, rt);
+	aMov(e, X1, X5);
+	callC(e, (const void*) GTE_WriteDR);
 }
 
 static void emitGte(struct Compile* k, uint32_t instr, int pending) {
