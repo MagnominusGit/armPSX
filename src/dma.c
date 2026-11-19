@@ -130,10 +130,6 @@ static void run(struct Psx* p, int channel) {
 	if (channel == OTC) {
 		clocks = words;
 	}
-	if (channel == GPU && p->gpu.drawTime < 0) {
-		// The transfer waits on the GPU's FIFO while the GPU draws.
-		clocks += -p->gpu.drawTime / 2;
-	}
 	if (sync == 0) {
 		// Immediate transfers hold the CPU.
 		p->cycles += clocks;
