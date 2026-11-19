@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
 	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
 	if (getenv("PSXRUN_STATE")) {
 		fprintf(stderr, "sr %08x cause %08x epc %08x istat %03x imask %03x dicr %08x\n", p->cpu.sr, p->cpu.cause, p->cpu.epc, p->iStat, p->iMask, p->dma.dicr);
+		fprintf(stderr, "gpu inCommand %d code %08x fifo %d drawTime %d dmaControl %u fifo0 %08x rw %u,%u %ux%u cur %u,%u\n", p->gpu.inCommand, p->gpu.inCommandCode, p->gpu.fifoCount, p->gpu.drawTime, p->gpu.dmaControl, p->gpu.fifo[p->gpu.fifoRead & 31], p->gpu.rwX, p->gpu.rwY, p->gpu.rwW, p->gpu.rwH, p->gpu.rwCurX, p->gpu.rwCurY);
 		for (int c = 0; c < 7; c++) fprintf(stderr, "dma%d chcr %08x madr %06x bcr %08x doneAt %lld\n", c, p->dma.chcr[c], p->dma.madr[c], p->dma.bcr[c], (long long) p->dma.doneAt[c]);
 		for (int i = 0; i < 16; i++) {
 			cpuRun(p, p->cycles + 1);

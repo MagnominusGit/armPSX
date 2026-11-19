@@ -90,10 +90,14 @@ static void run(struct Psx* p, int channel) {
 		words = count;
 	} else if (sync == 2) {
 		// Linked list (GPU): each node is a header (next address, word count) and its words.
+		// The GPU takes words only while it keeps up, so the list ends about when the GPU has drawn
+		// all but its last node (Mednafen's FIFO pacing).
 		int guard = 0;
+		int32_t backlog = 0;
 		for (;;) {
 			uint32_t header = ramRead(p, address);
 			uint32_t n = header >> 24;
+			if (n && p->gpu.drawTime < 0) backlog = -p->gpu.drawTime / 2;
 			for (uint32_t i = 0; i < n; i++) {
 				deviceWrite(p, channel, ramRead(p, address + 4 + i * 4));
 			}
@@ -105,6 +109,7 @@ static void run(struct Psx* p, int channel) {
 			}
 		}
 		d->madr[channel] = 0xFFFFFF;
+		if (backlog > clocks) clocks = backlog;
 	} else if ((channel == MDEC_IN || channel == MDEC_OUT) && sync == 1) {
 		uint32_t size = d->bcr[channel] & 0xFFFF, blocks = d->bcr[channel] >> 16;
 		d->remaining[channel] = (size ? size : 0x10000) * (blocks ? blocks : 0x10000);

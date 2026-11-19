@@ -20,7 +20,7 @@ static uint32_t ioRead(struct Psx* p, uint32_t a, int size) {
 	uint32_t v = ioReadInner(p, a, size);
 	if (p->traceIo > 0) {
 		p->traceIo--;
-		fprintf(stderr, "io r%d %08x = %08x pc %08x\n", size * 8, a, v, p->cpu.pc);
+		fprintf(stderr, "io r%d %08x = %08x pc %08x at %lld sr %x\n", size * 8, a, v, p->cpu.pc, (long long) (p->cycles - p->frameStart), p->cpu.sr & 0xFF);
 	}
 	return v;
 }
@@ -85,7 +85,7 @@ static uint32_t ioReadInner(struct Psx* p, uint32_t a, int size) {
 static void ioWrite(struct Psx* p, uint32_t a, uint32_t v, int size) {
 	if (p->traceIo > 0) {
 		p->traceIo--;
-		fprintf(stderr, "io w%d %08x = %08x pc %08x\n", size * 8, a, v, p->cpu.pc);
+		fprintf(stderr, "io w%d %08x = %08x pc %08x at %lld sr %x\n", size * 8, a, v, p->cpu.pc, (long long) (p->cycles - p->frameStart), p->cpu.sr & 0xFF);
 	}
 	if (p->cycles >= p->nextEvent) {
 		psxEvents(p);
