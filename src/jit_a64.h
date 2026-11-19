@@ -86,7 +86,7 @@ static void loadGpr(struct Emitter* e, int host, int reg) {
 	}
 }
 
-enum { FAST_JIT = 0 };  // the Fast mode's code isn't here yet: its blocks are the Exact mode's
+enum { FAST_JIT = 1 };  // this backend has the Fast and Balanced modes' code
 
 struct Compile {
 	struct Emitter e;
@@ -173,15 +173,26 @@ static void bCommitLoad(struct Compile* k, int reg) {
 	if (!reg) aStr(e, ZR, X19, GPR_OFF(0));
 }
 
-static void bCommitDynamic(struct Compile* k);
-
+// The Fast and Balanced modes' commits: the value only.
 static void bCommitLoadFast(struct Compile* k, int reg) {
-	(void) reg;
-	bCommitDynamic(k);
+	struct Emitter* e = &k->e;
+	if (reg) {
+		aLdr(e, X0, X19, OFF(cpu.ldValue));
+		aStr(e, X0, X19, GPR_OFF(reg));
+	}
+	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
 }
 
 static void bCommitDynamicFast(struct Compile* k) {
-	bCommitDynamic(k);
+	struct Emitter* e = &k->e;
+	aLdr(e, X0, X19, OFF(cpu.ldReg));
+	aCmpImm(e, X0, NO_LOAD);
+	uint8_t* none = aBcond(e, C_EQ, NULL);
+	aLdr(e, X1, X19, OFF(cpu.ldValue));
+	aLdst(e, L_STR, X1, X19, X0, L_UXTW | SCALED);
+	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
+	aStr(e, ZR, X19, GPR_OFF(0));
+	patchHere(e, none);
 }
 
 static void bCommitDynamic(struct Compile* k) {
@@ -454,6 +465,17 @@ static void ramOffset(struct Compile* k, uint8_t** otherSite) {
 	*otherSite = aBcond(e, C_MI, NULL);
 }
 
+// The Fast and Balanced modes: a store to a page recompiled code came from goes the slow way, which
+// throws the code out (x9 = the RAM offset; w0 and x1 are scratch).
+static void codePageCheck(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	if (!k->fast) return;
+	aLsrImm(e, X0, X9, 12);
+	aAddImmX(e, X1, X19, OFF(codePage));
+	aLdst(e, L_LDRB, X0, X1, X0, L_UXTW);
+	slowAt(k, aCbnz(e, X0, NULL));
+}
+
 // Not RAM: w9 = the scratchpad offset of the address in w10, or the slow path. The scratchpad is
 // (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000 (w2 and w3 are scratch).
 static void scratchOffset(struct Compile* k) {
@@ -507,8 +529,15 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	aLdst(e, loads[op - 0x20], X5, pass == 0 ? X23 : X25, X9, L_UXTW);
 	stUses(k, rs);
 	stCommit(k, cancelSame(k, pending, rt));
+	if (k->immediate) {
+		if (k->balanced && pass == 0) aDpImm(e, A_ADD_IMM | W64, X21, X21, 5);
+		if (rt) aStr(e, X5, X19, GPR_OFF(rt));
+		return;
+	}
 	int surcharge = stBeginRead(k);
-	if (pass == 0) {
+	if (k->fast) {
+		if (k->balanced && pass == 0) aDpImm(e, A_ADD_IMM | W64, X21, X21, 5);
+	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + (surcharge > 0 ? surcharge : 0));
 		storeByteI(e, OFF(cpu.ldAbsorb), 5);
@@ -527,7 +556,9 @@ static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	stUses(k, rs);
 	stCommit(k, pending);
 	int surcharge = stBeginRead(k);
-	if (pass == 0) {
+	if (k->fast) {
+		if (k->balanced && pass == 0) aDpImm(e, A_ADD_IMM | W64, X21, X21, 4);
+	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		aDpImm(e, A_ADD_IMM | W64, X21, X21, 4 + (surcharge > 0 ? surcharge : 0));
 		storeByteI(e, OFF(cpu.ldAbsorb), 4);
@@ -556,6 +587,7 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	slowAt(k, aTbnz(e, X0, 16, NULL));
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
+	codePageCheck(k);
 	aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
 	coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 	loadGpr(e, X5, rt);
@@ -572,10 +604,12 @@ static void bCold(struct Compile* k, struct Cold* c) {
 	struct Emitter* e = &k->e;
 	patchHere(e, c->site);
 	k->st = c->start;
+	k->immediate = c->immediate;
 	scratchOffset(k);
 	if (c->kind == COLD_STORE) aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
 	if (c->kind == COLD_LOAD) loadPass(k, c->instr, c->pending, 1);
 	if (c->kind == COLD_LWC2) lwc2Pass(k, c->instr, c->pending, 1);
+	k->immediate = false;
 	aB(e, c->back);
 }
 
@@ -611,12 +645,14 @@ static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 		case 0x10: case 0x12:
 			stUses(k, rd);
 			stCommit(k, pending);
-			stFlush(k);
-			aStrX(e, X21, X19, OFF(cycles));
-			aMovX(e, X0, X19);
-			callC(e, (const void*) cpuJitWaitMuldiv);
-			aLdrX(e, X21, X19, OFF(cycles));
-			stAfterWait(k);
+			if (!k->fast || k->balanced) {
+				stFlush(k);
+				aStrX(e, X21, X19, OFF(cycles));
+				aMovX(e, X0, X19);
+				callC(e, (const void*) cpuJitWaitMuldiv);
+				aLdrX(e, X21, X19, OFF(cycles));
+				stAfterWait(k);
+			}
 			if (rd) {
 				aLdr(e, X0, X19, GPR_OFF(fn == 0x10 ? 32 : 33));
 				aStr(e, X0, X19, GPR_OFF(rd));
@@ -786,6 +822,7 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
+		codePageCheck(k);
 		aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
 		coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 		stUses(k, rs);
