@@ -182,6 +182,7 @@ static uint32_t IRQAddr;
 static uint32_t RWAddr;
 static uint16_t SPUControl;
 static uint32_t VoiceOn;
+static uint32_t QuietVoices;  // the Fast mode: silent, released voices, left alone until keyed on or written
 static uint32_t VoiceOff;
 static uint32_t BlockEnd;
 static uint32_t CWA;
@@ -557,6 +558,7 @@ static const int16_t FIR_Table[256][4] =
 void SPU_Power(void)
 {
  clock_divider = 768;
+ QuietVoices = 0;
 
  memset(SPURAM, 0, sizeof(SPURAM));
 
@@ -1339,7 +1341,7 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
    int32_t voice_pvs;
 
    // The Fast mode leaves a silent, released voice alone until it's keyed on again.
-   if(P->mode == MODE_FAST && !(int16_t)voice->ADSR.EnvLevel && voice->ADSR.Phase == ADSR_RELEASE && !(VoiceOn & (1U << voice_num)))
+   if((QuietVoices & ~VoiceOn) & (1U << voice_num))
    {
     voice->PreLRSample = 0;
     if(voice_num == 1 || voice_num == 3)
@@ -1498,6 +1500,11 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
     voice->ADSR.Phase = ADSR_RELEASE;
     voice->ADSR.EnvLevel = 0;
    }
+
+   if(P->mode == MODE_FAST && !(int16_t)voice->ADSR.EnvLevel && voice->ADSR.Phase == ADSR_RELEASE)
+    QuietVoices |= 1U << voice_num;
+   else
+    QuietVoices &= ~(1U << voice_num);
   }
 
   VoiceOff = 0;
@@ -1621,6 +1628,7 @@ void SPU_Write(int64_t timestamp, uint32_t A, uint16_t V)
   if(A < 0x260)
   {
    SPU_Voice *voice = &Voices[(A - 0x200) >> 2];
+   QuietVoices &= ~(1U << ((A - 0x200) >> 2));
    Sweep_WriteVolume(&voice->Sweep[(A & 2) >> 1], V);
   }
   else if(A < 0x280)
@@ -1633,6 +1641,7 @@ void SPU_Write(int64_t timestamp, uint32_t A, uint16_t V)
  {
   SPU_Voice *voice = &Voices[A >> 4];
 
+  QuietVoices &= ~(1U << (A >> 4));
   switch(A & 0xF)
   {
    case 0x00:
@@ -1896,6 +1905,11 @@ void spuReset(struct Psx* p) {
  memset(SPURAM, 0, sizeof SPURAM);
  IntermediateBufferPos = 0;
  SPU_Power();
+ for(int i = 0; i < 24; i++)
+ {
+  if(p->mode == MODE_FAST && !(int16_t)Voices[i].ADSR.EnvLevel && Voices[i].ADSR.Phase == ADSR_RELEASE)
+   QuietVoices |= 1U << i;
+ }
 }
 
 uint16_t spuRead(struct Psx* p, uint32_t address) {
