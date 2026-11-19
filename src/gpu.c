@@ -1193,9 +1193,16 @@ void gpuRun(struct Psx* p) {
 			g->curYOffset = (g->curYOffset + 1) & 0x1FF;
 		}
 	}
+	// Mednafen wakes the GPU every 128 cycles at most; that's only needed while commands wait for drawing
+	// time or timer 0 counts dots. Otherwise the next line edge is the next thing that happens.
 	int64_t next = ((((int64_t) g->lineCounter) << 16) - (int64_t) g->clockCounter + g->clockRatio - 1) / g->clockRatio;
+	if (p->timer[0].mode & 0x100) {
+		if (next > 128) next = 128;
+	} else if (g->drawTime < 0 && (g->fifoCount || (g->inCommand & (CMD_QUAD | CMD_PLINE)))) {
+		int64_t ready = (1 - (int64_t) g->drawTime) / 2;
+		if (next > ready) next = ready;
+	}
 	if (next < 1) next = 1;
-	if (next > 128) next = 128;
 	psxSchedule(p, p->cycles + next);
 }
 

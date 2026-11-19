@@ -167,6 +167,7 @@ uint32_t timerRead(struct Psx* p, uint32_t address) {
 	if (i == 3) {
 		return 0;
 	}
+	gpuRun(p);
 	timersRun(p);
 	struct Timer* t = &p->timer[i];
 	switch (address & 0xC) {
@@ -189,6 +190,7 @@ void timerWrite(struct Psx* p, uint32_t address, uint32_t value) {
 	if (i == 3) {
 		return;
 	}
+	gpuRun(p);
 	timersRun(p);
 	struct Timer* t = &p->timer[i];
 	switch (address & 0xC) {
