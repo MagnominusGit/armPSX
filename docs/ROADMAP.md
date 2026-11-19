@@ -11,7 +11,7 @@ option list was read, never its code. armPSX's core has no options yet.
 | CPU | Overclocking 50-290% | none | **wanted**: CPU clock option (same range) |
 | CPU | Recompiler icache, block linking, fast memory (+ rewrite) | always exact icache; links on; RAM fast path inline | nothing to expose |
 | Console | Region (auto/J/U/PAL), per-region BIOS, fast boot, 8 MB dev RAM | region from disc; one BIOS | region option, BIOS per region, fast boot (skip the logo) |
-| CD-ROM | Region check, read thread, preload/pre-cache CHD, readahead, mute CD audio, read speedup 1-10x, seek speedup | CHD/cue read in the frame | read and seek speedup, mute CD audio, preload; region check off |
+| CD-ROM | Region check, read thread, preload/pre-cache CHD, readahead, mute CD audio, read speedup 1-10x, seek speedup | CHD/cue read in the frame | **wanted**: fast disk mode (read and seek speedup); mute CD audio, preload; region check off |
 | CD-ROM | Apply image patches (PPF) | none | PPF soft patches |
 | Video | Renderer (software, OpenGL, Vulkan, D3D), resolution scale 1-16x, MSAA, true colour, scaled dithering, texture filtering, downsampling, shader precompile, threaded software | software, native resolution | **wanted**: NEON software renderer, then GPU renderer (scale, true colour, filtering, MSAA) |
 | Video | PGXP (geometry, culling, perspective textures/colours, depth buffer, vertex cache, CPU mode, tolerance) | none | with the GPU renderer |
