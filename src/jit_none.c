@@ -26,3 +26,8 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 void jitStats(struct Psx* p, uint64_t* out) {
 	for (int i = 0; i < 6; i++) out[i] = 0;
 }
+
+void jitDump(struct Psx* p, const char* path) {
+	(void) p;
+	(void) path;
+}

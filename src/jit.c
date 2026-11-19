@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -21,7 +22,7 @@
 // against the most the block can take before its next instruction through the interpreter, and
 // again after each such instruction; near the limit they hand over to the careful one.
 
-enum { ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE = 1 << 19, NO_LOAD = 34, DYNAMIC = -1 };
+enum { PAGES = 4096, ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE = 1 << 19, NO_LOAD = 34, DYNAMIC = -1 };
 enum { GENERIC, CLEAN, CAREFUL };
 
 struct Block {
@@ -44,6 +45,7 @@ struct Jit {
 	void (*enter)(struct Psx*, int64_t, uint8_t*);
 	uint8_t* leave;     // stores the cycle count and returns
 	uint8_t* dispatch;  // on to the block at cpu.pc, or out
+	int64_t* pages;  // for each 1 MB page, what an address in it adds to make its RAM offset (negative when it isn't RAM); then the block table
 	struct Block** table;
 	struct Block* blocks;
 	int blockCount;
@@ -68,6 +70,15 @@ struct State {
 };
 
 struct Compile;
+
+// An instruction's way to the interpreter when its fast path can't do it, compiled after the block's end.
+struct Slow {
+	uint8_t* sites[BLOCK_MAX * 2];
+	int count, i;
+	bool after;
+	struct State before;
+	uint8_t* back;
+};
 static void stAbsorbStep(struct Compile* k);
 static void stUses(struct Compile* k, int reg);
 static void stCommit(struct Compile* k, int reg);
@@ -345,6 +356,8 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		bDecline(&k, bound, gte, b->body[CAREFUL]);
 	}
 	int pending = version == CLEAN ? NO_LOAD : DYNAMIC;
+	struct Slow slow[BLOCK_MAX];
+	int slowCount = 0;
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = b->pc + 4 * i, instr = b->words[i];
 		bool delay = b->delay && i == b->count - 1;
@@ -385,32 +398,45 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			else if (kind(instr) == 2) emitBranch(&k, a, instr, pending);
 			else emitAlu(&k, instr, pending);
 			if (k.slowCount) {
-				// The slow path: memory as it stood before the instruction, then the interpreter,
-				// which leaves memory as the fast path's state has it
-				uint8_t* over = bJump(&k);
-				bPatchSlows(&k);
-				struct State fast = k.st;
-				k.st = before;
-				stFlush(&k);
-				k.st = fast;
-				bHelper(&k, a, instr, delay);
-				if (after) {
-					bool gte;
-					int bound = boundFrom(j, b, inl, i + 1, &gte);
-					bCheck(&k, bound, gte, i + 1);
-				}
-				bPatchHere(&k, over);
+				// The slow path, after the block's end
+				struct Slow* d = &slow[slowCount++];
+				memcpy(d->sites, k.slows, k.slowCount * sizeof *k.slows);
+				d->count = k.slowCount;
+				d->before = before;
+				d->i = i;
+				d->after = after;
+				d->back = bHere(&k);
 			}
 		}
 		pending = leavesLoad(instr);
 	}
 	stFlush(&k);
+	struct State atEnd = k.st;
 	// The next block's version, when the state here decides it
 	int next = pending != NO_LOAD ? GENERIC : allZero(&k.st) ? CLEAN : DYNAMIC;
 	for (int r = 0; r < 32 && next == DYNAMIC; r++) {
 		if (k.st.absorb[r] > 0) next = GENERIC;
 	}
 	bEnd(&k, b, next);
+	for (int s = 0; s < slowCount; s++) {
+		// Memory as it stood before the instruction, then the interpreter, which leaves memory as
+		// the fast path's state has it; then back after the fast path
+		struct Slow* d = &slow[s];
+		int i = d->i;
+		memcpy(k.slows, d->sites, d->count * sizeof *k.slows);
+		k.slowCount = d->count;
+		bPatchSlows(&k);
+		k.st = d->before;
+		stFlush(&k);
+		bHelper(&k, b->pc + 4 * i, b->words[i], b->delay && i == b->count - 1);
+		if (d->after) {
+			bool gte;
+			int bound = boundFrom(j, b, inl, i + 1, &gte);
+			bCheck(&k, bound, gte, i + 1);
+		}
+		bJumpTo(&k, d->back);
+	}
+	k.st = atEnd;
 	return bFinish(&k, b);
 }
 
@@ -568,7 +594,14 @@ bool jitCreate(struct Psx* p) {
 	struct Jit* j = calloc(1, sizeof *j);
 	if (!j) return false;
 	j->arena = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	j->table = calloc(TABLE_SIZE, sizeof *j->table);
+	j->pages = calloc(PAGES + TABLE_SIZE, sizeof *j->pages);
+	j->table = j->pages ? (struct Block**) (j->pages + PAGES) : NULL;
+	// RAM: KUSEG, KSEG0 or KSEG1 below 8 MB, mirrored every 2 MB
+	for (int i = 0; j->pages && i < PAGES; i++) {
+		int seg = i >> 9;
+		bool ram = (seg == 0 || seg == 4 || seg == 5) && (i & 0x1FF) < 8;
+		j->pages[i] = ram ? ((int64_t) (i & 1) << 20) - ((int64_t) i << 20) : -((int64_t) 1 << 40);
+	}
 	j->blocks = calloc(BLOCKS_MAX, sizeof *j->blocks);
 	// The GTE's commands take a fixed time each; finding it out here leaves the GTE as psxReset
 	// starts it anyway.
@@ -582,7 +615,7 @@ bool jitCreate(struct Psx* p) {
 	}
 	if (j->arena == MAP_FAILED || !j->table || !j->blocks) {
 		if (j->arena != MAP_FAILED) munmap(j->arena, ARENA_SIZE);
-		free(j->table);
+		free(j->pages);
 		free(j->blocks);
 		free(j);
 		return false;
@@ -595,7 +628,7 @@ void jitFree(struct Psx* p) {
 	struct Jit* j = p->jit;
 	if (!j) return;
 	munmap(j->arena, ARENA_SIZE);
-	free(j->table);
+	free(j->pages);
 	free(j->blocks);
 	free(j);
 	p->jit = NULL;
@@ -667,6 +700,29 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
 	}
 	*instr = 0;
 	return 1;
+}
+
+// For psxrun: the recompiled code (path.bin) and where each block's versions are in it (path.txt).
+void jitDump(struct Psx* p, const char* path) {
+	struct Jit* j = p->jit;
+	if (!j) return;
+	char name[512];
+	snprintf(name, sizeof name, "%s.bin", path);
+	FILE* f = fopen(name, "wb");
+	if (!f) return;
+	fwrite(j->arena, 1, j->used, f);
+	fclose(f);
+	snprintf(name, sizeof name, "%s.txt", path);
+	f = fopen(name, "w");
+	if (!f) return;
+	for (int i = 0; i < j->blockCount; i++) {
+		struct Block* b = &j->blocks[i];
+		for (int v = 0; v < 3; v++) {
+			fprintf(f, "%08x %d %d %lx %lx\n", b->pc, b->count, v, (unsigned long) (b->body[v] - j->arena),
+			        (unsigned long) (b->end[v] - j->arena));
+		}
+	}
+	fclose(f);
 }
 
 // For psxrun: what the recompiler did.

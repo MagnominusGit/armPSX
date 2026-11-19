@@ -204,12 +204,8 @@ static uint8_t* bHere(struct Compile* k) {
 	return k->e.p;
 }
 
-static uint8_t* bJump(struct Compile* k) {
-	return aB(&k->e, NULL);
-}
-
-static void bPatchHere(struct Compile* k, uint8_t* site) {
-	patchHere(&k->e, site);
+static void bJumpTo(struct Compile* k, uint8_t* target) {
+	aB(&k->e, target);
 }
 
 static void slowAt(struct Compile* k, uint8_t* site) {
@@ -430,26 +426,29 @@ static void flushCode(uint8_t* start, uint8_t* end) {
 
 // The instructions.
 
-// w9 = the RAM offset of the address in w10, or the slow path when it isn't RAM; the scratchpad is
-// tried first and taken at *scratchSite. w2-w4 are scratch.
-static void ramOffset(struct Compile* k, uint8_t** scratchSite) {
+// x9 = the RAM offset of the address in w10, from its 1 MB page's entry in the table before the
+// block table (x3 and x4 are scratch); taken at *otherSite when it isn't RAM.
+static void ramOffset(struct Compile* k, uint8_t** otherSite) {
+	struct Emitter* e = &k->e;
+	aLsrImm(e, X3, X10, 20);
+	aDpImm(e, A_SUB_IMM | W64, X4, X24, PAGES * 8);
+	aLdst(e, L_LDRX, X9, X4, X3, L_UXTW | SCALED);
+	aDp(e, A_ADDS | W64, X9, X9, X10, S_LSL, 0);
+	*otherSite = aBcond(e, C_MI, NULL);
+}
+
+// Not RAM: w9 = the scratchpad offset of the address in w10, or the slow path. The scratchpad is
+// (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000 (w2 and w3 are scratch).
+static void scratchOffset(struct Compile* k) {
 	struct Emitter* e = &k->e;
 	aLogicImm(e, A_AND_IMM, X2, X10, 0x7FFFFC00);
 	movI(e, X3, 0x1F800000);
 	aCmp(e, X2, X3);
-	uint8_t* notScratch = aBcond(e, C_NE, NULL);
+	slowAt(k, aBcond(e, C_NE, NULL));
 	movI(e, X3, 0xA0000000);
 	aCmp(e, X10, X3);
-	*scratchSite = aBcond(e, C_LO, NULL);
-	patchHere(e, notScratch);
-	aLogicImm(e, A_AND_IMM, X9, X10, 0x1FFFFFFF);
-	aCmpImm(e, X9, 0x800000);
 	slowAt(k, aBcond(e, C_HS, NULL));
-	aLsrImm(e, X3, X10, 29);
-	movI(e, X4, 0x31);
-	aDp(e, A_LSRV, X4, X4, X3, S_LSL, 0);
-	slowAt(k, aTbz(e, X4, 0, NULL));
-	aLogicImm(e, A_AND_IMM, X9, X9, RAM_SIZE - 1);
+	aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
 }
 
 static void address(struct Compile* k, uint32_t instr, int width) {
@@ -483,15 +482,15 @@ static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
 	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	static const uint32_t loads[6] = { L_LDRSB, L_LDRSH, 0, L_LDR, L_LDRB, L_LDRH };
 	address(k, instr, width);
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	struct State start = k->st;
 	uint8_t* done = NULL;
 	for (int pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
 			k->st = start;
-			patchHere(e, scratchSite);
-			aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+			patchHere(e, otherSite);
+			scratchOffset(k);
 		}
 		aLdst(e, loads[op - 0x20], X5, pass == 0 ? X23 : X25, X9, L_UXTW);
 		stUses(k, rs);
@@ -518,12 +517,12 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	address(k, instr, width);
 	aLdr(e, X0, X19, OFF(cpu.sr));
 	slowAt(k, aTbnz(e, X0, 16, NULL));
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
 	uint8_t* write = aB(e, NULL);
-	patchHere(e, scratchSite);
-	aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+	patchHere(e, otherSite);
+	scratchOffset(k);
 	aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
 	patchHere(e, write);
 	loadGpr(e, X5, rt);
@@ -739,13 +738,13 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 		aLdr(e, X0, X19, OFF(cpu.sr));
 		slowAt(k, aTbnz(e, X0, 16, NULL));
 	}
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
 		aDp(e, A_ADD | W64, X11, X23, X9, S_LSL, 0);
 		uint8_t* write = aB(e, NULL);
-		patchHere(e, scratchSite);
-		aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+		patchHere(e, otherSite);
+		scratchOffset(k);
 		aDp(e, A_ADD | W64, X11, X25, X9, S_LSL, 0);
 		patchHere(e, write);
 		stUses(k, rs);
@@ -763,8 +762,8 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	for (int pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
 			k->st = start;
-			patchHere(e, scratchSite);
-			aLogicImm(e, A_AND_IMM, X9, X10, 0x3FF);
+			patchHere(e, otherSite);
+			scratchOffset(k);
 		}
 		aLdst(e, L_LDR, X5, pass == 0 ? X23 : X25, X9, L_UXTW);
 		stUses(k, rs);

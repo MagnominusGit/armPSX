@@ -150,12 +150,8 @@ static uint8_t* bHere(struct Compile* k) {
 	return k->e.p;
 }
 
-static uint8_t* bJump(struct Compile* k) {
-	return xJmp(&k->e, NULL);
-}
-
-static void bPatchHere(struct Compile* k, uint8_t* site) {
-	patchHere(&k->e, site);
+static void bJumpTo(struct Compile* k, uint8_t* target) {
+	xJmp(&k->e, target);
 }
 
 static void slowJump(struct Compile* k, int cc) {
@@ -375,29 +371,29 @@ static void flushCode(uint8_t* start, uint8_t* end) {
 
 // The instructions.
 
-// edx = the RAM offset of the address in ecx, or the slow path when it isn't RAM (r8 and eax are
-// scratch); the scratchpad is tried first and taken at *scratchSite.
-static void ramOffset(struct Compile* k, uint8_t** scratchSite) {
+// rdx = the RAM offset of the address in ecx, from its 1 MB page's entry in the table before the
+// block table (rax is scratch); taken at *otherSite when it isn't RAM.
+static void ramOffset(struct Compile* k, uint8_t** otherSite) {
 	struct Emitter* e = &k->e;
-	// The scratchpad: (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000
+	xMovRR(e, 4, RAX, RCX);
+	xShiftI(e, X_SHR, 4, R(RAX), 20);
+	xLoad(e, 8, RDX, MI(R12, RAX, 8, -PAGES * 8));
+	xAluRR(e, X_ADD, 8, R(RDX), RCX);
+	*otherSite = xJcc(e, CC_S, NULL);
+}
+
+// Not RAM: edx = the scratchpad offset of the address in ecx, or the slow path. The scratchpad is
+// (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000.
+static void scratchOffset(struct Compile* k) {
+	struct Emitter* e = &k->e;
 	xMovRR(e, 4, RAX, RCX);
 	xAluI(e, X_AND, 4, R(RAX), 0x7FFFFC00);
 	xAluI(e, X_CMP, 4, R(RAX), 0x1F800000);
-	uint8_t* notScratch = xJcc(e, CC_NE, NULL);
+	slowJump(k, CC_NE);
 	xAluI(e, X_CMP, 4, R(RCX), (int32_t) 0xA0000000);
-	*scratchSite = xJcc(e, CC_B, NULL);
-	patchHere(e, notScratch);
-	// RAM: KUSEG, KSEG0 or KSEG1 below 8 MB, mirrored every 2 MB
+	slowJump(k, CC_AE);
 	xMovRR(e, 4, RDX, RCX);
-	xAluI(e, X_AND, 4, R(RDX), 0x1FFFFFFF);
-	xAluI(e, X_CMP, 4, R(RDX), 0x800000);
-	slowJump(k, CC_AE);
-	xMovRR(e, 4, RAX, RCX);
-	xShiftI(e, X_SHR, 4, R(RAX), 29);
-	xMovI(e, R8, 0x31);
-	emitOp2(e, 4, 0x0F, 0xA3, RAX, R(R8));  // bt r8d, eax
-	slowJump(k, CC_AE);
-	xAluI(e, X_AND, 4, R(RDX), RAM_SIZE - 1);
+	xAluI(e, X_AND, 4, R(RDX), 0x3FF);
 }
 
 static void address(struct Compile* k, uint32_t instr, int width) {
@@ -432,16 +428,15 @@ static void emitLoad(struct Compile* k, uint32_t instr, int pending) {
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
 	int width = op == 0x23 ? 4 : (op == 0x21 || op == 0x25) ? 2 : 1;
 	address(k, instr, width);
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	struct State start = k->st;
 	uint8_t* done = NULL;
 	for (int pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
 			k->st = start;
-			patchHere(e, scratchSite);
-			xMovRR(e, 4, RDX, RCX);
-			xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+			patchHere(e, otherSite);
+			scratchOffset(k);
 			xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 		}
 		struct Opnd src = pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0);
@@ -472,13 +467,12 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	address(k, instr, width);
 	xTestI(e, 4, P(cpu.sr), 0x10000);
 	slowJump(k, CC_NE);
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	xAluRR(e, X_ADD, 8, R(RDX), R15);
 	uint8_t* write = xJmp(e, NULL);
-	patchHere(e, scratchSite);
-	xMovRR(e, 4, RDX, RCX);
-	xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+	patchHere(e, otherSite);
+	scratchOffset(k);
 	xAluRR(e, X_ADD, 8, R(RDX), RBX);
 	xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 	patchHere(e, write);
@@ -696,14 +690,13 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 		xTestI(e, 4, P(cpu.sr), 0x10000);
 		slowJump(k, CC_NE);
 	}
-	uint8_t* scratchSite;
-	ramOffset(k, &scratchSite);
+	uint8_t* otherSite;
+	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
 		xAluRR(e, X_ADD, 8, R(RDX), R15);
 		uint8_t* write = xJmp(e, NULL);
-		patchHere(e, scratchSite);
-		xMovRR(e, 4, RDX, RCX);
-		xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+		patchHere(e, otherSite);
+		scratchOffset(k);
 		xAluRR(e, X_ADD, 8, R(RDX), RBX);
 		xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 		patchHere(e, write);
@@ -725,9 +718,8 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	for (int pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
 			k->st = start;
-			patchHere(e, scratchSite);
-			xMovRR(e, 4, RDX, RCX);
-			xAluI(e, X_AND, 4, R(RDX), 0x3FF);
+			patchHere(e, otherSite);
+			scratchOffset(k);
 			xAluI(e, X_ADD, 8, R(RDX), (int32_t) offsetof(struct Psx, scratch));
 		}
 		xLoad(e, 4, RSI, pass == 0 ? MI(R15, RDX, 1, 0) : MI(RBX, RDX, 1, 0));

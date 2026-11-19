@@ -181,6 +181,7 @@ void jitFlush(struct Psx* p);
 bool jitRun(struct Psx* p, int64_t until);
 uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr);
 void jitStats(struct Psx* p, uint64_t* out);
+void jitDump(struct Psx* p, const char* path);
 
 // gte.c (Mednafen's)
 void GTE_Init(void);

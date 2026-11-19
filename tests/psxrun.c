@@ -55,13 +55,20 @@ static void profReport(struct Psx* p) {
 	int n = profCount, inJit = 0;
 	// guest opcode classes in recompiled code, and host addresses elsewhere (by 64-byte bucket)
 	static uint64_t ops[64][2], host[1 << 16][2];
-	int hosts = 0;
+	int hosts = 0, guests = 0;
+	static uint64_t guest[4096][2];
 	for (int i = 0; i < 64; i++) ops[i][0] = i;
 	for (int i = 0; i < n; i++) {
 		uint32_t instr;
 		uint32_t pc = jitDescribe(p, (const void*) profSamples[i], &instr);
 		if (pc) {
 			inJit++;
+			if (pc > 1) {
+				int g;
+				for (g = 0; g < guests && guest[g][0] != pc; g++) {}
+				if (g == guests && guests < 4096) guest[guests++][0] = pc;
+				if (g < 4096) guest[g][1]++;
+			}
 			ops[pc == 1 ? 63 : instr >> 26][1]++;
 			continue;
 		}
@@ -74,6 +81,8 @@ static void profReport(struct Psx* p) {
 	qsort(ops, 64, sizeof ops[0], countDesc);
 	fprintf(stderr, "prof: %d samples, %d in recompiled code, profReport at %lx\n", n, inJit, (unsigned long) (uintptr_t) profReport);
 	for (int i = 0; i < 12 && ops[i][1]; i++) fprintf(stderr, "prof op %02x %.1f%%\n", (int) ops[i][0], 100.0 * ops[i][1] / n);
+	qsort(guest, guests, sizeof guest[0], countDesc);
+	for (int i = 0; i < 30 && i < guests; i++) fprintf(stderr, "prof guest %08lx %lu\n", (unsigned long) guest[i][0], (unsigned long) guest[i][1]);
 	qsort(host, hosts, sizeof host[0], countDesc);
 	for (int i = 0; i < hosts; i++) fprintf(stderr, "prof host %lx %lu\n", (unsigned long) host[i][0], (unsigned long) host[i][1]);
 }
@@ -215,6 +224,7 @@ int main(int argc, char** argv) {
 		fclose(wav);
 	}
 	if (getenv("PSXRUN_PROF")) profReport(p);
+	if (getenv("PSXRUN_JITDUMP")) jitDump(p, getenv("PSXRUN_JITDUMP"));
 	if (getenv("PSXRUN_JITSTATS")) {
 		uint64_t s[6];
 		jitStats(p, s);
