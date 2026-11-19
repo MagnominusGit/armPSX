@@ -86,25 +86,6 @@ struct Gpu {
 	int frameX, frameY, frameW, frameH;
 };
 
-struct Spu {
-	uint16_t regs[512];
-	uint16_t ram[256 * 1024];
-	uint32_t transferAddress;
-	uint16_t stat, control;
-	int64_t sampleTime;
-	struct SpuVoice {
-		uint32_t counter;
-		uint32_t current, start, repeat;
-		int16_t history[4], decoded[28];
-		int decodedIndex;
-		int adsrPhase, adsrLevel, adsrCounter;
-		bool keyOn, endFlag, ignoreLoop;
-	} voice[24];
-	uint32_t keyOn, keyOff, endx;
-	int16_t *out;
-	int outCount;
-};
-
 struct Pad {
 	uint16_t buttons;  // pressed bits in the pad's order (bit 0 Select ... bit 15 Square)
 	int phase, txPos, txCount;
@@ -157,7 +138,6 @@ struct Psx {
 	int64_t timersAt;  // the cycle the timers have counted to
 	bool vblank, hretrace;
 	struct Gpu gpu;
-	struct Spu spu;
 	struct Sio sio;
 	struct Disc* disc;
 	struct Mdec mdec;
@@ -237,6 +217,7 @@ uint32_t spuDmaRead(struct Psx* p);
 void spuRun(struct Psx* p);
 void SPU_Power(void);
 int32_t SPU_UpdateFromCDC(int32_t clocks);
+int spuSamples(int16_t* out);
 
 // cdrom.c
 void cdromReset(struct Psx* p);

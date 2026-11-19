@@ -59,9 +59,19 @@ int main(int argc, char** argv) {
 	int frames = atoi(argv[2]);
 	const char* shots = getenv("PSXRUN_SHOTS");
 	const char* at = getenv("PSXRUN_AT");
+	const char* wavPath = getenv("PSXRUN_WAV");
+	FILE* wav = wavPath ? fopen(wavPath, "wb") : NULL;
+	uint32_t wavBytes = 0;
+	if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x44\xac\0\0\x10\xb1\x02\0\x04\0\x10\0data\0\0\0\0", 1, 44, wav);
+	static int16_t audio[4096 * 2];
 	clock_t start = clock();
 	for (int i = 1; i <= frames; i++) {
 		psxRunFrame(p);
+		int n = spuSamples(audio);
+		if (wav) {
+			fwrite(audio, 4, n, wav);
+			wavBytes += n * 4;
+		}
 		if (shots && at) {
 			char key[16];
 			snprintf(key, sizeof key, ",%d,", i);
@@ -75,6 +85,14 @@ int main(int argc, char** argv) {
 		}
 	}
 	double secs = (double) (clock() - start) / CLOCKS_PER_SEC;
+	if (wav) {
+		uint32_t riff = wavBytes + 36;
+		fseek(wav, 4, SEEK_SET);
+		fwrite(&riff, 4, 1, wav);
+		fseek(wav, 40, SEEK_SET);
+		fwrite(&wavBytes, 4, 1, wav);
+		fclose(wav);
+	}
 	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
 	if (shots && !at) {
 		char path[512];
