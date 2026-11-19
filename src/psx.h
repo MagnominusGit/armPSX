@@ -36,6 +36,7 @@ struct Dma {
 	uint32_t madr[7], bcr[7], chcr[7];
 	uint32_t dpcr, dicr;
 	int64_t doneAt[7];  // the cycle a running block or list transfer finishes (0: none)
+	uint32_t remaining[7], cursor[7];  // MDEC transfers waiting on the MDEC
 };
 
 struct Timer {
@@ -223,6 +224,8 @@ uint32_t mdecRead(struct Psx* p, uint32_t address);
 void mdecWrite(struct Psx* p, uint32_t address, uint32_t value);
 uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset);
 void mdecReset(struct Psx* p);
+bool mdecCanWrite(struct Psx* p);
+bool mdecCanRead(struct Psx* p);
 void mdecDmaWrite(struct Psx* p, uint32_t value);
 
 #endif

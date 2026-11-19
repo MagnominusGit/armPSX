@@ -63,6 +63,8 @@ static void finish(struct Psx* p, int channel) {
 	updateIrq(p);
 }
 
+static void mdecPump(struct Psx* p);
+
 static void run(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	uint32_t chcr = d->chcr[channel];
@@ -97,6 +99,13 @@ static void run(struct Psx* p, int channel) {
 			}
 		}
 		d->madr[channel] = 0xFFFFFF;
+	} else if ((channel == MDEC_IN || channel == MDEC_OUT) && sync == 1) {
+		uint32_t size = d->bcr[channel] & 0xFFFF, blocks = d->bcr[channel] >> 16;
+		d->remaining[channel] = (size ? size : 0x10000) * (blocks ? blocks : 0x10000);
+		d->cursor[channel] = address;
+		d->bcr[channel] &= 0xFFFF;
+		mdecPump(p);
+		return;
 	} else {
 		uint32_t count;
 		if (sync == 0) {
@@ -141,7 +150,46 @@ static void run(struct Psx* p, int channel) {
 	}
 }
 
+// The MDEC's channels move words only while the MDEC takes or gives them; a waiting channel stays busy
+// and goes on when the other side makes room.
+static void mdecPump(struct Psx* p) {
+	struct Dma* d = &p->dma;
+	bool progress = true;
+	while (progress) {
+		progress = false;
+		for (int channel = MDEC_OUT; channel >= MDEC_IN; channel--) {
+			uint32_t moved = 0;
+			int step = d->chcr[channel] & 2 ? -4 : 4;
+			while (d->remaining[channel]) {
+				if (channel == MDEC_IN) {
+					if (!mdecCanWrite(p)) break;
+					mdecDmaWrite(p, ramRead(p, d->cursor[channel]));
+				} else {
+					if (!mdecCanRead(p)) break;
+					uint32_t offset;
+					uint32_t v = mdecDmaRead(p, &offset);
+					ramWrite(p, d->cursor[channel] + (offset << 2), v);
+				}
+				d->cursor[channel] += step;
+				d->remaining[channel]--;
+				moved++;
+			}
+			if (moved) {
+				progress = true;
+				d->madr[channel] = d->cursor[channel] & 0xFFFFFF;
+				if (!d->remaining[channel]) {
+					d->doneAt[channel] = p->cycles + (int64_t) moved * wordCost(channel, d->chcr[channel]) + 7;
+					psxSchedule(p, d->doneAt[channel]);
+				}
+			}
+		}
+	}
+}
+
 void dmaRun(struct Psx* p) {
+	if (p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT]) {
+		mdecPump(p);
+	}
 	struct Dma* d = &p->dma;
 	for (int i = 0; i < 7; i++) {
 		if (d->doneAt[i]) {
@@ -158,7 +206,7 @@ void dmaRun(struct Psx* p) {
 static void maybeStart(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	uint32_t chcr = d->chcr[channel];
-	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->doneAt[channel]) {
+	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->doneAt[channel] || d->remaining[channel]) {
 		return;
 	}
 	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000)) {
@@ -203,6 +251,10 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 			value = (value & 0x51000000) | 2;
 		}
 		d->chcr[channel] = value & 0x71770703;
+		if (!(value & 0x01000000)) {
+			d->remaining[channel] = 0;
+			d->doneAt[channel] = 0;
+		}
 		maybeStart(p, channel);
 		break;
 	}

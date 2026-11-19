@@ -779,3 +779,13 @@ uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset) {
  if (!OutFIFO.count) runUntilStuck();
  return MDEC_DMARead(offset);
 }
+
+bool mdecCanWrite(struct Psx* p) {
+ if (InFIFO.count >= 0x20) runUntilStuck();
+ return InFIFO.count < 0x20;
+}
+
+bool mdecCanRead(struct Psx* p) {
+ if (!OutFIFO.count) runUntilStuck();
+ return OutFIFO.count > 0;
+}

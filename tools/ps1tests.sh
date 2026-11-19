@@ -4,6 +4,7 @@
 RUN=$1 BIOS=$2 BIN=$3 REF=$4 FRAMES=${5:-600}
 OUT=${OUT:-/tmp/ps1tests}
 mkdir -p "$OUT"
+TOOLS=$(cd "$(dirname "$0")" && pwd)
 cd "$BIN" || exit 1
 find . -name "*.exe" | sort | while read exe; do
 	dir=$(dirname "$exe" | sed 's|^\./||')
@@ -21,8 +22,7 @@ find . -name "*.exe" | sort | while read exe; do
 	fi
 	png=$(ls "$REF/$dir"/vram*.png 2>/dev/null | head -1)
 	if [ -n "$png" ]; then
-		px=$(compare -metric AE "$png" "$log.ppm" null: 2>&1 | cut -d' ' -f1)
-		result="$result, vram $px px differ"
+		result="$result, vram $(python3 -I "$TOOLS/vramcmp.py" "$png" "$log.ppm")"
 	fi
 	echo "$dir/$name: $result"
 done
