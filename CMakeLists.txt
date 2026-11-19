@@ -11,8 +11,8 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-	set(JIT_SOURCE src/jit_x64.c)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64)$")
+	set(JIT_SOURCE src/jit.c)
 else()
 	set(JIT_SOURCE src/jit_none.c)
 endif()
