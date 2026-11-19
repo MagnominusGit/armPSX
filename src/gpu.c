@@ -196,6 +196,7 @@ ALWAYS void addDy(struct Interp* i, const struct Deltas* d, uint32_t n, bool gou
 ALWAYS void drawSpan(struct Gpu* g, bool draw, int y, int32_t xStart, int32_t xBound, struct Interp ig, const struct Deltas* d,
                      bool gouraud, bool textured, int blend, bool texMult, int texMode, bool maskEval) {
 	if (lineSkip(g, y)) return;
+	if (draw && g->drawParity >= 0 && (y & 1) != g->drawParity) return;
 	int32_t xAdjust = xStart, w = xBound - xStart, x = sx11(xStart);
 	if (x < g->clipX0) {
 		int32_t delta = g->clipX0 - x;
@@ -511,7 +512,7 @@ ALWAYS void drawSprite(struct Gpu* g, bool draw, int32_t x0, int32_t y0, int32_t
 	if (yb > g->clipY1 + 1) yb = g->clipY1 + 1;
 	for (int32_t y = ys; y < yb; y++) {
 		uint8_t ur = u;
-		if (!lineSkip(g, y)) {
+		if (!lineSkip(g, y) && !(draw && g->drawParity >= 0 && (y & 1) != g->drawParity)) {
 			if (xb > xs) {
 				int32_t t = xb - xs;
 				if (blend >= 0 || maskEval) t += (((xb + 1) & ~1) - (xs & ~1)) >> 1;
@@ -650,7 +651,7 @@ static void drawLine(struct Gpu* g, struct LinePoint* pts, bool gouraud, int ble
 			} else {
 				pix |= (r >> 3) | (gr >> 3) << 5 | (b >> 3) << 10;
 			}
-			if (x >= g->clipX0 && x <= g->clipX1 && y >= g->clipY0 && y <= g->clipY1) {
+			if (x >= g->clipX0 && x <= g->clipX1 && y >= g->clipY0 && y <= g->clipY1 && (g->drawParity < 0 || (y & 1) == g->drawParity)) {
 				switch (blend) {
 				case 0: maskEval ? plot(g, 0, true, false, x, y, pix) : plot(g, 0, false, false, x, y, pix); break;
 				case 1: maskEval ? plot(g, 1, true, false, x, y, pix) : plot(g, 1, false, false, x, y, pix); break;
@@ -728,6 +729,7 @@ static void commandFill(struct Gpu* g, const uint32_t* cb) {
 		int32_t yy = (y + dy) & 511;
 		if (lineSkip(g, yy)) continue;
 		g->drawTime -= (w >> 3) + 9;
+		if (g->drawParity >= 0 && (yy & 1) != g->drawParity) continue;
 		for (int32_t x = 0; x < w && g->drawPixels; x++) {
 			g->vram[yy * 1024 + ((x + dx) & 1023)] = value;
 		}
@@ -741,7 +743,7 @@ static void commandCopy(struct Gpu* g, const uint32_t* cb) {
 	if (!h) h = 0x200;
 	invalidateTexCache(g);
 	g->drawTime -= w * h * 2;
-	for (int32_t y = 0; y < h && g->drawPixels; y++) {
+	for (int32_t y = 0; y < h && g->drawPixels && g->drawParity != 1; y++) {
 		for (int32_t x = 0; x < w; x += 128) {
 			int32_t n = w - x < 128 ? w - x : 128;
 			uint16_t tmp[128];
@@ -829,34 +831,59 @@ struct GpuJob {
 
 // One writer (the emulation) and one reader (the drawing thread): the indexes are atomic, and the lock
 // and conditions are only for a side that has to sleep.
+// In the Fast mode a second drawing thread (PSX_GPU_WORKERS=2) can take every other line: both run
+// each job, the second starting a job only when the first has done the one before, and the other way
+// round. It helps where drawing holds the emulation up and costs a little elsewhere.
 struct GpuThread {
-	pthread_t thread;
+	pthread_t thread, thread1;
 	pthread_mutex_t lock;
 	pthread_cond_t work, done;
-	_Atomic unsigned head, tail;
-	atomic_bool sleeping, syncing, quit;
+	_Atomic unsigned head, head1, tail;  // jobs done by each drawing thread (by the batch), jobs queued
+	atomic_bool sleeping, sleeping1, syncing, quit;
+	bool two;
+	// Each drawing thread's jobs done, job by job for the other, on lines of their own
+	_Alignas(64) _Atomic unsigned progress0;
+	_Alignas(64) _Atomic unsigned progress1;
+	_Alignas(64) char pad;
 	uint32_t* frame;
 	uint32_t writes[16];  // VRAM write words not queued yet
 	int writeCount;
 	struct GpuJob jobs[JOBS];
-	struct Gpu g;
+	struct Gpu g, g1;
 };
 
+// A spin loop's breath, so a thread sharing the core keeps its pace.
+static inline void relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ volatile("yield");
+#endif
+}
+
+// Jobs both drawing threads have done.
+static unsigned consumed(struct GpuThread* t) {
+	unsigned a = atomic_load(&t->head);
+	if (!t->two) return a;
+	unsigned b = atomic_load(&t->head1);
+	return (int) (a - b) < 0 ? a : b;
+}
+
 static void wake(struct GpuThread* t) {
-	if (atomic_load(&t->sleeping)) {
+	if (atomic_load(&t->sleeping) || atomic_load(&t->sleeping1)) {
 		pthread_mutex_lock(&t->lock);
-		pthread_cond_signal(&t->work);
+		pthread_cond_broadcast(&t->work);
 		pthread_mutex_unlock(&t->lock);
 	}
 }
 
 static void publish(struct GpuThread* t, const struct GpuJob* j) {
 	unsigned tail = atomic_load(&t->tail);
-	while (tail - atomic_load(&t->head) == JOBS) sched_yield();
+	while (tail - consumed(t) == JOBS) sched_yield();
 	t->jobs[tail % JOBS] = *j;
 	atomic_store(&t->tail, tail + 1);
 	// A sleeping drawing thread is woken for a batch, not each job
-	if (tail + 1 - atomic_load(&t->head) >= 64) wake(t);
+	if (tail + 1 - consumed(t) >= 64) wake(t);
 }
 
 static void flushWrites(struct Psx* p) {
@@ -888,13 +915,13 @@ void gpuSync(struct Psx* p) {
 	if (!t) return;
 	flushWrites(p);
 	unsigned tail = atomic_load(&t->tail);
-	if (atomic_load(&t->head) == tail) return;
+	if (consumed(t) == tail) return;
 	wake(t);
-	for (int spin = 0; spin < 1000 && atomic_load(&t->head) != tail; spin++) {}
-	if (atomic_load(&t->head) == tail) return;
+	for (int spin = 0; spin < 1000 && consumed(t) != tail; spin++) {}
+	if (consumed(t) == tail) return;
 	atomic_store(&t->syncing, true);
 	pthread_mutex_lock(&t->lock);
-	while (atomic_load(&t->head) != tail) pthread_cond_wait(&t->done, &t->lock);
+	while (consumed(t) != tail) pthread_cond_wait(&t->done, &t->lock);
 	pthread_mutex_unlock(&t->lock);
 	atomic_store(&t->syncing, false);
 }
@@ -970,10 +997,10 @@ static void execute(struct Psx* p, const uint32_t* cb, int len, uint32_t cc) {
 }
 
 // A word of a CPU-to-VRAM transfer.
-static void vramWrite(struct Gpu* g, uint32_t data) {
+static void vramWrite(struct Gpu* g, uint32_t data, bool write) {
 	for (int i = 0; i < 2; i++) {
 		uint16_t* d = &VRAM(g, g->rwCurX, g->rwCurY);
-		if (g->drawPixels && !(*d & g->maskEval)) *d = (uint16_t) data | g->maskSet;
+		if (write && g->drawPixels && !(*d & g->maskEval)) *d = (uint16_t) data | g->maskSet;
 		g->rwCurX++;
 		if (g->rwCurX == g->rwX + g->rwW) {
 			g->rwCurX = g->rwX;
@@ -995,7 +1022,7 @@ static void processFifo(struct Psx* p) {
 			return;
 		case CMD_FBWRITE: {
 			uint32_t data = fifoPop(g);
-			vramWrite(g, data);
+			vramWrite(g, data, true);
 			queueJob(p, JOB_VRAM_WRITE, &data, 1, 0);
 			continue;
 		}
@@ -1104,30 +1131,52 @@ static void softReset(struct Psx* p) {
 	queueJob(p, JOB_GP1, &v, 1, 0x00);
 }
 
-static void runJob(struct GpuThread* t, const struct GpuJob* j);
+static void runJob(struct GpuThread* t, int id, const struct GpuJob* j);
 
-static void* drawThread(void* arg) {
-	struct GpuThread* t = arg;
+static void drawLoop(struct GpuThread* t, int id) {
+	_Atomic unsigned* mine = id ? &t->head1 : &t->head;
+	_Atomic unsigned* progress = id ? &t->progress1 : &t->progress0;
+	_Atomic unsigned* other = id ? &t->progress0 : &t->progress1;
+	atomic_bool* sleeping = id ? &t->sleeping1 : &t->sleeping;
+	atomic_bool* otherSleeping = id ? &t->sleeping : &t->sleeping1;
 	for (;;) {
-		unsigned head = atomic_load(&t->head), tail = atomic_load(&t->tail);
+		unsigned head = atomic_load(mine), tail = atomic_load(&t->tail);
 		for (int spin = 0; spin < 2000 && head == tail; spin++) tail = atomic_load(&t->tail);
 		if (head == tail) {
 			pthread_mutex_lock(&t->lock);
-			atomic_store(&t->sleeping, true);
+			atomic_store(sleeping, true);
 			while (atomic_load(&t->tail) == head && !atomic_load(&t->quit)) pthread_cond_wait(&t->work, &t->lock);
-			atomic_store(&t->sleeping, false);
+			atomic_store(sleeping, false);
 			pthread_mutex_unlock(&t->lock);
 			if (atomic_load(&t->tail) == head) break;
 			continue;
 		}
-		for (unsigned i = head; i != tail; i++) runJob(t, &t->jobs[i % JOBS]);
-		atomic_store(&t->head, tail);
+		for (unsigned i = head; i != tail; i++) {
+			if (t->two) {
+				while ((int) (atomic_load(other) - i) < 0) {
+					if (atomic_load(otherSleeping)) wake(t);
+					relax();
+				}
+			}
+			runJob(t, id, &t->jobs[i % JOBS]);
+			if (t->two) atomic_store(progress, i + 1);
+		}
+		atomic_store(mine, tail);
 		if (atomic_load(&t->syncing)) {
 			pthread_mutex_lock(&t->lock);
 			pthread_cond_broadcast(&t->done);
 			pthread_mutex_unlock(&t->lock);
 		}
 	}
+}
+
+static void* drawThread(void* arg) {
+	drawLoop(arg, 0);
+	return NULL;
+}
+
+static void* drawThread1(void* arg) {
+	drawLoop(arg, 1);
 	return NULL;
 }
 
@@ -1137,10 +1186,11 @@ void gpuFree(struct Psx* p) {
 	gpuSync(p);
 	pthread_mutex_lock(&t->lock);
 	atomic_store(&t->quit, true);
-	pthread_cond_signal(&t->work);
+	pthread_cond_broadcast(&t->work);
 	pthread_mutex_unlock(&t->lock);
 	pthread_join(t->thread, NULL);
-	memcpy(p->gpu.vram, t->g.vram, sizeof p->gpu.vram);
+	if (t->two) pthread_join(t->thread1, NULL);
+	memcpy(p->gpu.vramStore, t->g.vram, sizeof p->gpu.vramStore);
 	pthread_mutex_destroy(&t->lock);
 	pthread_cond_destroy(&t->work);
 	pthread_cond_destroy(&t->done);
@@ -1160,6 +1210,10 @@ static void startDrawThread(struct Psx* p) {
 			pthread_cond_init(&t->done, NULL);
 			if (pthread_create(&t->thread, NULL, drawThread, t) == 0) {
 				p->gpuThread = t;
+				const char* workers = getenv("PSX_GPU_WORKERS");
+				if (p->gpu.roughTime && workers && !strcmp(workers, "2")) {
+					t->two = pthread_create(&t->thread1, NULL, drawThread1, t) == 0;
+				}
 			} else {
 				pthread_mutex_destroy(&t->lock);
 				pthread_cond_destroy(&t->work);
@@ -1173,7 +1227,13 @@ static void startDrawThread(struct Psx* p) {
 	if (t) {
 		gpuSync(p);
 		t->g = p->gpu;
+		t->g.vram = t->g.vramStore;
 		t->g.drawPixels = true;
+		if (t->two) {
+			t->g.drawParity = 0;
+			t->g1 = t->g;
+			t->g1.drawParity = 1;
+		}
 		t->frame = p->gpu.frame;
 	}
 }
@@ -1190,7 +1250,9 @@ void gpuReset(struct Psx* p) {
 		}
 	}
 	g->clockRatio = p->pal ? 102948 : 103896;
-	memset(g->vram, 0, sizeof g->vram);
+	g->vram = g->vramStore;
+	g->drawParity = -1;
+	memset(g->vram, 0, sizeof g->vramStore);
 	memset(g->clut, 0, sizeof g->clut);
 	g->clutTag = ~0u;
 	memset(g->texCache, 0xFF, sizeof g->texCache);
@@ -1508,8 +1570,8 @@ int gpuDisplay(struct Psx* p, uint32_t* out, int* width, int* height) {
 	return 0;
 }
 
-static void runJob(struct GpuThread* t, const struct GpuJob* j) {
-	struct Gpu* g = &t->g;
+static void runJob(struct GpuThread* t, int id, const struct GpuJob* j) {
+	struct Gpu* g = id ? &t->g1 : &t->g;
 	g->displayMode = j->displayMode;
 	g->displayY = j->displayY;
 	g->fieldReadout = j->fieldReadout;
@@ -1520,9 +1582,11 @@ static void runJob(struct GpuThread* t, const struct GpuJob* j) {
 	case JOB_POLYLINE: commandLine(g, w, j->cc); break;
 	case JOB_POLYLINE_END: g->inCommand = CMD_NONE; break;
 	case JOB_VRAM_WRITE:
-		for (int i = 0; i < j->len; i++) vramWrite(g, w[i]);
+		for (int i = 0; i < j->len; i++) vramWrite(g, w[i], id == 0);
 		break;
-	case JOB_LINE: linePixels(t->frame + w[0], &g->vram[w[1] * 1024], (int32_t) w[2], (int32_t) w[3], (int32_t) w[4], (int32_t) w[5], w[6]); break;
+	case JOB_LINE:
+		if (id) break;
+		linePixels(t->frame + w[0], &g->vram[w[1] * 1024], (int32_t) w[2], (int32_t) w[3], (int32_t) w[4], (int32_t) w[5], w[6]); break;
 	case JOB_GP1:
 		if (j->cc == 0x00) softResetGpu(g);
 		else if (j->cc == 0x01) g->inCommand = CMD_NONE;
