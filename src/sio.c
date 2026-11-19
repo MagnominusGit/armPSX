@@ -313,3 +313,22 @@ void sioWrite(struct Psx* p, uint32_t address, uint32_t value, int size) {
 	}
 	startPending(p);
 }
+
+// An empty, formatted card (Mednafen's memcard.cpp Format()).
+void sioFormatCard(struct Memcard* c) {
+	memset(c->data, 0, sizeof c->data);
+	c->data[0] = 0x4D;
+	c->data[1] = 0x43;
+	c->data[0x7F] = 0x0E;
+	for (unsigned a = 0x80; a < 0x800; a += 0x80) {
+		c->data[a] = 0xA0;
+		c->data[a + 8] = c->data[a + 9] = 0xFF;
+		c->data[a + 0x7F] = 0xA0;
+	}
+	for (unsigned a = 0x800; a < 0x1200; a += 0x80) {
+		c->data[a] = c->data[a + 1] = c->data[a + 2] = c->data[a + 3] = 0xFF;
+		c->data[a + 8] = c->data[a + 9] = 0xFF;
+	}
+	c->present = true;
+	c->fresh = true;
+}

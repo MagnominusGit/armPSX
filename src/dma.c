@@ -14,7 +14,9 @@ enum { MDEC_IN, MDEC_OUT, GPU, CDROM, SPU, PIO, OTC };
 static void updateIrq(struct Psx* p) {
 	struct Dma* d = &p->dma;
 	bool before = d->dicr >> 31;
-	bool master = (d->dicr & 0x8000) || ((d->dicr & 0x800000) && (d->dicr >> 16 & d->dicr >> 24 & 0x7F));
+	// Any pending flag raises it while the master enable is on, whatever the channel enables say now
+	// (Mednafen's dma.cpp; flags are only set for channels enabled when they finish).
+	bool master = (d->dicr & 0x8000) || ((d->dicr & 0x800000) && (d->dicr >> 24 & 0x7F));
 	d->dicr = (d->dicr & 0x7FFFFFFF) | (uint32_t) master << 31;
 	if (master && !before) {
 		psxIrq(p, IRQ_DMA);
@@ -28,6 +30,7 @@ static uint32_t ramRead(struct Psx* p, uint32_t address) {
 }
 
 static void ramWrite(struct Psx* p, uint32_t address, uint32_t v) {
+	if (p->watch && (address & 0x1FFFFC) == p->watch) fprintf(stderr, "dma write %06x = %08x frame %u ch? chcr1 %08x madr1 %06x bcr1 %08x\n", address, v, p->frames, p->dma.chcr[1], p->dma.madr[1], p->dma.bcr[1]);
 	memcpy(p->ram + (address & 0x1FFFFC), &v, 4);
 }
 
@@ -62,6 +65,7 @@ static void finish(struct Psx* p, int channel) {
 	if (d->dicr & 1u << (16 + channel)) {
 		d->dicr |= 1u << (24 + channel);
 	}
+	if (p->logDma) fprintf(stderr, "dma%d done dicr=%08x at %lld frame %u\n", channel, d->dicr, (long long) (p->cycles - p->frameStart), p->frames);
 	updateIrq(p);
 }
 
@@ -106,7 +110,9 @@ static void run(struct Psx* p, int channel) {
 		d->remaining[channel] = (size ? size : 0x10000) * (blocks ? blocks : 0x10000);
 		d->cursor[channel] = address;
 		d->bcr[channel] &= 0xFFFF;
+		mdecClock(p, NULL);
 		mdecPump(p);
+		psxSchedule(p, p->cycles + 128);
 		return;
 	} else {
 		uint32_t count;
@@ -197,8 +203,9 @@ static void mdecPump(struct Psx* p) {
 static void maybeStart(struct Psx* p, int channel);
 
 void dmaRun(struct Psx* p) {
-	if (p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT]) {
-		mdecPump(p);
+	mdecClock(p, p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT] ? mdecPump : NULL);
+	if (p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT] || mdecBusy(p)) {
+		psxSchedule(p, p->cycles + 128);
 	}
 	struct Dma* d = &p->dma;
 	for (int i = 0; i < 7; i++) {
@@ -251,6 +258,7 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 			d->dicr = (d->dicr & 0xFF000000) & ~(value & 0x7F000000);
 			d->dicr |= value & 0x00FF803F;
 			updateIrq(p);
+			if (p->logDma) fprintf(stderr, "dicr w %08x -> %08x pc %08x at %lld frame %u\n", value, d->dicr, p->cpu.pc, (long long) (p->cycles - p->frameStart), p->frames);
 		} else {
 			d->dpcr = value;
 			for (int i = 0; i < 7; i++) maybeStart(p, i);
@@ -261,7 +269,7 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 	case 0: d->madr[channel] = value & 0xFFFFFF; break;
 	case 4: d->bcr[channel] = value; break;
 	case 8:
-		if (getenv("PSX_DMALOG")) fprintf(stderr, "dma%d chcr=%08x madr=%06x bcr=%08x at %lld doneAt %lld dpcr %08x\n", channel, value, d->madr[channel], d->bcr[channel], (long long) p->cycles, (long long) d->doneAt[channel], d->dpcr);
+		if (p->logDma) fprintf(stderr, "dma%d chcr=%08x madr=%06x bcr=%08x at %lld doneAt %lld dpcr %08x\n", channel, value, d->madr[channel], d->bcr[channel], (long long) p->cycles, (long long) d->doneAt[channel], d->dpcr);
 		if (channel == OTC) {
 			value = (value & 0x51000000) | 2;
 		}

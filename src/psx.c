@@ -9,6 +9,8 @@
 struct Psx* psxCreate(void) {
 	struct Psx* p = calloc(1, sizeof *p);
 	GTE_Init();
+	p->logCd = getenv("PSX_CDLOG") != NULL;
+	p->logDma = getenv("PSX_DMALOG") != NULL;
 	return p;
 }
 
@@ -68,6 +70,7 @@ void psxEvents(struct Psx* p) {
 
 void psxRunFrame(struct Psx* p) {
 	p->gpu.frameDone = false;
+	p->frameStart = p->cycles;
 	int64_t limit = p->cycles + CPU_HZ / 10;
 	while (!p->gpu.frameDone && p->cycles < limit) {
 		int64_t until = p->nextEvent;

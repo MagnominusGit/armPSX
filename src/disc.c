@@ -504,3 +504,16 @@ void discReadPw(struct Disc* d, int32_t lba, uint8_t* pw) {
 	memset(pw, 0, 96);
 	makeSubPq(d, lba, pw);
 }
+
+// The region in the licence text of sector 4: 'A' America, 'E' Europe, 'I' Japan, 0 when not found.
+char discRegion(struct Disc* d) {
+	uint8_t raw[2352 + 96];
+	discReadRaw(d, 4, raw);
+	const char* text = (const char*) raw + 24;
+	for (int i = 0; i + 4 <= 2048; i++) {
+		if (!memcmp(text + i, "Amer", 4)) return 'A';
+		if (!memcmp(text + i, "Euro", 4)) return 'E';
+		if (!memcmp(text + i, "Inc.", 4)) return 'I';
+	}
+	return 0;
+}

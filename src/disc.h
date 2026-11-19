@@ -17,5 +17,6 @@ void discToc(struct Disc* d, struct Toc* toc);
 // 2352 bytes of sector and 96 of interleaved subchannel P-W.
 void discReadRaw(struct Disc* d, int32_t lba, uint8_t* buf);
 void discReadPw(struct Disc* d, int32_t lba, uint8_t* pw);
+char discRegion(struct Disc* d);
 
 #endif

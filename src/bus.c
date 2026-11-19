@@ -57,7 +57,8 @@ static uint32_t ioReadInner(struct Psx* p, uint32_t a, int size) {
 		return mdecRead(p, a & ~3u) >> shift;
 	}
 	if (a >= 0x1F801000 && a < 0x1F801024) {
-		return p->memControl[(a & 0x1F) >> 2] >> shift;
+		static const uint32_t fixed[9] = { 0x1F000000, 0x1F000000 };
+		return (p->memControl[(a & 0x1F) >> 2] | fixed[(a & 0x1F) >> 2]) >> shift;
 	}
 	if (a >= 0x1F801060 && a < 0x1F801064) {
 		return p->ramSize >> shift;
@@ -66,7 +67,8 @@ static uint32_t ioReadInner(struct Psx* p, uint32_t a, int size) {
 		return sioRead(p, a, size);
 	}
 	if (a >= 0x1F801070 && a < 0x1F801078) {
-		return (a & 4 ? p->iMask : p->iStat) >> (shift & 8);
+		// The upper half reads as 0x1F80 (Mednafen's irq.cpp; the BIOS keeps whole words of it).
+		return ((uint32_t) (a & 4 ? p->iMask : p->iStat) | 0x1F800000) >> shift;
 	}
 	if (a >= 0x1F801080 && a < 0x1F801100) {
 		return dmaRead(p, a & ~3u) >> shift;
@@ -105,7 +107,9 @@ static void ioWrite(struct Psx* p, uint32_t a, uint32_t v, int size) {
 	} else if (a >= 0x1F801820 && a < 0x1F801828) {
 		mdecWrite(p, a & ~3u, v << shift);
 	} else if (a >= 0x1F801000 && a < 0x1F801024) {
-		p->memControl[(a & 0x1F) >> 2] = v << shift;
+		// Memory control: Mednafen's masks and fixed bits
+		static const uint32_t mask[9] = { 0x00FFFFFF, 0x00FFFFFF, 0xFFFFFFFF, 0x2F1FFFFF, 0xFFFFFFFF, 0x2F1FFFFF, 0x2F1FFFFF, 0xFFFFFFFF, 0x0003FFFF };
+		p->memControl[(a & 0x1F) >> 2] = (v << shift) & mask[(a & 0x1F) >> 2];
 	} else if (a >= 0x1F801060 && a < 0x1F801064) {
 		p->ramSize = v << shift;
 	} else if (a >= 0x1F801040 && a < 0x1F801060) {
@@ -197,6 +201,7 @@ uint8_t busRead8(struct Psx* p, uint32_t address) {
 
 void busWrite32(struct Psx* p, uint32_t address, uint32_t value) {
 	uint32_t a = physical(address);
+	if (p->watch && (a & 0x1FFFFC) == p->watch && a < 0x800000) fprintf(stderr, "cpu write %08x = %08x pc %08x frame %u\n", address, value, p->cpu.pc, p->frames);
 	if (a < 0x800000) {
 		memcpy(p->ram + (a & (RAM_SIZE - 1)), &value, 4);
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {
@@ -214,6 +219,7 @@ void busWrite32(struct Psx* p, uint32_t address, uint32_t value) {
 
 void busWrite16(struct Psx* p, uint32_t address, uint32_t value) {
 	uint32_t a = physical(address);
+	if (p->watch && (a & 0x1FFFFC) == p->watch && a < 0x800000) fprintf(stderr, "cpu write16 %08x = %08x pc %08x frame %u\n", address, value, p->cpu.pc, p->frames);
 	if (a < 0x800000) {
 		uint16_t h = value;
 		memcpy(p->ram + (a & (RAM_SIZE - 1)), &h, 2);
@@ -224,6 +230,7 @@ void busWrite16(struct Psx* p, uint32_t address, uint32_t value) {
 
 void busWrite8(struct Psx* p, uint32_t address, uint32_t value) {
 	uint32_t a = physical(address);
+	if (p->watch && (a & 0x1FFFFC) == p->watch && a < 0x800000) fprintf(stderr, "cpu write8 %08x = %08x pc %08x frame %u\n", address, value, p->cpu.pc, p->frames);
 	if (a < 0x800000) {
 		p->ram[a & (RAM_SIZE - 1)] = value;
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {

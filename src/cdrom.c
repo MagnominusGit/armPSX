@@ -72,6 +72,7 @@
 */
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
@@ -467,6 +468,7 @@ static void RecalcIRQ(void)
 //static int32_t doom_ts;
 static void WriteIRQ(uint8_t V)
 {
+ if (P->logCd) fprintf(stderr, "cd irq %d results %d frame %u\n", V, ResultsIn, P->frames);
  assert(CDCReadyReceiveCounter <= 0);
  assert(!(IRQBuffer & 0xF));
 
@@ -1116,6 +1118,7 @@ static void HandlePlayRead(void)
      memcpy(SB, buf + 12 + offs, size);
      SB_In = size;
      SetAIP1(CDCIRQ_DATA_READY, MakeStatus(false));
+     if (P->logCd) fprintf(stderr, "cd sector %d frame %u mode %02x at %lld\n", CurSector, P->frames, Mode, (long long) (P->cycles - P->frameStart));
     }
    }
   }
@@ -1453,6 +1456,7 @@ void CDC_Write(const int64_t timestamp, uint32_t A, uint8_t V)
 
          	PendingCommandCounter = 10500 + PSX_GetRandU32(0, 3000) + 1815;
 	 	PendingCommand = V;
+		if (P->logCd) fprintf(stderr, "cd cmd %02x args %d frame %u ts %lld\n", V, ArgsWP, P->frames, (long long) timestamp);
          	PendingCommandPhase = -1;
 		ArgsReceiveIn = 0;
 		break;
@@ -2076,9 +2080,9 @@ static int32_t Command_Reset(const int arg_count, const uint8_t *args)
 // printf("DriveStatus: %d %d %d\n", DriveStatus, StatusAfterSeek, SeekTarget);
  if(Cur_CDIF && DiscStartupDelay <= 0)
  {
-  if((DriveStatus == DS_SEEKING_LOGICAL || DriveStatus == DS_SEEKING) && StatusAfterSeek == DS_PAUSED && SeekTarget == 0)
+  // A reset seek already in flight, its second logical phase included (Beetle PSX's fix).
+  if((DriveStatus == DS_SEEKING_LOGICAL || DriveStatus == DS_SEEKING || DriveStatus == DS_SEEKING_LOGICAL2) && StatusAfterSeek == DS_PAUSED && SeekTarget == 0)
   {
-   //puts("HRMPH");
    return 256;
   }
   else
@@ -2090,7 +2094,12 @@ static int32_t Command_Reset(const int arg_count, const uint8_t *args)
    SectorsRead = 0;
 
    SeekTarget = 0;
-   PSRCounter = MAX(PSX_GetRandU32(0, 3250000), CalcSeekTime(CurSector, SeekTarget, DriveStatus != DS_STOPPED, DriveStatus == DS_PAUSED));
+   {
+    // Seek time first, then the random term, as Beetle PSX orders them (and MAX would evaluate twice).
+    int32_t st = CalcSeekTime(CurSector, SeekTarget, DriveStatus != DS_STOPPED, DriveStatus == DS_PAUSED);
+    int32_t rt = (int32_t) PSX_GetRandU32(0, 3250000);
+    PSRCounter = rt > st ? rt : st;
+   }
    PreSeekHack(SeekTarget);
    SeekFinished = false;
    DriveStatus = HoldLogicalPos ? DS_SEEKING_LOGICAL : DS_SEEKING;
@@ -2627,7 +2636,7 @@ void cdromReset(struct Psx* p) {
  P = p;
  PSX_ResetRand();
  CDC_Init();
- CDC_SetDisc(p->disc == NULL, p->disc, "SCEA");
+ CDC_SetDisc(p->disc == NULL, p->disc, p->region == 'E' ? "SCEE" : p->region == 'I' ? "SCEI" : "SCEA");
  CDC_Power();
  lastts = p->cycles;
 }
@@ -2650,4 +2659,8 @@ uint32_t cdromDmaRead(struct Psx* p) {
 
 bool cdromDmaCanRead(struct Psx* p) {
  return CDC_DMACanRead();
+}
+
+void cdromSetDisc(struct Psx* p, struct Disc* disc, bool trayOpen) {
+ CDC_SetDisc(trayOpen, disc, p->region == 'E' ? "SCEE" : p->region == 'I' ? "SCEI" : "SCEA");
 }

@@ -133,8 +133,14 @@ struct Psx {
 	struct Sio sio;
 	struct Disc* disc;
 	uint32_t frames;
+	int64_t frameStart;  // the cycle the current frame began
 	int traceIo;  // I/O accesses still to print
+	bool logCd, logDma;  // PSX_CDLOG, PSX_DMALOG
+	uint32_t* pcRing;  // debugging: the last 256 PCs, when set
+	uint32_t pcRingAt, pcStop;
+	uint32_t watch;  // debugging: physical address whose writes are printed (0: none)
 	bool pal;
+	char region;  // the disc's: 'A', 'E' or 'I'
 	uint32_t exeEntry;
 	uint8_t* exe;
 	size_t exeSize;
@@ -201,6 +207,7 @@ uint32_t gpuDotClock(struct Psx* p);
 uint32_t sioRead(struct Psx* p, uint32_t address, int size);
 void sioWrite(struct Psx* p, uint32_t address, uint32_t value, int size);
 void sioRun(struct Psx* p);
+void sioFormatCard(struct Memcard* c);
 
 // spu.c
 void spuReset(struct Psx* p);
@@ -221,6 +228,7 @@ uint32_t cdromDmaRead(struct Psx* p);
 bool cdromDmaCanRead(struct Psx* p);
 void CDC_GetCDAudio(int32_t samples[2]);
 void cdromRun(struct Psx* p);
+void cdromSetDisc(struct Psx* p, struct Disc* disc, bool trayOpen);
 
 // mdec.c
 uint32_t mdecRead(struct Psx* p, uint32_t address);
@@ -229,6 +237,8 @@ uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset);
 void mdecReset(struct Psx* p);
 bool mdecCanWrite(struct Psx* p);
 bool mdecCanRead(struct Psx* p);
+void mdecClock(struct Psx* p, void (*step)(struct Psx*));
+bool mdecBusy(struct Psx* p);
 void mdecDmaWrite(struct Psx* p, uint32_t value);
 
 #endif

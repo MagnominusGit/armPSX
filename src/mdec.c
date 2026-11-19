@@ -746,46 +746,56 @@ uint32_t MDEC_Read(const int64_t timestamp, uint32_t A)
 }
 
 
-// armPSX's side: the DMA moves whole blocks at once, so the MDEC runs until it waits.
+// armPSX's side: the MDEC runs on the CPU's clock, in 128-cycle steps as Mednafen's DMA update drives
+// it; the DMA channels move words between steps (dma.c).
 
-static void runUntilStuck(void) {
- for (int i = 0; i < 4096; i++) {
-  unsigned phase = MDRPhase, in = InFIFO.count, outc = OutFIFO.count;
-  MDEC_Run(128);
-  if (MDRPhase == phase && InFIFO.count == in && OutFIFO.count == outc && ClockCounter > 0) break;
- }
-}
+static int64_t mdecLast;
 
 void mdecReset(struct Psx* p) {
  MDEC_Power();
+ mdecLast = p->cycles;
+}
+
+// Runs the MDEC up to the CPU's cycle; step() moves DMA words after each step.
+void mdecClock(struct Psx* p, void (*step)(struct Psx*)) {
+ int64_t elapsed = p->cycles - mdecLast;
+ mdecLast = p->cycles;
+ if (elapsed > 1 << 20) elapsed = 1 << 20;
+ while (elapsed > 0) {
+  int32_t chunk = elapsed > 128 ? 128 : (int32_t) elapsed;
+  MDEC_Run(chunk);
+  elapsed -= chunk;
+  if (step) step(p);
+ }
+}
+
+bool mdecBusy(struct Psx* p) {
+ return InCommand || InFIFO.count || OutFIFO.count;
 }
 
 uint32_t mdecRead(struct Psx* p, uint32_t address) {
- runUntilStuck();
+ mdecClock(p, NULL);
  return MDEC_Read(p->cycles, address);
 }
 
 void mdecWrite(struct Psx* p, uint32_t address, uint32_t value) {
+ mdecClock(p, NULL);
  MDEC_Write(p->cycles, address, value);
- runUntilStuck();
+ psxSchedule(p, p->cycles + 128);
 }
 
 void mdecDmaWrite(struct Psx* p, uint32_t value) {
- if (InFIFO.count == 0x20) runUntilStuck();
  MDEC_DMAWrite(value);
 }
 
 uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset) {
- if (!OutFIFO.count) runUntilStuck();
  return MDEC_DMARead(offset);
 }
 
 bool mdecCanWrite(struct Psx* p) {
- if (InFIFO.count >= 0x20) runUntilStuck();
  return InFIFO.count < 0x20;
 }
 
 bool mdecCanRead(struct Psx* p) {
- if (!OutFIFO.count) runUntilStuck();
  return OutFIFO.count > 0;
 }

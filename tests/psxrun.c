@@ -63,8 +63,11 @@ int main(int argc, char** argv) {
 			fprintf(stderr, "can't read the disc %s\n", image);
 			return 1;
 		}
+		p->region = discRegion(p->disc);
+		p->pal = p->region == 'E';
 		image = NULL;
 	}
+	sioFormatCard(&p->sio.card[0]);
 	psxReset(p);
 	if (image) {
 		FILE* f = fopen(image, "rb");
@@ -85,6 +88,11 @@ int main(int argc, char** argv) {
 	if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x44\xac\0\0\x10\xb1\x02\0\x04\0\x10\0data\0\0\0\0", 1, 44, wav);
 	static int16_t audio[4096 * 2];
 	clock_t start = clock();
+	if (getenv("PSXRUN_WATCH")) p->watch = strtoul(getenv("PSXRUN_WATCH"), NULL, 16);
+	if (getenv("PSXRUN_PCSTOP")) {
+		p->pcRing = calloc(256, 4);
+		p->pcStop = strtoul(getenv("PSXRUN_PCSTOP"), NULL, 16);
+	}
 	int traceAt = getenv("PSXRUN_TRACE_AT") ? atoi(getenv("PSXRUN_TRACE_AT")) : -1;
 	for (int i = 1; i <= frames; i++) {
 		p->sio.pad[0].buttons = pressed(getenv("PSXRUN_PRESS"), i);
@@ -141,6 +149,15 @@ int main(int argc, char** argv) {
 		fclose(wav);
 	}
 	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
+	if (getenv("PSXRUN_STATE")) {
+		fprintf(stderr, "sr %08x cause %08x epc %08x istat %03x imask %03x dicr %08x\n", p->cpu.sr, p->cpu.cause, p->cpu.epc, p->iStat, p->iMask, p->dma.dicr);
+		for (int c = 0; c < 7; c++) fprintf(stderr, "dma%d chcr %08x madr %06x bcr %08x doneAt %lld\n", c, p->dma.chcr[c], p->dma.madr[c], p->dma.bcr[c], (long long) p->dma.doneAt[c]);
+		for (int i = 0; i < 16; i++) {
+			cpuRun(p, p->cycles + 1);
+			fprintf(stderr, "pc %08x ", p->cpu.pc);
+		}
+		fprintf(stderr, "\n");
+	}
 	if (shots && !at) {
 		char path[512];
 		snprintf(path, sizeof path, "%s-%05d.ppm", shots, frames);

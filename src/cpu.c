@@ -280,6 +280,16 @@ void cpuRun(struct Psx* p, int64_t until) {
 			psxEvents(p);
 		}
 		uint32_t pc = c->pc;
+		if (__builtin_expect(p->pcRing != NULL, 0)) {
+			p->pcRing[p->pcRingAt++ & 255] = pc;
+			if (pc == p->pcStop) {
+				for (int i = 0; i < 256; i++) fprintf(stderr, "%08x%c", p->pcRing[(p->pcRingAt + i) & 255], i % 16 == 15 ? '\n' : ' ');
+				for (int i = 0x80 >> 2; i < 0x90 >> 2; i++) fprintf(stderr, "icache %03x tag %08x data %08x\n", i * 4, c->icache[i].tag, c->icache[i].data);
+				fprintf(stderr, "biu %08x sr %08x\n", c->biu, c->sr);
+				for (int i = 0; i < 32; i++) fprintf(stderr, "r%d=%08x%c", i, c->r[i], i % 8 == 7 ? '\n' : ' ');
+				p->pcRing = NULL;
+			}
+		}
 		if (__builtin_expect(p->exe != NULL, 0) && pc == 0x80030000) {
 			psxLoadExe(p, p->exe, p->exeSize);
 			continue;
