@@ -144,6 +144,7 @@ struct Psx {
 	struct Gpu gpu;
 	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
 	int mode;  // MODE_*, from PSX_MODE (fast, balanced or exact) or the frontend
+	uint8_t codePage[RAM_SIZE >> 12];  // 4 KB pages of RAM the Fast mode's recompiled code came from
 	struct Sio sio;
 	struct Disc* disc;
 	uint32_t frames;
@@ -189,6 +190,7 @@ bool jitCreate(struct Psx* p);
 void jitFree(struct Psx* p);
 void jitFlush(struct Psx* p);
 bool jitRun(struct Psx* p, int64_t until);
+void jitInvalidate(struct Psx* p, uint32_t offset);
 uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr, int* version);
 void jitStats(struct Psx* p, uint64_t* out);
 void jitDump(struct Psx* p, const char* path);
@@ -277,3 +279,8 @@ bool mdecBusy(struct Psx* p);
 void mdecDmaWrite(struct Psx* p, uint32_t value);
 
 #endif
+
+// RAM at offset was written: recompiled code from its page is out of date (the Fast mode).
+static inline void psxCodeWrite(struct Psx* p, uint32_t offset) {
+	if (p->codePage[(offset & (RAM_SIZE - 1)) >> 12]) jitInvalidate(p, offset);
+}

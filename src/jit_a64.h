@@ -86,10 +86,13 @@ static void loadGpr(struct Emitter* e, int host, int reg) {
 	}
 }
 
+enum { FAST_JIT = 0 };  // the Fast mode's code isn't here yet: its blocks are the Exact mode's
+
 struct Compile {
 	struct Emitter e;
 	struct Jit* j;
 	struct State st;
+	bool fast;
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -166,6 +169,17 @@ static void bCommitLoad(struct Compile* k, int reg) {
 	aStrb(e, X0, X26, reg);
 	storeWordI(e, OFF(cpu.ldReg), NO_LOAD);
 	if (!reg) aStr(e, ZR, X19, GPR_OFF(0));
+}
+
+static void bCommitDynamic(struct Compile* k);
+
+static void bCommitLoadFast(struct Compile* k, int reg) {
+	(void) reg;
+	bCommitDynamic(k);
+}
+
+static void bCommitDynamicFast(struct Compile* k) {
+	bCommitDynamic(k);
 }
 
 static void bCommitDynamic(struct Compile* k) {

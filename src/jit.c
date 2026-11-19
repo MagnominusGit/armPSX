@@ -24,12 +24,15 @@
 
 enum { PAGES = 4096, ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE = 1 << 19, NO_LOAD = 34, DYNAMIC = -1 };
 enum { GENERIC, CLEAN, CAREFUL };
+enum { FAST_CPI_X4 = 9 };  // the Fast mode's cycles per instruction, times 4: about the Exact mode's average
 
 struct Block {
 	uint32_t pc;
 	int count, lines;
 	bool delay;  // it ends with a branch and its delay slot
 	bool uncached;  // in the BIOS ROM through KSEG1: no lines, every fetch from the bus
+	bool fast;      // the Fast mode's: one version, from memory, gone when its RAM is written
+	bool dead;      // its RAM was written (the Fast mode)
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
 	uint32_t checked;  // cpu.icacheChanges when its lines were last found unchanged
@@ -203,6 +206,10 @@ static uint8_t* jitLink(struct Psx* p, struct Block** slot, uint32_t pc);
 #include "jit_a64.h"
 #endif
 
+static bool fastMode(struct Psx* p) {
+	return FAST_JIT && p->mode == MODE_FAST;
+}
+
 static void stUnknown(struct State* s) {
 	memset(s->absorb, -1, sizeof s->absorb);
 	s->aw = -1;
@@ -223,6 +230,10 @@ static bool allZero(const struct State* s) {
 // The fetch's cycle, unless the register absorbWhich names still hides some of a load's wait.
 static void stAbsorbStep(struct Compile* k) {
 	struct State* s = &k->st;
+	if (k->fast) {
+		s->cycles++;
+		return;
+	}
 	if (s->aw >= 0) {
 		int v = s->absorb[s->aw];
 		if (v == 0) {
@@ -242,6 +253,7 @@ static void stAbsorbStep(struct Compile* k) {
 
 static void stUses(struct Compile* k, int reg) {
 	struct State* s = &k->st;
+	if (k->fast) return;
 	if (reg && s->absorb[reg]) {
 		bStoreAbsorb(k, reg, 0);
 		s->absorb[reg] = 0;
@@ -252,6 +264,11 @@ static void stUses(struct Compile* k, int reg) {
 // none, DYNAMIC when it isn't known (the generic block's first instruction).
 static void stCommit(struct Compile* k, int reg) {
 	struct State* s = &k->st;
+	if (k->fast) {
+		if (reg == DYNAMIC) bCommitDynamicFast(k);
+		else if (reg != NO_LOAD) bCommitLoadFast(k, reg);
+		return;
+	}
 	if (reg == DYNAMIC) {
 		stFlush(k);
 		bCommitDynamic(k);
@@ -283,6 +300,7 @@ static void stCommit(struct Compile* k, int reg) {
 // the read's extra 2 cycles when no load came just before (0 or 2), or -1 when that's memory's.
 static int stBeginRead(struct Compile* k) {
 	struct State* s = &k->st;
+	if (k->fast) return 0;
 	if (s->aw >= 0) {
 		if (s->absorb[s->aw]) {
 			bStoreAbsorb(k, s->aw, 0);
@@ -301,6 +319,7 @@ static int stBeginRead(struct Compile* k) {
 // bus takes 4 cycles.
 static void stUncachedFetch(struct Compile* k) {
 	struct State* s = &k->st;
+	if (k->fast) return;
 	if (s->aw >= 0) {
 		if (s->absorb[s->aw]) {
 			bStoreAbsorb(k, s->aw, 0);
@@ -325,9 +344,10 @@ static void stAfterWait(struct Compile* k) {
 	}
 }
 
+// (In the Fast mode the count is of instructions, each FAST_CPI_X4 / 4 cycles.)
 static void stFlushCycles(struct Compile* k) {
 	if (k->st.cycles) {
-		bAddCycles(k, k->st.cycles);
+		bAddCycles(k, k->fast ? (k->st.cycles * FAST_CPI_X4 + 2) / 4 : k->st.cycles);
 		k->st.cycles = 0;
 	}
 }
@@ -336,6 +356,7 @@ static void stFlushCycles(struct Compile* k) {
 static void stFlush(struct Compile* k) {
 	struct State* s = &k->st;
 	stFlushCycles(k);
+	if (k->fast) return;
 	if (s->aw >= 0 && s->awDirty) {
 		bStoreAw(k, s->aw);
 		s->awDirty = false;
@@ -354,6 +375,7 @@ static void stFlush(struct Compile* k) {
 static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* start, uint8_t* end) {
 	struct Compile k;
 	bBegin(&k, j, start, end);
+	k.fast = b->fast;
 	bool inl[BLOCK_MAX];
 	for (int i = 0; i < b->count; i++) {
 		inl[i] = inlinable(b, i);
@@ -362,7 +384,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	if (version == CLEAN) {
 		memset(k.st.absorb, 0, sizeof k.st.absorb);
 	}
-	if (version != CAREFUL) {
+	if (version != CAREFUL && !b->fast) {
 		bool gte;
 		int bound = boundFrom(j, b, inl, 0, &gte);
 		bDecline(&k, bound, gte, b->body[CAREFUL]);
@@ -373,14 +395,14 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = b->pc + 4 * i, instr = b->words[i];
 		bool delay = b->delay && i == b->count - 1;
-		if (version == CAREFUL && i) {
+		if (version == CAREFUL && i && !b->fast) {
 			// Memory has everything before each instruction, and the code assumes nothing: a line
 			// that missed goes on here, after its fill
 			stFlush(&k);
 			stUnknown(&k.st);
 			bCheck(&k, 0, false, i);
 		}
-		if (i && !(a & 0xF) && !b->uncached) {
+		if (i && !(a & 0xF) && !b->uncached && !b->fast) {
 			// A new cache line: on while it's as last checked
 			stFlushCycles(&k);
 			bLineCheck(&k, b, (a >> 4) - (b->pc >> 4), i);
@@ -388,7 +410,8 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		b->at[version][i] = (uint16_t) (bHere(&k) - start);
 		if (b->uncached) stUncachedFetch(&k);
 		stAbsorbStep(&k);
-		bool after = version != CAREFUL && i + 1 < b->count && !delay;
+		// (The Fast mode's blocks run to their end; the limit is the dispatcher's.)
+		bool after = version != CAREFUL && i + 1 < b->count && !delay && !b->fast;
 		if (!inl[i]) {
 			stFlush(&k);
 			bHelper(&k, a, instr, delay);
@@ -427,7 +450,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	stFlush(&k);
 	struct State atEnd = k.st;
 	// The next block's version, when the state here decides it
-	int next = pending != NO_LOAD ? GENERIC : allZero(&k.st) ? CLEAN : DYNAMIC;
+	int next = b->fast || pending != NO_LOAD ? GENERIC : allZero(&k.st) ? CLEAN : DYNAMIC;
 	for (int r = 0; r < 32 && next == DYNAMIC; r++) {
 		if (k.st.absorb[r] > 0) next = GENERIC;
 	}
@@ -457,7 +480,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 
 // What a fetch at a runs: the cache's word when it holds it, otherwise memory's, which a fill brings in.
 static uint32_t fetchWord(struct Psx* p, uint32_t a) {
-	if (!romUncached(a) && cached(&p->cpu, a)) return cachedWord(&p->cpu, a);
+	if (!romUncached(a) && cached(&p->cpu, a) && !fastMode(p)) return cachedWord(&p->cpu, a);
 	uint32_t phys = a & 0x1FFFFFFF, w;
 	memcpy(&w, phys < 0x800000 ? p->ram + (phys & (RAM_SIZE - 1)) : p->bios + (phys & (BIOS_SIZE - 1)), 4);
 	return w;
@@ -465,7 +488,8 @@ static uint32_t fetchWord(struct Psx* p, uint32_t a) {
 
 // Whether the cache holds the block's words in its line k.
 static bool lineHeld(struct Cpu* c, struct Block* b, int k) {
-	if (b->uncached) return true;
+	if (b->dead) return false;
+	if (b->uncached || b->fast) return true;
 	int first = k ? 4 * k - (int) ((b->pc >> 2) & 3) : 0;
 	int last = 4 * (k + 1) - (int) ((b->pc >> 2) & 3);
 	if (last > b->count) last = b->count;
@@ -499,6 +523,8 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 	b->delay = false;
 	b->link[0] = b->link[1] = NULL;
 	b->uncached = romUncached(pc);
+	b->fast = fastMode(p);
+	b->dead = false;
 	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {
 		if (!(b->uncached ? romUncached(a) : fetchable(a)) || (a != pc && special(p, a))) break;
 		uint32_t instr = fetchWord(p, a);
@@ -521,7 +547,7 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 	}
 
 	static const int order[3] = { CAREFUL, GENERIC, CLEAN };
-	for (int o = 0; o < 3; o++) {
+	for (int o = b->fast ? 1 : 0; o < (b->fast ? 2 : 3); o++) {
 		int version = order[o];
 		uint8_t* start = j->arena + j->used;
 		uint8_t* end = emitBlock(j, b, version, start, j->arena + ARENA_SIZE);
@@ -533,6 +559,19 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 		j->used = (size_t) (end - j->arena + 15) & ~(size_t) 15;
 		b->body[version] = start;
 		b->end[version] = end;
+	}
+	if (b->fast) {
+		// One version for all three; its RAM pages say when it's written
+		for (int v = 0; v < 3; v++) {
+			b->body[v] = b->body[GENERIC];
+			b->end[v] = b->end[GENERIC];
+			memcpy(b->at[v], b->at[GENERIC], sizeof b->at[v]);
+		}
+		uint32_t phys = pc & 0x1FFFFFFF;
+		if (phys < 0x800000) {
+			p->codePage[(phys & (RAM_SIZE - 1)) >> 12] = 1;
+			p->codePage[((phys + 4 * b->count - 4) & (RAM_SIZE - 1)) >> 12] = 1;
+		}
 	}
 	// Checked only when the cache holds its first line as compiled
 	b->checked = c->icacheChanges - !lineHeld(c, b, 0);
@@ -589,7 +628,7 @@ static bool cleanState(struct Cpu* c) {
 static uint8_t* enterAt(struct Psx* p, struct Jit* j, uint32_t pc) {
 	struct Cpu* c = &p->cpu;
 	if (!c->branched) {
-		if (!romUncached(pc) && !cached(c, pc)) cpuFetch(p, pc);
+		if (!romUncached(pc) && !cached(c, pc) && !fastMode(p)) cpuFetch(p, pc);
 		struct Block** slot = &j->table[(pc >> 2) & (TABLE_SIZE - 1)];
 		struct Block* b = *slot;
 		if (!b || b->pc != pc || (b->checked != c->icacheChanges && !lineCurrent(c, b, 0))) {
@@ -653,6 +692,7 @@ void jitFlush(struct Psx* p) {
 	struct Jit* j = p->jit;
 	if (!j) return;
 	memset(j->table, 0, TABLE_SIZE * sizeof *j->table);
+	memset(p->codePage, 0, sizeof p->codePage);
 	j->blockCount = 0;
 	j->resumeBlock = NULL;
 	j->stats[5]++;
@@ -717,6 +757,29 @@ uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr, int* v
 	}
 	*instr = 0;
 	return 1;
+}
+
+// The Fast mode: RAM at offset was written, and its 4 KB page holds recompiled code. The blocks in it
+// (and those running into it from the page before) are gone: their table slots are cleared, and
+// their links and the dispatcher find them out of date.
+void jitInvalidate(struct Psx* p, uint32_t offset) {
+	struct Jit* j = p->jit;
+	uint32_t page = (offset & (RAM_SIZE - 1)) >> 12;
+	p->codePage[page] = 0;
+	if (!j) return;
+	uint32_t first = page << 10, from = first >= BLOCK_MAX ? first - BLOCK_MAX : 0;
+	for (uint32_t w = from; w < first + 1024; w++) {
+		struct Block** slot = &j->table[w & (TABLE_SIZE - 1)];
+		struct Block* b = *slot;
+		if (!b || !b->fast || b->uncached || (b->pc & 0x1FFFFFFF) >= 0x800000) continue;
+		uint32_t start = (b->pc & (RAM_SIZE - 1)) >> 2;
+		if (start + (uint32_t) b->count <= first || start >= first + 1024) continue;
+		b->dead = true;
+		b->checked = p->cpu.icacheChanges - 1;
+		b->gen[0] ^= 0x80000000;
+		*slot = NULL;
+	}
+	if (j->resumeBlock && j->resumeBlock->dead) j->resumeBlock = NULL;
 }
 
 // For psxrun: the recompiled code (path.bin) and where each block's versions are in it (path.txt).

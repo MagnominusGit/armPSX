@@ -112,6 +112,7 @@ bool psxLoadExe(struct Psx* p, const uint8_t* data, size_t size) {
 	for (uint32_t i = 0; i < length; i++) {
 		p->ram[(dest + i) & (RAM_SIZE - 1)] = data[0x800 + i];
 	}
+	jitFlush(p);
 	p->cpu.pc = pc;
 	p->cpu.next = pc + 4;
 	p->cpu.r[28] = gp;

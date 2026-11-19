@@ -32,3 +32,8 @@ void jitDump(struct Psx* p, const char* path) {
 	(void) p;
 	(void) path;
 }
+
+void jitInvalidate(struct Psx* p, uint32_t offset) {
+	(void) p;
+	(void) offset;
+}

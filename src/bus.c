@@ -204,6 +204,7 @@ void busWrite32(struct Psx* p, uint32_t address, uint32_t value) {
 	if (p->watch && (a & 0x1FFFFC) == p->watch && a < 0x800000) fprintf(stderr, "cpu write %08x = %08x pc %08x frame %u\n", address, value, p->cpu.pc, p->frames);
 	if (a < 0x800000) {
 		memcpy(p->ram + (a & (RAM_SIZE - 1)), &value, 4);
+		psxCodeWrite(p, a);
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {
 		ioWrite(p, a, value, 4);
 	} else if (a == 0xFFFE0130) {
@@ -227,6 +228,7 @@ void busWrite16(struct Psx* p, uint32_t address, uint32_t value) {
 	if (a < 0x800000) {
 		uint16_t h = value;
 		memcpy(p->ram + (a & (RAM_SIZE - 1)), &h, 2);
+		psxCodeWrite(p, a);
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {
 		ioWrite(p, a, value, 2);
 	}
@@ -237,6 +239,7 @@ void busWrite8(struct Psx* p, uint32_t address, uint32_t value) {
 	if (p->watch && (a & 0x1FFFFC) == p->watch && a < 0x800000) fprintf(stderr, "cpu write8 %08x = %08x pc %08x frame %u\n", address, value, p->cpu.pc, p->frames);
 	if (a < 0x800000) {
 		p->ram[a & (RAM_SIZE - 1)] = value;
+		psxCodeWrite(p, a);
 	} else if (a >= 0x1F801000 && a < 0x1F803000) {
 		ioWrite(p, a, value, 1);
 	}

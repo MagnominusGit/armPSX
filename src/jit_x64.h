@@ -14,10 +14,13 @@
 #define ABSORB(i) M(RBX, (int32_t) (offsetof(struct Psx, cpu.absorb) + (i)))
 #define ABSORB_AT(reg) MI(RBX, reg, 1, (int32_t) offsetof(struct Psx, cpu.absorb))
 
+enum { FAST_JIT = 1 };  // this backend has the Fast mode's code
+
 struct Compile {
 	struct Emitter e;
 	struct Jit* j;
 	struct State st;
+	bool fast;  // the Fast mode: no timing besides a fixed cost per instruction
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -113,6 +116,28 @@ static void bCommitLoad(struct Compile* k, int reg) {
 	xStore(e, 1, ABSORB(reg), RAX);
 	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
 	if (!reg) xStoreI(e, 4, GPR(0), 0);
+}
+
+// The Fast mode's commits: the value only.
+static void bCommitLoadFast(struct Compile* k, int reg) {
+	struct Emitter* e = &k->e;
+	if (reg) {
+		xLoad(e, 4, RAX, P(cpu.ldValue));
+		xStore(e, 4, GPR(reg), RAX);
+	}
+	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
+}
+
+static void bCommitDynamicFast(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	xLoad(e, 4, RAX, P(cpu.ldReg));
+	xAluI(e, X_CMP, 4, R(RAX), NO_LOAD);
+	uint8_t* none = xJcc(e, CC_E, NULL);
+	xLoad(e, 4, R8, P(cpu.ldValue));
+	xStore(e, 4, MI(RBX, RAX, 4, (int32_t) offsetof(struct Psx, cpu.r)), R8);
+	xStoreI(e, 4, P(cpu.ldReg), NO_LOAD);
+	xStoreI(e, 4, GPR(0), 0);
+	patchHere(e, none);
 }
 
 // commitLoad as the interpreter does it, for whatever load is in flight.
@@ -383,6 +408,17 @@ static void ramOffset(struct Compile* k, uint8_t** otherSite) {
 	*otherSite = xJcc(e, CC_S, NULL);
 }
 
+// The Fast mode: a store to a page recompiled code came from goes the slow way, which throws the code
+// out (rdx = the RAM offset).
+static void codePageCheck(struct Compile* k) {
+	struct Emitter* e = &k->e;
+	if (!k->fast) return;
+	xMovRR(e, 4, RAX, RDX);
+	xShiftI(e, X_SHR, 4, R(RAX), 12);
+	xAluI(e, X_CMP, 1, MI(RBX, RAX, 1, (int32_t) offsetof(struct Psx, codePage)), 0);
+	slowJump(k, CC_NE);
+}
+
 // Not RAM: edx = the scratchpad offset of the address in ecx, or the slow path. The scratchpad is
 // (a & 0x7FFFFC00) == 0x1F800000 below 0xA0000000.
 static void scratchOffset(struct Compile* k) {
@@ -440,7 +476,8 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	stUses(k, rs);
 	stCommit(k, cancelSame(k, pending, rt));
 	int surcharge = stBeginRead(k);
-	if (pass == 0) {
+	if (k->fast) {
+	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
 		xStoreI(e, 1, P(cpu.ldAbsorb), 5);
@@ -459,7 +496,8 @@ static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	stUses(k, rs);
 	stCommit(k, pending);
 	int surcharge = stBeginRead(k);
-	if (pass == 0) {
+	if (k->fast) {
+	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
 		xStoreI(e, 1, P(cpu.ldAbsorb), 4);
@@ -489,6 +527,7 @@ static void emitStore(struct Compile* k, uint32_t instr, int pending) {
 	slowJump(k, CC_NE);
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
+	codePageCheck(k);
 	xAluRR(e, X_ADD, 8, R(RDX), R15);
 	coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 	loadGpr(e, RSI, rt);
@@ -543,12 +582,14 @@ static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 			// MFHI/MFLO: the commit, then the wait for a multiply or divide (memory has the state)
 			stUses(k, rd);
 			stCommit(k, pending);
-			stFlush(k);
-			xStore(e, 8, P(cycles), R13);
-			xMovRR(e, 8, RDI, RBX);
-			callC(e, (const void*) cpuJitWaitMuldiv);
-			xLoad(e, 8, R13, P(cycles));
-			stAfterWait(k);
+			if (!k->fast) {
+				stFlush(k);
+				xStore(e, 8, P(cycles), R13);
+				xMovRR(e, 8, RDI, RBX);
+				callC(e, (const void*) cpuJitWaitMuldiv);
+				xLoad(e, 8, R13, P(cycles));
+				stAfterWait(k);
+			}
 			if (rd) {
 				xLoad(e, 4, RAX, GPR(fn == 0x10 ? 32 : 33));
 				xStore(e, 4, GPR(rd), RAX);
@@ -721,6 +762,7 @@ static void emitGteMemory(struct Compile* k, uint32_t instr, int pending) {
 	uint8_t* otherSite;
 	ramOffset(k, &otherSite);
 	if (op == 0x3A) {
+		codePageCheck(k);
 		xAluRR(e, X_ADD, 8, R(RDX), R15);
 		coldHere(k, COLD_STORE, otherSite, instr, pending, k->st);
 		stUses(k, rs);

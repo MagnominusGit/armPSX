@@ -32,6 +32,7 @@ static uint32_t ramRead(struct Psx* p, uint32_t address) {
 static void ramWrite(struct Psx* p, uint32_t address, uint32_t v) {
 	if (p->watch && (address & 0x1FFFFC) == p->watch) fprintf(stderr, "dma write %06x = %08x frame %u ch? chcr1 %08x madr1 %06x bcr1 %08x\n", address, v, p->frames, p->dma.chcr[1], p->dma.madr[1], p->dma.bcr[1]);
 	memcpy(p->ram + (address & 0x1FFFFC), &v, 4);
+	psxCodeWrite(p, address & 0x1FFFFC);
 }
 
 static uint32_t deviceRead(struct Psx* p, int channel) {
