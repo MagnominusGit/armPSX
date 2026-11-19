@@ -26,12 +26,16 @@ struct Block {
 	bool delay;  // it ends with a branch and its delay slot
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
-	void (*code)(struct Psx*, int64_t);
+	uint32_t checked;  // cpu.icacheChanges when its lines were last found unchanged
+	uint8_t* body;
 };
 
 struct Jit {
 	uint8_t* arena;
 	size_t used;
+	void (*enter)(struct Psx*, int64_t, uint8_t*);
+	uint8_t* leave;     // stores r13 and returns
+	uint8_t* dispatch;  // on to the block at cpu.pc, or out
 	struct Block** table;
 	struct Block* blocks;
 	int blockCount;
@@ -123,8 +127,7 @@ static void loadGpr(struct Emitter* e, int host, int reg) {
 
 struct Compile {
 	struct Emitter e;
-	uint8_t* leave;        // stores r13 and returns
-	uint8_t* leaveReload;  // reloads r13 from p->cycles, then leaves
+	uint8_t* leave;
 	uint8_t* stubSites[BLOCK_MAX];
 	struct { uint8_t* site; uint32_t pc, instr; } slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -409,6 +412,60 @@ static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pendi
 	xStore(e, 4, P(cpu.next), RAX);
 }
 
+// COP2: the GTE's commands and moves, when the GTE is usable (otherwise the interpreter raises the
+// exception). Calls into gte.c keep rbx, rbp and r12-r15.
+static bool emitGte(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+	struct Emitter* e = &k->e;
+	int rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
+	if (!(instr & 0x02000000) && rs != 0 && rs != 2 && rs != 4 && rs != 6) return false;
+	xTestI(e, 4, P(cpu.sr), 0x40000000);
+	slowJump(k, CC_E, pc, instr);
+	if (instr & 0x02000000) {
+		commit(e, pending);
+		xLoad(e, 8, RAX, P(cpu.gteDone));
+		xAluRR(e, X_CMP, 8, R(R13), RAX);
+		xCmov(e, CC_L, 8, R13, R(RAX));
+		movI(e, RDI, instr);
+		callC(e, (const void*) GTE_Instruction);
+		xMovsxd(e, RAX, R(RAX));
+		xAluRR(e, X_ADD, 8, R(RAX), R13);
+		xStore(e, 8, P(cpu.gteDone), RAX);
+		return true;
+	}
+	if (rs == 0 || rs == 2) {
+		int reg = pending;
+		if (pending == DYNAMIC) {
+			xAluI(e, X_CMP, 4, P(cpu.ldReg), rt);
+			uint8_t* other = xJcc(e, CC_NE, NULL);
+			xStoreI(e, 4, P(cpu.ldReg), 0);
+			patchHere(e, other);
+		} else if (pending == rt) {
+			reg = 0;
+		}
+		commit(e, reg);
+		// The GTE's wait, which the next instructions may hide
+		movI(e, RCX, 0);
+		xLoad(e, 8, RAX, P(cpu.gteDone));
+		xAluRR(e, X_SUB, 8, R(RAX), R13);
+		xCmov(e, CC_L, 8, RAX, R(RCX));
+		xStore(e, 1, P(cpu.ldAbsorb), RAX);
+		xAluRR(e, X_ADD, 8, R(R13), RAX);
+		movI(e, RDI, rd);
+		callC(e, (const void*) (rs == 0 ? GTE_ReadDR : GTE_ReadCR));
+		xStore(e, 4, P(cpu.ldValue), RAX);
+		xStoreI(e, 4, P(cpu.ldReg), rt);
+		return true;
+	}
+	loadGpr(e, RSI, rt);
+	commit(e, pending);
+	xLoad(e, 8, RAX, P(cpu.gteDone));
+	xAluRR(e, X_CMP, 8, R(R13), RAX);
+	xCmov(e, CC_L, 8, R13, R(RAX));
+	movI(e, RDI, rd);
+	callC(e, (const void*) (rs == 4 ? GTE_WriteDR : GTE_WriteCR));
+	return true;
+}
+
 static int kind(uint32_t instr) {
 	int op = instr >> 26, fn = instr & 63;
 	if (op == 0 && (fn == 0x08 || fn == 0x09)) return 2;  // JR/JALR
@@ -459,24 +516,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	e->start = e->p = j->arena + j->used;
 	e->end = j->arena + ARENA_SIZE;
 	uint8_t* entry = e->p;
-	xPush(e, RBX); xPush(e, RBP); xPush(e, R12); xPush(e, R13); xPush(e, R14); xPush(e, R15);
-	xAluI(e, X_SUB, 8, R(RSP), 8);
-	xMovRR(e, 8, RBX, RDI);
-	xMovRR(e, 8, RBP, RSI);
-	xLoad(e, 8, R13, P(cycles));
-	xLea(e, 8, R15, P(ram));
-	loadLimit(e);
-	uint8_t* body = xJmp(e, NULL);
-	// The way out
-	k.leaveReload = e->p;
-	xLoad(e, 8, R13, P(cycles));
-	k.leave = e->p;
-	xStore(e, 8, P(cycles), R13);
-	xAluI(e, X_ADD, 8, R(RSP), 8);
-	xPop(e, R15); xPop(e, R14); xPop(e, R13); xPop(e, R12); xPop(e, RBP); xPop(e, RBX);
-	xRet(e);
-	patchHere(e, body);
-
+	k.leave = j->leave;
 	int pending = DYNAMIC;
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = pc + 4 * i, instr = b->words[i];
@@ -500,6 +540,8 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		} else if (op == 0x28 || op == 0x29 || op == 0x2B) {
 			emitStore(&k, a, instr, pending);
 			inline_ = true;
+		} else if (op == 0x12) {
+			inline_ = emitGte(&k, a, instr, pending);
 		} else if (kind(instr) == 0) {
 			inline_ = emitAlu(&k, a, instr, pending);
 		} else if (b->delay && i == b->count - 2) {
@@ -532,7 +574,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		xStore(e, 4, P(cpu.next), RAX);
 	}
 	xStoreI(e, 1, P(cpu.branched), 0);
-	xJmp(e, k.leave);
+	xJmp(e, j->dispatch);
 	// Leaving before an instruction when the limit is reached
 	for (int i = 0; i < b->count; i++) {
 		patchHere(e, k.stubSites[i]);
@@ -553,9 +595,49 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		return NULL;
 	}
 	j->used = (size_t) (e->p - j->arena + 15) & ~(size_t) 15;
-	b->code = (void (*)(struct Psx*, int64_t)) (void*) entry;
+	b->body = entry;
+	b->checked = c->icacheChanges;
 	j->blockCount++;
 	return b;
+}
+
+// The code every block shares: the way in (registers set, then the block's body), the way out, and
+// the dispatcher a block ends with, which goes straight on to the next block while the limit allows
+// and the next block's lines are as it last found them.
+static void emitShared(struct Psx* p, struct Jit* j) {
+	struct Emitter e = { j->arena, j->arena, j->arena + ARENA_SIZE };
+	j->enter = (void (*)(struct Psx*, int64_t, uint8_t*)) (void*) e.p;
+	xPush(&e, RBX); xPush(&e, RBP); xPush(&e, R12); xPush(&e, R13); xPush(&e, R14); xPush(&e, R15);
+	xAluI(&e, X_SUB, 8, R(RSP), 8);
+	xMovRR(&e, 8, RBX, RDI);
+	xMovRR(&e, 8, RBP, RSI);
+	xLoad(&e, 8, R13, P(cycles));
+	xLea(&e, 8, R15, P(ram));
+	xMovI64(&e, R12, (uint64_t) (uintptr_t) j->table);
+	loadLimit(&e);
+	xJmpR(&e, RDX);
+	j->leave = e.p;
+	xStore(&e, 8, P(cycles), R13);
+	xAluI(&e, X_ADD, 8, R(RSP), 8);
+	xPop(&e, R15); xPop(&e, R14); xPop(&e, R13); xPop(&e, R12); xPop(&e, RBP); xPop(&e, RBX);
+	xRet(&e);
+	j->dispatch = e.p;
+	xAluRR(&e, X_CMP, 8, R(R13), R14);
+	xJcc(&e, CC_GE, j->leave);
+	xLoad(&e, 4, RAX, P(cpu.pc));
+	xMovRR(&e, 4, RCX, RAX);
+	xShiftI(&e, X_SHR, 4, R(RCX), 2);
+	xAluI(&e, X_AND, 4, R(RCX), TABLE_SIZE - 1);
+	xLoad(&e, 8, RDX, MI(R12, RCX, 8, 0));
+	xTest(&e, 8, R(RDX), RDX);
+	xJcc(&e, CC_E, j->leave);
+	xAluRM(&e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct Block, pc)));
+	xJcc(&e, CC_NE, j->leave);
+	xLoad(&e, 4, RAX, P(cpu.icacheChanges));
+	xAluRM(&e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct Block, checked)));
+	xJcc(&e, CC_NE, j->leave);
+	xJmpM(&e, M(RDX, (int32_t) offsetof(struct Block, body)));
+	j->used = (size_t) (e.p - j->arena + 15) & ~(size_t) 15;
 }
 
 // Whether the block's lines still hold what it was compiled from.
@@ -581,6 +663,9 @@ bool jitCreate(struct Psx* p) {
 	j->arena = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	j->table = calloc(TABLE_SIZE, sizeof *j->table);
 	j->blocks = calloc(BLOCKS_MAX, sizeof *j->blocks);
+	if (j->arena != MAP_FAILED && j->table && j->blocks) {
+		emitShared(p, j);
+	}
 	if (j->arena == MAP_FAILED || !j->table || !j->blocks) {
 		if (j->arena != MAP_FAILED) munmap(j->arena, ARENA_SIZE);
 		free(j->table);
@@ -607,7 +692,7 @@ void jitFlush(struct Psx* p) {
 	if (!j) return;
 	memset(j->table, 0, TABLE_SIZE * sizeof *j->table);
 	j->blockCount = 0;
-	j->used = 0;
+	emitShared(p, j);
 }
 
 bool jitRun(struct Psx* p, int64_t until) {
@@ -624,9 +709,10 @@ bool jitRun(struct Psx* p, int64_t until) {
 		b = compile(p, j, pc);
 		if (!b) return false;
 		*slot = b;
-	} else if (!current(c, b)) {
-		return false;
+	} else if (b->checked != c->icacheChanges) {
+		if (!current(c, b)) return false;
+		b->checked = c->icacheChanges;
 	}
-	b->code(p, until);
+	j->enter(p, until, b->body);
 	return true;
 }
