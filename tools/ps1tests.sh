@@ -25,7 +25,8 @@ find . -name "*.exe" | sort | while read exe; do
 	*15bit*|*24bit*) bits=$(echo "$name" | grep -o "[0-9]*bit"); [ -f "$REF/$dir/vram-$bits.png" ] && png="$REF/$dir/vram-$bits.png";;
 	esac
 	if [ -n "$png" ]; then
-		result="$result, vram $(python3 -I "$TOOLS/vramcmp.py" "$png" "$log.ppm")"
+		mode=; case "$name" in *24bit*) mode=24;; esac
+		result="$result, vram $(python3 -I "$TOOLS/vramcmp.py" "$png" "$log.ppm" $mode)"
 	fi
 	echo "$dir/$name: $result"
 done
