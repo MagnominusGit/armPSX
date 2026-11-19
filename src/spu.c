@@ -87,6 +87,8 @@
 #include <string.h>
 #include "psx.h"
 
+static struct Psx* P;
+
 #define MDFN_LIKELY(x) __builtin_expect(!!(x), 1)
 #define MDFN_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define INLINE inline
@@ -1336,6 +1338,15 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
    SPU_Voice *voice = &Voices[voice_num];
    int32_t voice_pvs;
 
+   // The Fast mode leaves a silent, released voice alone until it's keyed on again.
+   if(P->mode == MODE_FAST && !(int16_t)voice->ADSR.EnvLevel && voice->ADSR.Phase == ADSR_RELEASE && !(VoiceOn & (1U << voice_num)))
+   {
+    voice->PreLRSample = 0;
+    if(voice_num == 1 || voice_num == 3)
+     WriteSPURAM(0x400 | ((voice_num >> 1) * 0x200) | CWA, 0);
+    continue;
+   }
+
    voice->PreLRSample = 0;
 
    //;
@@ -1867,7 +1878,6 @@ int32_t SPU_EndFrame(int16_t *SoundBuf)
 
 // armPSX's side
 
-static struct Psx* P;
 static bool irqLevel;
 
 static void spuIrq(bool level) {
