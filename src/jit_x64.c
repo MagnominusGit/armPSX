@@ -28,6 +28,8 @@ struct Block {
 	uint32_t words[BLOCK_MAX];
 	uint32_t checked;  // cpu.icacheChanges when its lines were last found unchanged
 	uint8_t* body;
+	uint8_t* end;
+	uint16_t at[BLOCK_MAX];  // each instruction's code, from body
 };
 
 struct Jit {
@@ -521,6 +523,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = pc + 4 * i, instr = b->words[i];
 		bool delay = b->delay && i == b->count - 1;
+		b->at[i] = (uint16_t) (e->p - entry);
 		// The limit, then the cycle the fetch takes unless a load's wait hides it
 		xAluRR(e, X_CMP, 8, R(R13), R14);
 		k.stubSites[i] = xJcc(e, CC_GE, NULL);
@@ -596,6 +599,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	}
 	j->used = (size_t) (e->p - j->arena + 15) & ~(size_t) 15;
 	b->body = entry;
+	b->end = e->p;
 	b->checked = c->icacheChanges;
 	j->blockCount++;
 	return b;
@@ -635,7 +639,23 @@ static void emitShared(struct Psx* p, struct Jit* j) {
 	xJcc(&e, CC_NE, j->leave);
 	xLoad(&e, 4, RAX, P(cpu.icacheChanges));
 	xAluRM(&e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct Block, checked)));
+	uint8_t* go = xJcc(&e, CC_E, NULL);
+	// The cache changed since: the block's own lines decide
+	xLoad(&e, 4, RCX, M(RDX, (int32_t) offsetof(struct Block, pc)));
+	xShiftI(&e, X_SHR, 4, R(RCX), 4);
+	xLoad(&e, 4, RSI, M(RDX, (int32_t) offsetof(struct Block, lines)));
+	xLea(&e, 8, RDI, M(RDX, (int32_t) offsetof(struct Block, gen)));
+	uint8_t* loop = e.p;
+	xMovzx(&e, R8, 1, R(RCX));
+	xLoad(&e, 4, R9, MI(RBX, R8, 4, (int32_t) offsetof(struct Psx, cpu.icacheGen)));
+	xAluRM(&e, X_CMP, 4, R9, M(RDI, 0));
 	xJcc(&e, CC_NE, j->leave);
+	xAluI(&e, X_ADD, 8, R(RDI), 4);
+	xAluI(&e, X_ADD, 4, R(RCX), 1);
+	xAluI(&e, X_SUB, 4, R(RSI), 1);
+	xJcc(&e, CC_NE, loop);
+	xStore(&e, 4, M(RDX, (int32_t) offsetof(struct Block, checked)), RAX);
+	patchHere(&e, go);
 	xJmpM(&e, M(RDX, (int32_t) offsetof(struct Block, body)));
 	j->used = (size_t) (e.p - j->arena + 15) & ~(size_t) 15;
 }
@@ -715,4 +735,22 @@ bool jitRun(struct Psx* p, int64_t until) {
 	}
 	j->enter(p, until, b->body);
 	return true;
+}
+
+// For profiling: the guest instruction whose code holds address (0 when it isn't a block's).
+uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
+	struct Jit* j = p->jit;
+	const uint8_t* a = address;
+	if (!j || a < j->arena || a >= j->arena + ARENA_SIZE) return 0;
+	for (int i = 0; i < j->blockCount; i++) {
+		struct Block* b = &j->blocks[i];
+		if (a >= b->body && a < b->end) {
+			int w = 0;
+			while (w + 1 < b->count && a >= b->body + b->at[w + 1]) w++;
+			*instr = b->words[w];
+			return b->pc + 4 * w;
+		}
+	}
+	*instr = 0;
+	return 1;
 }

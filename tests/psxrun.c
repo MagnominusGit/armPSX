@@ -1,17 +1,82 @@
 /* Copyright (c) 2026 Magnominus
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
 #include "psx.h"
 #include "disc.h"
 
 // psxrun bios frames [exe]: runs headless; PSXRUN_SHOTS=dir/prefix saves pictures at PSXRUN_AT=frame,frame...
 // PSXRUN_PRESS="from-to:buttons,..." holds pad 1 buttons (hex, pad order: 0x0008 Start, 0x4000 Cross,
 // 0x0010 Up, 0x0040 Down, ...) over those frames; "every/len@from:buttons" repeats from a frame on.
+
+
+// PSXRUN_PROF=1: samples where the host is every 100 us of CPU time, then prints the guest
+// instructions the recompiled code spent it on and the host addresses outside it (for nm).
+static uintptr_t profSamples[1 << 22];
+static volatile int profCount;
+
+static void profHandler(int sig, siginfo_t* info, void* context) {
+#if defined(__x86_64__)
+	uintptr_t ip = ((ucontext_t*) context)->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+	uintptr_t ip = ((ucontext_t*) context)->uc_mcontext.pc;
+#else
+	uintptr_t ip = 0;
+#endif
+	if (profCount < (int) (sizeof profSamples / sizeof *profSamples)) profSamples[profCount++] = ip;
+}
+
+static void profStart(void) {
+	struct sigaction sa = { 0 };
+	sa.sa_sigaction = profHandler;
+	sa.sa_flags = SA_SIGINFO | SA_RESTART;
+	sigaction(SIGPROF, &sa, NULL);
+	struct itimerval t = { { 0, 100 }, { 0, 100 } };
+	setitimer(ITIMER_PROF, &t, NULL);
+}
+
+static int countDesc(const void* a, const void* b) {
+	const uint64_t* x = a;
+	const uint64_t* y = b;
+	return x[1] < y[1] ? 1 : x[1] > y[1] ? -1 : 0;
+}
+
+static void profReport(struct Psx* p) {
+	struct itimerval t = { 0 };
+	setitimer(ITIMER_PROF, &t, NULL);
+	int n = profCount, inJit = 0;
+	// guest opcode classes in recompiled code, and host addresses elsewhere (by 64-byte bucket)
+	static uint64_t ops[64][2], host[1 << 16][2];
+	int hosts = 0;
+	for (int i = 0; i < 64; i++) ops[i][0] = i;
+	for (int i = 0; i < n; i++) {
+		uint32_t instr;
+		uint32_t pc = jitDescribe(p, (const void*) profSamples[i], &instr);
+		if (pc) {
+			inJit++;
+			ops[pc == 1 ? 63 : instr >> 26][1]++;
+			continue;
+		}
+		uintptr_t a = profSamples[i];
+		int k;
+		for (k = 0; k < hosts && host[k][0] != a; k++) {}
+		if (k == hosts && hosts < (1 << 16)) host[hosts++][0] = a;
+		if (k < (1 << 16)) host[k][1]++;
+	}
+	qsort(ops, 64, sizeof ops[0], countDesc);
+	fprintf(stderr, "prof: %d samples, %d in recompiled code\n", n, inJit);
+	for (int i = 0; i < 12 && ops[i][1]; i++) fprintf(stderr, "prof op %02x %.1f%%\n", (int) ops[i][0], 100.0 * ops[i][1] / n);
+	qsort(host, hosts, sizeof host[0], countDesc);
+	for (int i = 0; i < hosts; i++) fprintf(stderr, "prof host %lx %lu\n", (unsigned long) host[i][0], (unsigned long) host[i][1]);
+}
 
 // The buttons held on a frame from PSXRUN_PRESS.
 static uint16_t pressed(const char* script, int frame) {
@@ -93,6 +158,7 @@ int main(int argc, char** argv) {
 		p->pcRing = calloc(256, 4);
 		p->pcStop = strtoul(getenv("PSXRUN_PCSTOP"), NULL, 16);
 	}
+	if (getenv("PSXRUN_PROF")) profStart();
 	int traceAt = getenv("PSXRUN_TRACE_AT") ? atoi(getenv("PSXRUN_TRACE_AT")) : -1;
 	for (int i = 1; i <= frames; i++) {
 		p->sio.pad[0].buttons = pressed(getenv("PSXRUN_PRESS"), i);
@@ -148,6 +214,7 @@ int main(int argc, char** argv) {
 		fwrite(&wavBytes, 4, 1, wav);
 		fclose(wav);
 	}
+	if (getenv("PSXRUN_PROF")) profReport(p);
 	fprintf(stderr, "%d frames in %.2f s (%.1f fps), pc %08x\n", frames, secs, frames / secs, p->cpu.pc);
 	if (getenv("PSXRUN_STATE")) {
 		fprintf(stderr, "sr %08x cause %08x epc %08x istat %03x imask %03x dicr %08x\n", p->cpu.sr, p->cpu.cause, p->cpu.epc, p->iStat, p->iMask, p->dma.dicr);

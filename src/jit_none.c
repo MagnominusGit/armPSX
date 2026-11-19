@@ -18,3 +18,7 @@ void jitFlush(struct Psx* p) {
 bool jitRun(struct Psx* p, int64_t until) {
 	return false;
 }
+
+uint32_t jitDescribe(struct Psx* p, const void* address, uint32_t* instr) {
+	return 0;
+}
