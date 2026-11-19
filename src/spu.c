@@ -1885,6 +1885,11 @@ static void spuIrq(bool level) {
  irqLevel = level;
 }
 
+// Whether SPU RAM accesses can raise the SPU's IRQ (then its samples have to come on time).
+bool spuIrqArmed(void) {
+ return SPUControl & 0x40;
+}
+
 void spuReset(struct Psx* p) {
  P = p;
  irqLevel = false;

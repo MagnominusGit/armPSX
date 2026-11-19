@@ -1386,6 +1386,15 @@ static void outputLine(struct Psx* p) {
 	g->frameH = count << interlace;
 }
 
+// Whether a timer's IRQ depends on each line's edges (timer 0 or 1 clocked or gated by them).
+static bool linesWatched(struct Psx* p) {
+	for (int i = 0; i < 2; i++) {
+		uint32_t mode = p->timer[i].mode;
+		if ((mode & 0x30) && (mode & 0x101)) return true;
+	}
+	return false;
+}
+
 void gpuRun(struct Psx* p) {
 	struct Gpu* g = &p->gpu;
 	int64_t sys = p->cycles - g->last;
@@ -1457,6 +1466,18 @@ void gpuRun(struct Psx* p) {
 	// Mednafen wakes the GPU every 128 cycles at most; that's only needed while commands wait for drawing
 	// time or timer 0 counts dots. Otherwise the next line edge is the next thing that happens.
 	int64_t next = ((((int64_t) g->lineCounter) << 16) - (int64_t) g->clockCounter + g->clockRatio - 1) / g->clockRatio;
+	if (p->mode == MODE_FAST && !linesWatched(p)) {
+		// The Fast mode wakes for the next line where something happens (vblank, the field); the lines
+		// before it are caught up then, or when the CPU looks
+		int32_t lines = (int32_t) g->linesPerField;
+		uint32_t targets[3] = { g->vEnd, g->vStart, 0 };
+		for (int i = 0; i < 3; i++) {
+			int32_t d = (int32_t) ((targets[i] + g->linesPerField - g->scanline) % g->linesPerField);
+			if (d > 0 && d < lines) lines = d;
+		}
+		int64_t lineCycles = ((int64_t) (g->displayMode & 8 ? 3405 : 3413) << 16) / g->clockRatio;
+		next += (lines - 1) * lineCycles;
+	}
 	if (p->timer[0].mode & 0x100) {
 		if (next > 128) next = 128;
 	} else if (g->drawTime < 0 && (g->fifoCount || (g->inCommand & (CMD_QUAD | CMD_PLINE)))) {

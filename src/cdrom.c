@@ -335,6 +335,10 @@ int32_t CDC_CalcNextEvent(void)
 {
  int32_t next_event = SPUCounter;
 
+ // The Fast mode makes the SPU's samples 32 at a time (one by one while its IRQ is armed)
+ if(P->mode == MODE_FAST && !spuIrqArmed())
+  next_event += 31 * 768;
+
  if(PSRCounter > 0 && next_event > PSRCounter)
   next_event = PSRCounter;
 

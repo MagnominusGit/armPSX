@@ -254,6 +254,7 @@ uint32_t spuDmaRead(struct Psx* p);
 void spuRun(struct Psx* p);
 void SPU_Power(void);
 int32_t SPU_UpdateFromCDC(int32_t clocks);
+bool spuIrqArmed(void);
 int spuSamples(int16_t* out);
 
 // cdrom.c
