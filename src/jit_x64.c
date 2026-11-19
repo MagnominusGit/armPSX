@@ -23,6 +23,7 @@ enum { ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE =
 struct Block {
 	uint32_t pc;
 	int count, lines;
+	bool delay;  // it ends with a branch and its delay slot
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
 	void (*code)(struct Psx*, int64_t);
@@ -129,14 +130,15 @@ struct Compile {
 	int slowCount;
 };
 
-// The instruction through cpuJitExecute; the block leaves if it has to.
-static void helper(struct Compile* k, uint32_t pc, uint32_t instr) {
+// The instruction through cpuJitExecute; the block leaves if it has to (always after a delay slot,
+// which leaves pc at the branch's target).
+static void helper(struct Compile* k, uint32_t pc, uint32_t instr, bool delay) {
 	struct Emitter* e = &k->e;
 	xStore(e, 8, P(cycles), R13);
 	xMovRR(e, 8, RDI, RBX);
 	movI(e, RSI, pc);
 	movI(e, RDX, instr);
-	xMovI(e, RCX, 0);
+	movI(e, RCX, delay);
 	callC(e, (const void*) cpuJitExecute);
 	xLoad(e, 8, R13, P(cycles));
 	xTest(e, 4, R(RAX), RAX);
@@ -361,6 +363,52 @@ result:
 	return true;
 }
 
+// Branches and jumps: the interpreter's order (operands, the commit, the link), then cpu.next = where
+// the delay slot goes on to.
+static void emitBranch(struct Compile* k, uint32_t pc, uint32_t instr, int pending) {
+	struct Emitter* e = &k->e;
+	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31, rd = instr >> 11 & 31;
+	uint32_t after = pc + 8, target = pc + 4 + ((uint32_t) (int32_t) (int16_t) instr << 2);
+	uint32_t jump = ((pc + 4) & 0xF0000000) | (instr & 0x3FFFFFF) << 2;
+	if (op == 0x02 || op == 0x03) {
+		if (op == 0x03) uses(e, 31);
+		commit(e, pending);
+		if (op == 0x03) xStoreI(e, 4, GPR(31), after);
+		xStoreI(e, 4, P(cpu.next), jump);
+		return;
+	}
+	if (op == 0x00) {
+		// JR/JALR
+		loadGpr(e, RSI, rs);
+		uses(e, rs);
+		uses(e, rd);
+		commit(e, pending);
+		if ((instr & 63) == 0x09 && rd) xStoreI(e, 4, GPR(rd), after);
+		xStore(e, 4, P(cpu.next), RSI);
+		return;
+	}
+	loadGpr(e, RSI, rs);
+	if (op == 0x04 || op == 0x05) loadGpr(e, RDI, rt);
+	uses(e, rs);
+	bool link = op == 0x01 && (rt & 0x1E) == 0x10;
+	if (op == 0x04 || op == 0x05) uses(e, rt);
+	if (link) uses(e, 31);
+	commit(e, pending);
+	if (link) xStoreI(e, 4, GPR(31), after);
+	int cc;
+	if (op == 0x04 || op == 0x05) {
+		xAluRR(e, X_CMP, 4, R(RSI), RDI);
+		cc = op == 0x04 ? CC_E : CC_NE;
+	} else {
+		xTest(e, 4, R(RSI), RSI);
+		cc = op == 0x06 ? CC_LE : op == 0x07 ? CC_G : (rt & 1) ? CC_NS : CC_S;
+	}
+	movI(e, RAX, after);
+	movI(e, RCX, target);
+	xCmov(e, cc, 4, RAX, R(RCX));
+	xStore(e, 4, P(cpu.next), RAX);
+}
+
 static int kind(uint32_t instr) {
 	int op = instr >> 26, fn = instr & 63;
 	if (op == 0 && (fn == 0x08 || fn == 0x09)) return 2;  // JR/JALR
@@ -385,11 +433,20 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	struct Block* b = &j->blocks[j->blockCount];
 	b->pc = pc;
 	b->count = 0;
-	for (uint32_t a = pc; b->count < BLOCK_MAX; a += 4) {
+	b->delay = false;
+	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {
 		if (!fetchable(a) || !cached(c, a) || (a != pc && special(p, a))) break;
 		uint32_t instr = cachedWord(c, a);
 		b->words[b->count++] = instr;
-		if (kind(instr) == 2) break;
+		if (kind(instr) == 2) {
+			// The delay slot comes along when the cache holds it and it isn't a branch too.
+			uint32_t d = a + 4;
+			if (fetchable(d) && cached(c, d) && !special(p, d) && kind(cachedWord(c, d)) != 2) {
+				b->words[b->count++] = cachedWord(c, d);
+				b->delay = true;
+			}
+			break;
+		}
 	}
 	if (!b->count) return NULL;
 	b->lines = ((pc + 4 * b->count - 4) >> 4) - (pc >> 4) + 1;
@@ -423,6 +480,7 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 	int pending = DYNAMIC;
 	for (int i = 0; i < b->count; i++) {
 		uint32_t a = pc + 4 * i, instr = b->words[i];
+		bool delay = b->delay && i == b->count - 1;
 		// The limit, then the cycle the fetch takes unless a load's wait hides it
 		xAluRR(e, X_CMP, 8, R(R13), R14);
 		k.stubSites[i] = xJcc(e, CC_GE, NULL);
@@ -444,25 +502,35 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 			inline_ = true;
 		} else if (kind(instr) == 0) {
 			inline_ = emitAlu(&k, a, instr, pending);
+		} else if (b->delay && i == b->count - 2) {
+			emitBranch(&k, a, instr, pending);
+			inline_ = true;
 		}
 		if (inline_) {
 			if (k.slowCount) {
 				uint8_t* over = xJmp(e, NULL);
 				for (int s = 0; s < k.slowCount; s++) patchHere(e, k.slows[s].site);
-				helper(&k, a, instr);
+				helper(&k, a, instr, delay);
 				patchHere(e, over);
 			}
 		} else {
-			helper(&k, a, instr);
+			helper(&k, a, instr, delay);
 		}
 		pending = leavesLoad(instr);
 	}
-	// The end of the block: on to the next instruction
-	uint32_t end = pc + 4 * b->count;
-	movI(e, RAX, end);
-	xStore(e, 4, P(cpu.pc), RAX);
-	movI(e, RAX, end + 4);
-	xStore(e, 4, P(cpu.next), RAX);
+	// The end of the block: on to the next instruction, or where the branch sent the delay slot
+	if (b->delay) {
+		xLoad(e, 4, RAX, P(cpu.next));
+		xStore(e, 4, P(cpu.pc), RAX);
+		xAluI(e, X_ADD, 4, R(RAX), 4);
+		xStore(e, 4, P(cpu.next), RAX);
+	} else {
+		uint32_t end = pc + 4 * b->count;
+		movI(e, RAX, end);
+		xStore(e, 4, P(cpu.pc), RAX);
+		movI(e, RAX, end + 4);
+		xStore(e, 4, P(cpu.next), RAX);
+	}
 	xStoreI(e, 1, P(cpu.branched), 0);
 	xJmp(e, k.leave);
 	// Leaving before an instruction when the limit is reached
@@ -470,9 +538,14 @@ static struct Block* compile(struct Psx* p, struct Jit* j, uint32_t pc) {
 		patchHere(e, k.stubSites[i]);
 		movI(e, RAX, pc + 4 * i);
 		xStore(e, 4, P(cpu.pc), RAX);
-		movI(e, RAX, pc + 4 * i + 4);
-		xStore(e, 4, P(cpu.next), RAX);
-		xStoreI(e, 1, P(cpu.branched), 0);
+		if (b->delay && i == b->count - 1) {
+			// before the delay slot: cpu.next is the branch's, and the branch has just run
+			xStoreI(e, 1, P(cpu.branched), 1);
+		} else {
+			movI(e, RAX, pc + 4 * i + 4);
+			xStore(e, 4, P(cpu.next), RAX);
+			xStoreI(e, 1, P(cpu.branched), 0);
+		}
 		xJmp(e, k.leave);
 	}
 	if (e->p > e->end) {
