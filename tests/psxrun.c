@@ -4,8 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include "psx.h"
+#include "disc.h"
 
 // psxrun bios frames [exe]: runs headless; PSXRUN_SHOTS=dir/prefix saves pictures at PSXRUN_AT=frame,frame...
 
@@ -33,9 +35,19 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "can't read the BIOS %s\n", argv[1]);
 		return 1;
 	}
+	const char* image = argc > 3 ? argv[3] : NULL;
+	size_t n = image ? strlen(image) : 0;
+	if (image && n > 4 && (!strcasecmp(image + n - 4, ".cue") || !strcasecmp(image + n - 4, ".chd") || !strcasecmp(image + n - 4, ".m3u"))) {
+		p->disc = discOpen(image);
+		if (!p->disc) {
+			fprintf(stderr, "can't read the disc %s\n", image);
+			return 1;
+		}
+		image = NULL;
+	}
 	psxReset(p);
-	if (argc > 3) {
-		FILE* f = fopen(argv[3], "rb");
+	if (image) {
+		FILE* f = fopen(image, "rb");
 		if (!f) return 1;
 		fseek(f, 0, SEEK_END);
 		p->exeSize = ftell(f);

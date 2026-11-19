@@ -59,3 +59,10 @@ uint32_t spuDmaRead(struct Psx* p) {
 
 void spuRun(struct Psx* p) {
 }
+
+void SPU_Power(void) {
+}
+
+int32_t SPU_UpdateFromCDC(int32_t clocks) {
+	return 768 * 16;
+}

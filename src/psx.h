@@ -131,31 +131,6 @@ struct Sio {
 
 struct Disc;
 
-struct Cdrom {
-	uint8_t index, ie, iflags;
-	uint8_t params[16], paramCount;
-	uint8_t response[16], responseCount, responseRead;
-	uint8_t data[2352 + 16];
-	int dataCount, dataRead;
-	bool dataReady;
-	uint8_t status, mode;
-	uint8_t command;
-	int64_t commandAt, secondAt, readAt;
-	int pendingIrq, second;
-	uint32_t seekTarget, position;
-	bool reading, playing, seeking, motor, shellOpen;
-	uint8_t filterFile, filterChannel;
-	bool muted, adpcmMuted;
-	uint8_t volume[4], nextVolume[4];
-	struct { uint8_t data[2352]; bool ready; } sectors[8];
-	int sectorWrite, sectorRead;
-	struct { uint8_t bytes[16]; int count, irq; int64_t at; } queue[4];
-	int queued;
-	struct Disc* disc;
-	int16_t xa[2][4096];
-	int xaCount;
-};
-
 struct Mdec {
 	uint32_t status, command;
 	int words;
@@ -184,7 +159,7 @@ struct Psx {
 	struct Gpu gpu;
 	struct Spu spu;
 	struct Sio sio;
-	struct Cdrom cdrom;
+	struct Disc* disc;
 	struct Mdec mdec;
 	uint32_t frames;
 	bool pal;
@@ -260,12 +235,16 @@ void spuWrite(struct Psx* p, uint32_t address, uint16_t value);
 void spuDmaWrite(struct Psx* p, uint32_t value);
 uint32_t spuDmaRead(struct Psx* p);
 void spuRun(struct Psx* p);
+void SPU_Power(void);
+int32_t SPU_UpdateFromCDC(int32_t clocks);
 
 // cdrom.c
 void cdromReset(struct Psx* p);
 uint8_t cdromRead(struct Psx* p, uint32_t address);
 void cdromWrite(struct Psx* p, uint32_t address, uint8_t value);
 uint32_t cdromDmaRead(struct Psx* p);
+bool cdromDmaCanRead(struct Psx* p);
+void CDC_GetCDAudio(int32_t samples[2]);
 void cdromRun(struct Psx* p);
 
 // mdec.c
