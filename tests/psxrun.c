@@ -9,7 +9,9 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
+#include <unistd.h>
 #include "psx.h"
 #include "disc.h"
 
@@ -18,10 +20,12 @@
 // 0x0010 Up, 0x0040 Down, ...) over those frames; "every/len@from:buttons" repeats from a frame on.
 
 
-// PSXRUN_PROF=1: samples where the host is every 100 us of CPU time, then prints the guest
-// instructions the recompiled code spent it on and the host addresses outside it (for nm).
+// PSXRUN_PROF=1: samples where the emulation's thread is every 100 us of its CPU time (the drawing
+// and disc threads aren't sampled), then prints the guest instructions the recompiled code spent it
+// on and the host addresses outside it (for nm).
 static uintptr_t profSamples[1 << 22];
 static volatile int profCount;
+static timer_t profTimer;
 
 static void profHandler(int sig, siginfo_t* info, void* context) {
 #if defined(__x86_64__)
@@ -39,8 +43,12 @@ static void profStart(void) {
 	sa.sa_sigaction = profHandler;
 	sa.sa_flags = SA_SIGINFO | SA_RESTART;
 	sigaction(SIGPROF, &sa, NULL);
-	struct itimerval t = { { 0, 100 }, { 0, 100 } };
-	setitimer(ITIMER_PROF, &t, NULL);
+	struct sigevent ev = { 0 };
+	ev.sigev_notify = SIGEV_THREAD_ID;
+	ev.sigev_signo = SIGPROF;
+	ev._sigev_un._tid = (pid_t) syscall(SYS_gettid);
+	struct itimerspec t = { { 0, 100000 }, { 0, 100000 } };
+	if (timer_create(CLOCK_THREAD_CPUTIME_ID, &ev, &profTimer) == 0) timer_settime(profTimer, 0, &t, NULL);
 }
 
 static int countDesc(const void* a, const void* b) {
@@ -50,8 +58,7 @@ static int countDesc(const void* a, const void* b) {
 }
 
 static void profReport(struct Psx* p) {
-	struct itimerval t = { 0 };
-	setitimer(ITIMER_PROF, &t, NULL);
+	timer_delete(profTimer);
 	int n = profCount, inJit = 0;
 	// guest opcode classes in recompiled code, and host addresses elsewhere (by 64-byte bucket)
 	static uint64_t ops[64][2], host[1 << 16][2];
