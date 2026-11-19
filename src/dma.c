@@ -141,11 +141,16 @@ static void run(struct Psx* p, int channel) {
 	if (channel == OTC) {
 		clocks = words;
 	}
-	if (sync == 0 || (channel == GPU && sync == 1)) {
-		// Immediate transfers hold the CPU; so, nearly, do GPU block transfers (Mednafen steals
-		// cycles from every CPU read while one runs).
+	if (sync == 0) {
+		// Immediate transfers hold the CPU.
 		p->cycles += clocks;
 		finish(p, channel);
+	} else if (channel == GPU && sync == 1) {
+		// GPU block transfers nearly hold the CPU too (Mednafen steals cycles from every CPU read
+		// while one runs); they end after the store that started them.
+		p->cycles += clocks;
+		d->doneAt[channel] = p->cycles;
+		psxSchedule(p, p->cycles);
 	} else {
 		// Block and linked-list transfers run beside the CPU; the channel is busy until they're done.
 		d->doneAt[channel] = p->cycles + clocks;
@@ -189,6 +194,8 @@ static void mdecPump(struct Psx* p) {
 	}
 }
 
+static void maybeStart(struct Psx* p, int channel);
+
 void dmaRun(struct Psx* p) {
 	if (p->dma.remaining[MDEC_IN] || p->dma.remaining[MDEC_OUT]) {
 		mdecPump(p);
@@ -213,10 +220,8 @@ static void maybeStart(struct Psx* p, int channel) {
 		return;
 	}
 	if (d->doneAt[channel]) {
-		// Started again while the last transfer's time hasn't run out: its data has moved already.
-		d->doneAt[channel] = 0;
-		finish(p, channel);
-		d->chcr[channel] = chcr;
+		// A write while the transfer runs only updates the register; the transfer goes on.
+		return;
 	}
 	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000)) {
 		return;
