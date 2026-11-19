@@ -9,7 +9,7 @@ option list was read, never its code. armPSX's core has no options yet.
 |---|---|---|---|
 | CPU | Execution mode (interpreter, cached interpreter, recompiler) | interpreter + exact recompiler, recompiler always on | option: Recompiler / Interpreter |
 | CPU | Overclocking 50-290% | none | **wanted**: CPU clock option (same range) |
-| CPU | (none) | exact only | **wanted**: modes Exact (Mednafen-equivalent, today's code), Balanced (SwanStation-equivalent), Fast (PCSX-ReARMed-equivalent, the default) |
+| CPU | (none) | modes Exact (Mednafen-equivalent), Balanced (SwanStation-equivalent: a cycle per instruction plus bus time, coarse device timing), Fast (PCSX-ReARMed-equivalent, the default); x86 recompiler for Balanced/Fast, ARM still runs Exact's blocks | ARM recompiler for Balanced/Fast; register caching on ARM |
 | CPU | Recompiler icache, block linking, fast memory (+ rewrite) | always exact icache; links on; RAM fast path inline | nothing to expose |
 | Console | Region (auto/J/U/PAL), per-region BIOS, fast boot, 8 MB dev RAM | region from disc; one BIOS | region option, BIOS per region, fast boot (skip the logo) |
 | CD-ROM | Region check, read thread, preload/pre-cache CHD, readahead, mute CD audio, read speedup 1-10x, seek speedup | CHD/cue read in the frame | **wanted**: fast disk mode (read and seek speedup); mute CD audio, preload; region check off |

@@ -20,7 +20,8 @@ struct Compile {
 	struct Emitter e;
 	struct Jit* j;
 	struct State st;
-	bool fast;  // the Fast mode: no timing besides a fixed cost per instruction
+	bool fast;  // the Fast or Balanced mode: no ReadAbsorb or instruction cache timing
+	bool balanced;  // the Balanced mode: a cycle per instruction plus the bus's time
 	bool immediate;  // the Fast mode: this load writes its register at once (the next instruction doesn't read it)
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
@@ -477,11 +478,13 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	stUses(k, rs);
 	stCommit(k, cancelSame(k, pending, rt));
 	if (k->immediate) {
+		if (k->balanced && pass == 0) xAluI(e, X_ADD, 8, R(R13), 5);
 		if (rt) xStore(e, 4, GPR(rt), RSI);
 		return;
 	}
 	int surcharge = stBeginRead(k);
 	if (k->fast) {
+		if (k->balanced && pass == 0) xAluI(e, X_ADD, 8, R(R13), 5);
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
@@ -502,6 +505,7 @@ static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	stCommit(k, pending);
 	int surcharge = stBeginRead(k);
 	if (k->fast) {
+		if (k->balanced && pass == 0) xAluI(e, X_ADD, 8, R(R13), 4);
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
@@ -589,7 +593,7 @@ static void emitAlu(struct Compile* k, uint32_t instr, int pending) {
 			// MFHI/MFLO: the commit, then the wait for a multiply or divide (memory has the state)
 			stUses(k, rd);
 			stCommit(k, pending);
-			if (!k->fast) {
+			if (!k->fast || k->balanced) {
 				stFlush(k);
 				xStore(e, 8, P(cycles), R13);
 				xMovRR(e, 8, RDI, RBX);

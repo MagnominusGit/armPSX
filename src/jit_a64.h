@@ -93,6 +93,7 @@ struct Compile {
 	struct Jit* j;
 	struct State st;
 	bool fast;
+	bool balanced;
 	bool immediate;
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];

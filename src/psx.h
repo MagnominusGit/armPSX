@@ -88,7 +88,7 @@ struct Gpu {
 	int64_t last;
 	bool frameDone;
 	bool drawPixels;  // false while another thread draws: this GPU only takes drawing's time
-	bool roughTime;   // Fast mode: drawing's time from each primitive's size, without the texture cache
+	bool roughTime;   // Fast and Balanced modes: drawing's time from each primitive's size, without the texture cache
 	int8_t drawParity;  // a Fast mode drawing thread's lines (0 even, 1 odd), or -1 for all
 	uint8_t ditherLut[4][4][512];
 	// The picture, as Mednafen makes it: 768 wide, up to 576 lines, with the line widths

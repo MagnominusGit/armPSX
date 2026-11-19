@@ -1346,7 +1346,7 @@ void gpuReset(struct Psx* p) {
 	timersVblank(p, true);
 	g->frameW = 320;
 	g->frameH = 240;
-	g->roughTime = p->mode == MODE_FAST;
+	g->roughTime = p->mode != MODE_EXACT;
 	startDrawThread(p);
 }
 
@@ -1607,8 +1607,8 @@ void gpuRun(struct Psx* p) {
 	// Mednafen wakes the GPU every 128 cycles at most; that's only needed while commands wait for drawing
 	// time or timer 0 counts dots. Otherwise the next line edge is the next thing that happens.
 	int64_t next = ((((int64_t) g->lineCounter) << 16) - (int64_t) g->clockCounter + g->clockRatio - 1) / g->clockRatio;
-	if (p->mode == MODE_FAST && !linesWatched(p)) {
-		// The Fast mode wakes for the next line where something happens (vblank, the field); the lines
+	if (p->mode != MODE_EXACT && !linesWatched(p)) {
+		// The Fast and Balanced modes wake for the next line where something happens (vblank, the field); the lines
 		// before it are caught up then, or when the CPU looks
 		int32_t lines = (int32_t) g->linesPerField;
 		uint32_t targets[3] = { g->vEnd, g->vStart, 0 };

@@ -31,7 +31,8 @@ struct Block {
 	int count, lines;
 	bool delay;  // it ends with a branch and its delay slot
 	bool uncached;  // in the BIOS ROM through KSEG1: no lines, every fetch from the bus
-	bool fast;      // the Fast mode's: one version, from memory, gone when its RAM is written
+	bool fast;      // the Fast or Balanced mode's: one version, from memory, gone when its RAM is written
+	bool balanced;  // (the Balanced mode's)
 	bool dead;      // its RAM was written (the Fast mode)
 	uint32_t gen[BLOCK_MAX / 4 + 2];
 	uint32_t words[BLOCK_MAX];
@@ -218,8 +219,11 @@ static uint8_t* jitLink(struct Psx* p, struct Block** slot, uint32_t pc);
 #include "jit_a64.h"
 #endif
 
+// The Fast and Balanced modes' blocks: one version, from memory, no instruction cache or ReadAbsorb
+// timing. Fast charges a flat cost per instruction; Balanced one cycle each and the bus's time for
+// loads, BIOS fetches and the multiplier's waits.
 static bool fastMode(struct Psx* p) {
-	return FAST_JIT && p->mode == MODE_FAST;
+	return FAST_JIT && p->mode != MODE_EXACT;
 }
 
 static void stUnknown(struct State* s) {
@@ -331,7 +335,10 @@ static int stBeginRead(struct Compile* k) {
 // bus takes 4 cycles.
 static void stUncachedFetch(struct Compile* k) {
 	struct State* s = &k->st;
-	if (k->fast) return;
+	if (k->fast) {
+		if (k->balanced) s->cycles += 4;
+		return;
+	}
 	if (s->aw >= 0) {
 		if (s->absorb[s->aw]) {
 			bStoreAbsorb(k, s->aw, 0);
@@ -359,7 +366,7 @@ static void stAfterWait(struct Compile* k) {
 // (In the Fast mode the count is of instructions, each FAST_CPI_X4 / 4 cycles.)
 static void stFlushCycles(struct Compile* k) {
 	if (k->st.cycles) {
-		bAddCycles(k, k->fast ? (k->st.cycles * FAST_CPI_X4 + 2) / 4 : k->st.cycles);
+		bAddCycles(k, k->fast && !k->balanced ? (k->st.cycles * FAST_CPI_X4 + 2) / 4 : k->st.cycles);
 		k->st.cycles = 0;
 	}
 }
@@ -388,6 +395,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	struct Compile k;
 	bBegin(&k, j, start, end);
 	k.fast = b->fast;
+	k.balanced = b->balanced;
 	bool inl[BLOCK_MAX];
 	for (int i = 0; i < b->count; i++) {
 		inl[i] = inlinable(b, i);
@@ -540,6 +548,7 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 	b->link[0] = b->link[1] = NULL;
 	b->uncached = romUncached(pc);
 	b->fast = fastMode(p);
+	b->balanced = b->fast && p->mode == MODE_BALANCED;
 	b->dead = false;
 	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {
 		if (!(b->uncached ? romUncached(a) : fetchable(a)) || (a != pc && special(p, a))) break;
