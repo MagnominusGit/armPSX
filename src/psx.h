@@ -19,9 +19,10 @@ enum {
 
 
 struct Cpu {
-	uint32_t r[34];  // r[32] = hi, r[33] = lo
+	uint32_t r[35];  // r[32] = hi, r[33] = lo, r[34] = where "no load in flight" commits
 	uint32_t pc, next;
-	uint32_t ldReg, ldValue;  // the load in flight; ldReg 0 = none
+	uint32_t ldReg, ldValue;  // the load in flight; ldReg 34 = none
+	uint8_t absorb[35], absorbWhich, readFudge, ldAbsorb;  // load latency the next instructions hide (Mednafen's ReadAbsorb)
 	bool branched, inDelay;   // the instruction just run was a jump or branch / this one is in its delay slot
 	uint32_t sr, cause, epc, badVaddr, tar;
 	uint32_t cop0[32];
@@ -34,7 +35,7 @@ struct Cpu {
 struct Dma {
 	uint32_t madr[7], bcr[7], chcr[7];
 	uint32_t dpcr, dicr;
-	int64_t busy;  // cycles the CPU is held up for transfers
+	int64_t doneAt[7];  // the cycle a running block or list transfer finishes (0: none)
 };
 
 struct Timer {
@@ -172,6 +173,7 @@ void busWrite8(struct Psx* p, uint32_t address, uint8_t value);
 // dma.c
 uint32_t dmaRead(struct Psx* p, uint32_t address);
 void dmaWrite(struct Psx* p, uint32_t address, uint32_t value);
+void dmaRun(struct Psx* p);
 
 // timers.c
 uint32_t timerRead(struct Psx* p, uint32_t address);

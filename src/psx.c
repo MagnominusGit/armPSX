@@ -59,6 +59,7 @@ void psxIrq(struct Psx* p, int irq) {
 void psxEvents(struct Psx* p) {
 	p->nextEvent = p->cycles + 4096;
 	gpuRun(p);
+	dmaRun(p);
 	timersRun(p);
 	sioRun(p);
 	cdromRun(p);

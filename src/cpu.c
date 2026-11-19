@@ -6,13 +6,18 @@
 #include <string.h>
 #include "psx.h"
 
-// The R3000A interpreter: one instruction a cycle, plus the instruction cache's fills and the bus's
-// waits (timings per Mednafen). A load's value lands one instruction late: each instruction reads its
-// operands, then the load in flight is written, then the instruction's own result.
+// The R3000A interpreter, with Mednafen's cycle model (cpu.cpp, Copyright (C) 2011-2016 Mednafen Team,
+// GPL-2.0-or-later): one cycle an instruction, the instruction cache's fills, the bus's waits, and a
+// load's wait hidden by the instructions after it until one uses the loaded register. A load's value
+// lands one instruction late: each instruction reads its operands, then the load in flight is
+// written, then the instruction's own result.
 
 enum { EXC_INT = 0, EXC_ADEL = 4, EXC_ADES = 5, EXC_IBE = 6, EXC_DBE = 7, EXC_SYS = 8, EXC_BP = 9, EXC_RI = 10, EXC_CPU = 11, EXC_OV = 12 };
+enum { NO_LOAD = 34 };
 
 #define R p->cpu.r
+
+static uint8_t multCycles[24];
 
 static uint32_t exception(struct Psx* p, int code, uint32_t pc, uint32_t instr) {
 	struct Cpu* c = &p->cpu;
@@ -28,10 +33,19 @@ static uint32_t exception(struct Psx* p, int code, uint32_t pc, uint32_t instr) 
 	return c->sr & 1 << 22 ? 0xBFC00180 : 0x80000080;
 }
 
+// DO_LDS
 static inline void commitLoad(struct Cpu* c) {
 	c->r[c->ldReg] = c->ldValue;
-	c->ldReg = 0;
+	c->absorb[c->ldReg] = c->ldAbsorb;
+	c->readFudge = c->ldReg;
+	c->absorbWhich |= c->ldReg & 0x1F;
+	c->ldReg = NO_LOAD;
 	c->r[0] = 0;
+}
+
+// The registers an instruction reads or writes stop hiding their loads' waits (r0's is kept).
+static inline void uses(struct Cpu* c, uint32_t reg) {
+	if (reg) c->absorb[reg] = 0;
 }
 
 static inline void setReg(struct Cpu* c, uint32_t reg, uint32_t value) {
@@ -41,7 +55,6 @@ static inline void setReg(struct Cpu* c, uint32_t reg, uint32_t value) {
 }
 
 static inline void load(struct Cpu* c, uint32_t reg, uint32_t value) {
-	commitLoad(c);
 	c->ldReg = reg;
 	c->ldValue = value;
 }
@@ -52,11 +65,13 @@ static uint32_t fetch(struct Psx* p, uint32_t address) {
 	if (*tag == address) {
 		return c->icache[(address & 0xFFC) >> 2].data;
 	}
+	c->absorb[c->absorbWhich] = 0;
+	c->absorbWhich = 0;
 	uint32_t physical = address & 0x1FFFFFFF;
-	const uint8_t* memory = physical < 0x800000 ? p->ram + (physical & (RAM_SIZE - 1)) : p->bios + (physical & (BIOS_SIZE - 1));
 	if (physical >= 0x800000 && (physical < 0x1FC00000 || physical >= 0x1FC80000)) {
 		return 0;
 	}
+	const uint8_t* memory = physical < 0x800000 ? p->ram + (physical & (RAM_SIZE - 1)) : p->bios + (physical & (BIOS_SIZE - 1));
 	uint32_t instr;
 	if (address >= 0xA0000000 || !(c->biu & 0x800)) {
 		memcpy(&instr, memory, 4);
@@ -96,29 +111,55 @@ static inline bool scratchpad(uint32_t address) {
 	return (address & 0x7FFFFC00) == 0x1F800000 && address < 0xA0000000;
 }
 
-static uint32_t read32(struct Psx* p, uint32_t address) {
+// Every read ends the hiding of earlier loads; one not right after a load costs 2 cycles more; its
+// wait, the bus's plus 2 (1 for LWC2), is what the next instructions may hide.
+static inline bool beginRead(struct Psx* p, uint32_t address) {
+	struct Cpu* c = &p->cpu;
+	c->absorb[c->absorbWhich] = 0;
+	c->absorbWhich = 0;
 	if (scratchpad(address)) {
-		uint32_t v;
+		c->ldAbsorb = 0;
+		return true;
+	}
+	p->cycles += (c->readFudge >> 4) & 2;
+	return false;
+}
+
+static uint32_t read32(struct Psx* p, uint32_t address) {
+	uint32_t v;
+	if (beginRead(p, address)) {
 		memcpy(&v, p->scratch + (address & 0x3FF), 4);
 		return v;
 	}
-	return busRead32(p, address);
+	int64_t before = p->cycles;
+	v = busRead32(p, address);
+	p->cycles += 2;
+	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);
+	return v;
 }
 
 static uint32_t read16(struct Psx* p, uint32_t address) {
-	if (scratchpad(address)) {
+	if (beginRead(p, address)) {
 		uint16_t v;
 		memcpy(&v, p->scratch + (address & 0x3FF), 2);
 		return v;
 	}
-	return busRead16(p, address);
+	int64_t before = p->cycles;
+	uint32_t v = busRead16(p, address);
+	p->cycles += 2;
+	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);
+	return v;
 }
 
 static uint32_t read8(struct Psx* p, uint32_t address) {
-	if (scratchpad(address)) {
+	if (beginRead(p, address)) {
 		return p->scratch[address & 0x3FF];
 	}
-	return busRead8(p, address);
+	int64_t before = p->cycles;
+	uint32_t v = busRead8(p, address);
+	p->cycles += 2;
+	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);
+	return v;
 }
 
 static void write32(struct Psx* p, uint32_t address, uint32_t value) {
@@ -158,8 +199,13 @@ void cpuReset(struct Psx* p) {
 	c->next = c->pc + 4;
 	c->sr = 1 << 22;
 	c->cop0[15] = 0x00000002;
+	c->ldReg = NO_LOAD;
+	c->readFudge = NO_LOAD;
 	for (int i = 0; i < 1024; i++) {
 		c->icache[i].tag = 2;
+	}
+	for (int i = 0; i < 24; i++) {
+		multCycles[i] = 7 + (i < 12 ? 4 : 0) + (i < 21 ? 3 : 0);
 	}
 }
 
@@ -170,9 +216,18 @@ static inline bool irqPending(struct Psx* p) {
 	return (c->sr & 1) && (c->sr & cause & 0xFF00);
 }
 
+// MFHI/MFLO waiting on a multiply or divide; the wait's cycles still use up hidden load time.
 static void waitMuldiv(struct Psx* p) {
-	if (p->cycles < p->cpu.muldivDone) {
-		p->cycles = p->cpu.muldivDone;
+	struct Cpu* c = &p->cpu;
+	if (p->cycles < c->muldivDone) {
+		if (p->cycles == c->muldivDone - 1) {
+			c->muldivDone--;
+		} else {
+			do {
+				if (c->absorb[c->absorbWhich]) c->absorb[c->absorbWhich]--;
+				p->cycles++;
+			} while (p->cycles < c->muldivDone);
+		}
 	}
 }
 
@@ -190,7 +245,6 @@ static uint32_t cop0Read(struct Cpu* c, int reg) {
 	case 13: return c->cause;
 	case 14: return c->epc;
 	case 15: return 0x00000002;
-	case 6 + 32: return c->tar;
 	}
 	return 0;
 }
@@ -215,6 +269,8 @@ static void tty(struct Psx* p, char ch) {
 	}
 }
 
+#define EXCEPTION(code) do { commitLoad(c); c->pc = exception(p, code, pc, instr); c->next = c->pc + 4; } while (0)
+
 void cpuRun(struct Psx* p, int64_t until) {
 	struct Cpu* c = &p->cpu;
 	while (p->cycles < until) {
@@ -227,21 +283,22 @@ void cpuRun(struct Psx* p, int64_t until) {
 		} else if ((pc & 0x1FFFFFFF) == 0xA0 && c->r[9] == 0x3C) {
 			tty(p, c->r[4]);
 		}
+		uint32_t instr = 0;
 		if (pc & 3) {
 			c->badVaddr = pc;
-			commitLoad(c);
-			c->pc = exception(p, EXC_ADEL, pc, 0);
-			c->next = c->pc + 4;
+			EXCEPTION(EXC_ADEL);
 			continue;
 		}
-		uint32_t instr = fetch(p, pc);
-		p->cycles++;
+		instr = fetch(p, pc);
+		if (c->absorb[c->absorbWhich]) {
+			c->absorb[c->absorbWhich]--;
+		} else {
+			p->cycles++;
+		}
 		c->inDelay = c->branched;
 		c->branched = false;
 		if (irqPending(p) && (instr >> 26) != 0x12) {
-			commitLoad(c);
-			c->pc = exception(p, EXC_INT, pc, instr);
-			c->next = c->pc + 4;
+			EXCEPTION(EXC_INT);
 			continue;
 		}
 		uint32_t next = c->next;
@@ -253,55 +310,68 @@ void cpuRun(struct Psx* p, int64_t until) {
 		switch (instr >> 26) {
 		case 0x00:
 			switch (instr & 63) {
-			case 0x00: setReg(c, rd, t << (instr >> 6 & 31)); break;
-			case 0x02: setReg(c, rd, t >> (instr >> 6 & 31)); break;
-			case 0x03: setReg(c, rd, (uint32_t) ((int32_t) t >> (instr >> 6 & 31))); break;
-			case 0x04: setReg(c, rd, t << (s & 31)); break;
-			case 0x06: setReg(c, rd, t >> (s & 31)); break;
-			case 0x07: setReg(c, rd, (uint32_t) ((int32_t) t >> (s & 31))); break;
+			case 0x00: uses(c, rt); uses(c, rd); setReg(c, rd, t << (instr >> 6 & 31)); break;
+			case 0x02: uses(c, rt); uses(c, rd); setReg(c, rd, t >> (instr >> 6 & 31)); break;
+			case 0x03: uses(c, rt); uses(c, rd); setReg(c, rd, (uint32_t) ((int32_t) t >> (instr >> 6 & 31))); break;
+			case 0x04: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, t << (s & 31)); break;
+			case 0x06: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, t >> (s & 31)); break;
+			case 0x07: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, (uint32_t) ((int32_t) t >> (s & 31))); break;
 			case 0x08:
+				uses(c, rs);
+				uses(c, rd);
 				commitLoad(c);
 				c->next = s;
 				c->branched = true;
 				break;
 			case 0x09:
+				uses(c, rs);
+				uses(c, rd);
 				setReg(c, rd, next + 4);
 				c->next = s;
 				c->branched = true;
 				break;
-			case 0x0C:
+			case 0x0C: EXCEPTION(EXC_SYS); break;
+			case 0x0D: EXCEPTION(EXC_BP); break;
+			case 0x10:
+				uses(c, rd);
 				commitLoad(c);
-				c->pc = exception(p, EXC_SYS, pc, instr);
-				c->next = c->pc + 4;
+				waitMuldiv(p);
+				R[rd] = R[32];
+				R[0] = 0;
 				break;
-			case 0x0D:
+			case 0x11: uses(c, rs); commitLoad(c); R[32] = s; break;
+			case 0x12:
+				uses(c, rd);
 				commitLoad(c);
-				c->pc = exception(p, EXC_BP, pc, instr);
-				c->next = c->pc + 4;
+				waitMuldiv(p);
+				R[rd] = R[33];
+				R[0] = 0;
 				break;
-			case 0x10: waitMuldiv(p); setReg(c, rd, R[32]); break;
-			case 0x11: commitLoad(c); R[32] = s; break;
-			case 0x12: waitMuldiv(p); setReg(c, rd, R[33]); break;
-			case 0x13: commitLoad(c); R[33] = s; break;
+			case 0x13: uses(c, rs); commitLoad(c); R[33] = s; break;
 			case 0x18: {
+				uses(c, rs);
+				uses(c, rt);
 				int64_t r = (int64_t) (int32_t) s * (int32_t) t;
+				uint32_t a = (s ^ (uint32_t) ((int32_t) s >> 31)) | 0x400;
+				c->muldivDone = p->cycles + multCycles[__builtin_clz(a)];
 				commitLoad(c);
 				R[32] = (uint32_t) ((uint64_t) r >> 32);
 				R[33] = (uint32_t) r;
-				uint32_t a = (int32_t) s < 0 ? ~s : s;
-				c->muldivDone = p->cycles + (a < 0x800 ? 6 : a < 0x100000 ? 9 : 13);
 				break;
 			}
 			case 0x19: {
+				uses(c, rs);
+				uses(c, rt);
 				uint64_t r = (uint64_t) s * t;
+				c->muldivDone = p->cycles + multCycles[__builtin_clz(s | 0x400)];
 				commitLoad(c);
 				R[32] = (uint32_t) (r >> 32);
 				R[33] = (uint32_t) r;
-				c->muldivDone = p->cycles + (s < 0x800 ? 6 : s < 0x100000 ? 9 : 13);
 				break;
 			}
 			case 0x1A:
-				commitLoad(c);
+				uses(c, rs);
+				uses(c, rt);
 				if (t == 0) {
 					R[32] = s;
 					R[33] = (int32_t) s < 0 ? 1 : 0xFFFFFFFF;
@@ -312,10 +382,12 @@ void cpuRun(struct Psx* p, int64_t until) {
 					R[32] = (uint32_t) ((int32_t) s % (int32_t) t);
 					R[33] = (uint32_t) ((int32_t) s / (int32_t) t);
 				}
-				c->muldivDone = p->cycles + 36;
+				c->muldivDone = p->cycles + 37;
+				commitLoad(c);
 				break;
 			case 0x1B:
-				commitLoad(c);
+				uses(c, rs);
+				uses(c, rt);
 				if (t == 0) {
 					R[32] = s;
 					R[33] = 0xFFFFFFFF;
@@ -323,50 +395,48 @@ void cpuRun(struct Psx* p, int64_t until) {
 					R[32] = s % t;
 					R[33] = s / t;
 				}
-				c->muldivDone = p->cycles + 36;
+				c->muldivDone = p->cycles + 37;
+				commitLoad(c);
 				break;
 			case 0x20: {
+				uses(c, rs); uses(c, rt); uses(c, rd);
 				uint32_t r = s + t;
 				if (~(s ^ t) & (s ^ r) & 0x80000000) {
-					commitLoad(c);
-					c->pc = exception(p, EXC_OV, pc, instr);
-					c->next = c->pc + 4;
+					EXCEPTION(EXC_OV);
 				} else {
 					setReg(c, rd, r);
 				}
 				break;
 			}
-			case 0x21: setReg(c, rd, s + t); break;
+			case 0x21: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s + t); break;
 			case 0x22: {
+				uses(c, rs); uses(c, rt); uses(c, rd);
 				uint32_t r = s - t;
 				if ((s ^ t) & (s ^ r) & 0x80000000) {
-					commitLoad(c);
-					c->pc = exception(p, EXC_OV, pc, instr);
-					c->next = c->pc + 4;
+					EXCEPTION(EXC_OV);
 				} else {
 					setReg(c, rd, r);
 				}
 				break;
 			}
-			case 0x23: setReg(c, rd, s - t); break;
-			case 0x24: setReg(c, rd, s & t); break;
-			case 0x25: setReg(c, rd, s | t); break;
-			case 0x26: setReg(c, rd, s ^ t); break;
-			case 0x27: setReg(c, rd, ~(s | t)); break;
-			case 0x2A: setReg(c, rd, (int32_t) s < (int32_t) t); break;
-			case 0x2B: setReg(c, rd, s < t); break;
-			default:
-				commitLoad(c);
-				c->pc = exception(p, EXC_RI, pc, instr);
-				c->next = c->pc + 4;
-				break;
+			case 0x23: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s - t); break;
+			case 0x24: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s & t); break;
+			case 0x25: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s | t); break;
+			case 0x26: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s ^ t); break;
+			case 0x27: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, ~(s | t)); break;
+			case 0x2A: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, (int32_t) s < (int32_t) t); break;
+			case 0x2B: uses(c, rs); uses(c, rt); uses(c, rd); setReg(c, rd, s < t); break;
+			default: EXCEPTION(EXC_RI); break;
 			}
 			break;
 		case 0x01: {
-			// BLTZ/BGEZ, and with bit 20 set the "AL" forms; only rt 0x10/0x11 link (others decode by bits 16 and 20)
+			// BLTZ/BGEZ, and their linking forms (rt 0x10/0x11)
 			bool taken = ((int32_t) s < 0) ^ (rt & 1);
+			bool link = (rt & 0x1E) == 0x10;
+			uses(c, rs);
+			if (link) uses(c, 31);
 			commitLoad(c);
-			if ((rt & 0x1E) == 0x10) {
+			if (link) {
 				R[31] = next + 4;
 			}
 			if (taken) {
@@ -381,57 +451,64 @@ void cpuRun(struct Psx* p, int64_t until) {
 			c->branched = true;
 			break;
 		case 0x03:
+			uses(c, 31);
 			setReg(c, 31, next + 4);
 			c->next = (next & 0xF0000000) | (instr & 0x3FFFFFF) << 2;
 			c->branched = true;
 			break;
 		case 0x04:
+			uses(c, rs); uses(c, rt);
 			commitLoad(c);
 			if (s == t) c->next = next + (imm << 2);
 			c->branched = true;
 			break;
 		case 0x05:
+			uses(c, rs); uses(c, rt);
 			commitLoad(c);
 			if (s != t) c->next = next + (imm << 2);
 			c->branched = true;
 			break;
 		case 0x06:
+			uses(c, rs);
 			commitLoad(c);
 			if ((int32_t) s <= 0) c->next = next + (imm << 2);
 			c->branched = true;
 			break;
 		case 0x07:
+			uses(c, rs);
 			commitLoad(c);
 			if ((int32_t) s > 0) c->next = next + (imm << 2);
 			c->branched = true;
 			break;
 		case 0x08: {
+			uses(c, rs); uses(c, rt);
 			uint32_t r = s + imm;
 			if (~(s ^ imm) & (s ^ r) & 0x80000000) {
-				commitLoad(c);
-				c->pc = exception(p, EXC_OV, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_OV);
 			} else {
 				setReg(c, rt, r);
 			}
 			break;
 		}
-		case 0x09: setReg(c, rt, s + imm); break;
-		case 0x0A: setReg(c, rt, (int32_t) s < (int32_t) imm); break;
-		case 0x0B: setReg(c, rt, s < imm); break;
-		case 0x0C: setReg(c, rt, s & immu); break;
-		case 0x0D: setReg(c, rt, s | immu); break;
-		case 0x0E: setReg(c, rt, s ^ immu); break;
-		case 0x0F: setReg(c, rt, immu << 16); break;
+		case 0x09: uses(c, rs); uses(c, rt); setReg(c, rt, s + imm); break;
+		case 0x0A: uses(c, rs); uses(c, rt); setReg(c, rt, (int32_t) s < (int32_t) imm); break;
+		case 0x0B: uses(c, rs); uses(c, rt); setReg(c, rt, s < imm); break;
+		case 0x0C: uses(c, rs); uses(c, rt); setReg(c, rt, s & immu); break;
+		case 0x0D: uses(c, rs); uses(c, rt); setReg(c, rt, s | immu); break;
+		case 0x0E: uses(c, rs); uses(c, rt); setReg(c, rt, s ^ immu); break;
+		case 0x0F: uses(c, rt); setReg(c, rt, immu << 16); break;
 		case 0x10:
 			if ((c->sr & 0x10000000) == 0 && (c->sr & 2)) {
-				commitLoad(c);
-				c->pc = exception(p, EXC_CPU, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_CPU);
 				break;
 			}
 			switch (rs) {
-			case 0x00: load(c, rt, cop0Read(c, rd)); break;
+			case 0x00:
+				if (c->ldReg == rt) c->ldReg = 0;
+				commitLoad(c);
+				c->ldAbsorb = 0;
+				load(c, rt, cop0Read(c, rd));
+				break;
 			case 0x04: commitLoad(c); cop0Write(c, rd, t); break;
 			case 0x10:
 				commitLoad(c);
@@ -444,9 +521,7 @@ void cpuRun(struct Psx* p, int64_t until) {
 			break;
 		case 0x12:
 			if (!(c->sr & 0x40000000)) {
-				commitLoad(c);
-				c->pc = exception(p, EXC_CPU, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_CPU);
 				break;
 			}
 			if (instr & 0x02000000) {
@@ -456,8 +531,17 @@ void cpuRun(struct Psx* p, int64_t until) {
 				break;
 			}
 			switch (rs) {
-			case 0x00: waitGte(p); load(c, rt, GTE_ReadDR(rd)); break;
-			case 0x02: waitGte(p); load(c, rt, GTE_ReadCR(rd)); break;
+			case 0x00: case 0x02:
+				if (c->ldReg == rt) c->ldReg = 0;
+				commitLoad(c);
+				if (p->cycles < c->gteDone) {
+					c->ldAbsorb = (uint8_t) (c->gteDone - p->cycles);
+					p->cycles = c->gteDone;
+				} else {
+					c->ldAbsorb = 0;
+				}
+				load(c, rt, rs == 0 ? GTE_ReadDR(rd) : GTE_ReadCR(rd));
+				break;
 			case 0x04: commitLoad(c); waitGte(p); GTE_WriteDR(rd, t); break;
 			case 0x06: commitLoad(c); waitGte(p); GTE_WriteCR(rd, t); break;
 			default: commitLoad(c); break;
@@ -465,31 +549,40 @@ void cpuRun(struct Psx* p, int64_t until) {
 			break;
 		case 0x11:
 		case 0x13:
-			commitLoad(c);
-			c->pc = exception(p, EXC_CPU, pc, instr);
-			c->next = c->pc + 4;
+			EXCEPTION(EXC_CPU);
 			break;
-		case 0x20: {
+		case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: {
+			uses(c, rs);
 			uint32_t a = s + imm;
-			load(c, rt, (uint32_t) (int32_t) (int8_t) read8(p, a));
-			break;
-		}
-		case 0x21: {
-			uint32_t a = s + imm;
-			if (a & 1) {
+			int op = instr >> 26;
+			if (((op == 0x21 || op == 0x25) && (a & 1)) || (op == 0x23 && (a & 3))) {
 				c->badVaddr = a;
-				commitLoad(c);
-				c->pc = exception(p, EXC_ADEL, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_ADEL);
 				break;
 			}
-			load(c, rt, (uint32_t) (int32_t) (int16_t) read16(p, a));
+			if (c->ldReg == rt) c->ldReg = 0;
+			commitLoad(c);
+			uint32_t v;
+			switch (op) {
+			case 0x20: v = (uint32_t) (int32_t) (int8_t) read8(p, a); break;
+			case 0x21: v = (uint32_t) (int32_t) (int16_t) read16(p, a); break;
+			case 0x23: v = read32(p, a); break;
+			case 0x24: v = read8(p, a); break;
+			default: v = read16(p, a); break;
+			}
+			load(c, rt, v);
 			break;
 		}
 		case 0x22: case 0x26: {
+			uses(c, rs);
 			uint32_t a = s + imm;
-			uint32_t v = c->ldReg == rt ? c->ldValue : t;
-			if (c->ldReg != rt) commitLoad(c);
+			uint32_t v = t;
+			if (c->ldReg == rt) {
+				v = c->ldValue;
+				c->readFudge = 0;
+			} else {
+				commitLoad(c);
+			}
 			uint32_t w = read32(p, a & ~3u);
 			int shift = (a & 3) * 8;
 			if ((instr >> 26) == 0x22) {
@@ -497,114 +590,83 @@ void cpuRun(struct Psx* p, int64_t until) {
 			} else {
 				v = (v & ~(0xFFFFFFFFu >> shift)) | (w >> shift);
 			}
-			c->ldReg = rt;
-			c->ldValue = v;
+			load(c, rt, v);
 			break;
 		}
-		case 0x23: {
-			uint32_t a = s + imm;
-			if (a & 3) {
-				c->badVaddr = a;
-				commitLoad(c);
-				c->pc = exception(p, EXC_ADEL, pc, instr);
-				c->next = c->pc + 4;
-				break;
-			}
-			load(c, rt, read32(p, a));
-			break;
-		}
-		case 0x24: {
-			uint32_t a = s + imm;
-			load(c, rt, read8(p, a));
-			break;
-		}
-		case 0x25: {
-			uint32_t a = s + imm;
-			if (a & 1) {
-				c->badVaddr = a;
-				commitLoad(c);
-				c->pc = exception(p, EXC_ADEL, pc, instr);
-				c->next = c->pc + 4;
-				break;
-			}
-			load(c, rt, read16(p, a));
-			break;
-		}
-		case 0x28: commitLoad(c); write8(p, s + imm, t); break;
+		case 0x28: uses(c, rs); uses(c, rt); commitLoad(c); write8(p, s + imm, t); break;
 		case 0x29: {
+			uses(c, rs); uses(c, rt);
 			uint32_t a = s + imm;
-			commitLoad(c);
 			if (a & 1) {
 				c->badVaddr = a;
-				c->pc = exception(p, EXC_ADES, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_ADES);
 				break;
 			}
+			commitLoad(c);
 			write16(p, a, t);
 			break;
 		}
 		case 0x2A: case 0x2E: {
-			uint32_t a = s + imm;
+			uses(c, rs); uses(c, rt);
+			uint32_t a = s + imm, base = a & ~3u, k = a & 3;
 			commitLoad(c);
-			uint32_t w = read32(p, a & ~3u);
-			int shift = (a & 3) * 8;
 			if ((instr >> 26) == 0x2A) {
-				w = (w & ~(0xFFFFFFFFu >> (24 - shift))) | (t >> (24 - shift));
-				if (shift == 24) w = t;
+				// SWL: the word's bytes 0..k take t's top k+1 bytes
+				for (uint32_t i = 0; i <= k; i++) write8(p, base + i, t >> (8 * (3 - k + i)));
 			} else {
-				w = (w & ~(0xFFFFFFFFu << shift)) | (t << shift);
+				// SWR: bytes k..3 take t's low 4-k bytes
+				for (uint32_t i = k; i < 4; i++) write8(p, base + i, t >> (8 * (i - k)));
 			}
-			write32(p, a & ~3u, w);
 			break;
 		}
 		case 0x2B: {
+			uses(c, rs); uses(c, rt);
 			uint32_t a = s + imm;
-			commitLoad(c);
 			if (a & 3) {
 				c->badVaddr = a;
-				c->pc = exception(p, EXC_ADES, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_ADES);
 				break;
 			}
+			commitLoad(c);
 			write32(p, a, t);
 			break;
 		}
 		case 0x32: {
+			uses(c, rs);
 			uint32_t a = s + imm;
-			commitLoad(c);
 			if (a & 3) {
 				c->badVaddr = a;
-				c->pc = exception(p, EXC_ADEL, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_ADEL);
 				break;
 			}
+			commitLoad(c);
 			uint32_t v = read32(p, a);
+			if (!scratchpad(a)) {
+				p->cycles--;
+				c->ldAbsorb--;
+			}
 			waitGte(p);
 			GTE_WriteDR(rt, v);
 			break;
 		}
 		case 0x3A: {
+			uses(c, rs);
 			uint32_t a = s + imm;
-			commitLoad(c);
 			if (a & 3) {
 				c->badVaddr = a;
-				c->pc = exception(p, EXC_ADES, pc, instr);
-				c->next = c->pc + 4;
+				EXCEPTION(EXC_ADES);
 				break;
 			}
+			commitLoad(c);
 			waitGte(p);
 			write32(p, a, GTE_ReadDR(rt));
 			break;
 		}
 		case 0x30: case 0x31: case 0x33: case 0x38: case 0x39: case 0x3B:
-			commitLoad(c);
-			c->pc = exception(p, EXC_CPU, pc, instr);
-			c->next = c->pc + 4;
+			EXCEPTION(EXC_CPU);
 			break;
 		default:
-			commitLoad(c);
-			c->pc = exception(p, EXC_RI, pc, instr);
-			c->next = c->pc + 4;
+			EXCEPTION(EXC_RI);
 			break;
 		}
 	}

@@ -47,6 +47,13 @@ static void deviceWrite(struct Psx* p, int channel, uint32_t v) {
 	}
 }
 
+// Clock cost of a word on each channel and of each block or list node (Mednafen's dma.cpp).
+static int wordCost(int channel, uint32_t chcr) {
+	int extra = channel == CDROM ? 8 : channel == SPU ? 47 : 0;
+	int chop = chcr & 0x100 ? 7 : 0;
+	return 1 + (extra > chop ? extra : chop);
+}
+
 static void finish(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	d->chcr[channel] &= ~0x11000000u;
@@ -64,6 +71,7 @@ static void run(struct Psx* p, int channel) {
 	bool toDevice = chcr & 1;
 	int sync = chcr >> 9 & 3;
 	uint32_t words = 0;
+	int64_t clocks = 0;
 	if (channel == OTC) {
 		uint32_t count = d->bcr[channel] & 0xFFFF;
 		if (count == 0) count = 0x10000;
@@ -82,6 +90,7 @@ static void run(struct Psx* p, int channel) {
 				deviceWrite(p, channel, ramRead(p, address + 4 + i * 4));
 			}
 			words += n + 1;
+			clocks += (n ? 15 : 10) + n * wordCost(channel, chcr);
 			address = header & 0xFFFFFF;
 			if ((address & 0x800000) || ++guard > 0x100000) {
 				break;
@@ -112,17 +121,48 @@ static void run(struct Psx* p, int channel) {
 		}
 		if (sync == 1) {
 			d->madr[channel] = address & 0xFFFFFF;
+			uint32_t blocks = count / ((d->bcr[channel] & 0xFFFF) ? (d->bcr[channel] & 0xFFFF) : 0x10000);
+			clocks += blocks * 7;
 		}
 		words = count;
+		clocks += (int64_t) count * wordCost(channel, chcr);
 	}
-	p->cycles += words;
-	finish(p, channel);
+	if (channel == OTC) {
+		clocks = words;
+	}
+	if (channel == GPU && p->gpu.drawTime < 0) {
+		// The transfer waits on the GPU's FIFO while the GPU draws.
+		clocks += -p->gpu.drawTime / 2;
+	}
+	if (sync == 0) {
+		// Immediate transfers hold the CPU.
+		p->cycles += clocks;
+		finish(p, channel);
+	} else {
+		// Block and linked-list transfers run beside the CPU; the channel is busy until they're done.
+		d->doneAt[channel] = p->cycles + clocks;
+		psxSchedule(p, d->doneAt[channel]);
+	}
+}
+
+void dmaRun(struct Psx* p) {
+	struct Dma* d = &p->dma;
+	for (int i = 0; i < 7; i++) {
+		if (d->doneAt[i]) {
+			if (p->cycles >= d->doneAt[i]) {
+				d->doneAt[i] = 0;
+				finish(p, i);
+			} else {
+				psxSchedule(p, d->doneAt[i]);
+			}
+		}
+	}
 }
 
 static void maybeStart(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
 	uint32_t chcr = d->chcr[channel];
-	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000)) {
+	if (!(d->dpcr & 8u << (channel * 4)) || !(chcr & 0x01000000) || d->doneAt[channel]) {
 		return;
 	}
 	if ((chcr >> 9 & 3) == 0 && !(chcr & 0x10000000) && channel != OTC) {

@@ -83,6 +83,17 @@ int main(int argc, char** argv) {
 				savePpm(p, path);
 			}
 		}
+		const char* ram = getenv("PSXRUN_RAM");
+		int every = getenv("PSXRUN_RAM_EVERY") ? atoi(getenv("PSXRUN_RAM_EVERY")) : 0;
+		if (ram && every && i % every == 0) {
+			char path[512];
+			snprintf(path, sizeof path, "%s-%05d.ram", ram, i);
+			FILE* f = fopen(path, "wb");
+			if (f) {
+				fwrite(p->ram, 1, RAM_SIZE, f);
+				fclose(f);
+			}
+		}
 	}
 	double secs = (double) (clock() - start) / CLOCKS_PER_SEC;
 	if (wav) {
