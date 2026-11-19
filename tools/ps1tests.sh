@@ -21,6 +21,9 @@ find . -name "*.exe" | sort | while read exe; do
 		result="log: $missing of $total hardware lines missing"
 	fi
 	png=$(ls "$REF/$dir"/vram*.png 2>/dev/null | head -1)
+	case "$name" in
+	*15bit*|*24bit*) bits=$(echo "$name" | grep -o "[0-9]*bit"); [ -f "$REF/$dir/vram-$bits.png" ] && png="$REF/$dir/vram-$bits.png";;
+	esac
 	if [ -n "$png" ]; then
 		result="$result, vram $(python3 -I "$TOOLS/vramcmp.py" "$png" "$log.ppm")"
 	fi

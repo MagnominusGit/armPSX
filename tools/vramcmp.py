@@ -10,5 +10,6 @@ def load(path):
 ref, got = load(sys.argv[1]), load(sys.argv[2])
 bg = Counter(ref).most_common(1)[0][0]
 drawn = [i for i, p in enumerate(ref) if p != bg]
-bad = sum(1 for i in drawn if i < len(got) and got[i] != ref[i])
-print(f"{bad} of {len(drawn)} drawn px differ")
+bad = [i for i in drawn if i < len(got) and got[i] != ref[i]]
+worst = max((max(abs(a - b) for a, b in zip(got[i], ref[i])) for i in bad), default=0)
+print(f"{len(bad)} of {len(drawn)} drawn px differ" + (f" (max {worst} per channel)" if bad else ""))
