@@ -32,3 +32,8 @@ target_compile_options(armpsx PRIVATE -O2)
 
 add_executable(psxrun tests/psxrun.c)
 target_link_libraries(psxrun armpsx)
+
+add_library(armpsx_libretro SHARED libretro/libretro.c)
+target_include_directories(armpsx_libretro PRIVATE libretro)
+target_link_libraries(armpsx_libretro armpsx)
+set_target_properties(armpsx_libretro PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden)
