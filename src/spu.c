@@ -1340,8 +1340,9 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
    SPU_Voice *voice = &Voices[voice_num];
    int32_t voice_pvs;
 
-   // The Fast mode leaves a silent, released voice alone until it's keyed on again.
-   if((QuietVoices & ~VoiceOn) & (1U << voice_num))
+   // The Fast mode leaves a silent, released voice alone until it's keyed on again, while the
+   // SPU's IRQ is off (the voice's reads can raise it).
+   if((QuietVoices & ~VoiceOn) & (1U << voice_num) && !(SPUControl & 0x40))
    {
     voice->PreLRSample = 0;
     if(voice_num == 1 || voice_num == 3)
