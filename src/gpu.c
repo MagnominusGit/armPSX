@@ -11,9 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
 
 #define ALWAYS static inline __attribute__((always_inline))
 
@@ -198,61 +195,63 @@ ALWAYS void addDy(struct Interp* i, const struct Deltas* d, uint32_t n, bool gou
 	if (gouraud) { i->r += d->drdy * n; i->g += d->dgdy * n; i->b += d->dbdy * n; }
 }
 
-#if defined(__SSE2__)
-// Opaque, shaded texture spans 8 pixels at a time: the texels one by one, then modTexel and plot's
-// write for all 8 in vector registers (the same results). A channel's ((t & mask) * c) >> n is
-// ((t >> shift) & 31) * c >> 4, which fits 16 bits.
-ALWAYS __m128i shadeChannel(__m128i t, __m128i c, __m128i off) {
-	__m128i v = _mm_srli_epi16(_mm_mullo_epi16(_mm_and_si128(t, _mm_set1_epi16(31)), c), 4);
-	v = _mm_srai_epi16(_mm_add_epi16(v, off), 3);
-	return _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), _mm_set1_epi16(31));
+// Spans 8 pixels at a time in the compiler's vectors (NEON on ARM, SSE2 on x86): texels are fetched
+// one by one in order as before, then shading, blending, the mask test and the write for all 8, with
+// plot()'s results (-DVECTOR_SPANS=0 turns them off). A channel's ((t & mask) * c) >> n is
+// ((t >> shift) & 31) * c >> 4.
+#ifndef VECTOR_SPANS
+#define VECTOR_SPANS 1
+#endif
+
+typedef uint16_t V16 __attribute__((vector_size(16)));
+typedef int16_t S16 __attribute__((vector_size(16)));
+
+ALWAYS V16 vsel(V16 m, V16 a, V16 b) {
+	return (a & m) | (b & ~m);
 }
 
-ALWAYS void spanVector(struct Gpu* g, int y, int32_t x, int32_t w, struct Interp ig, const struct Deltas* d, bool gouraud,
-                       int texMode, bool maskEval) {
-	uint16_t* dest = &g->vram[(y & 511) * 1024 + x];
-	__m128i offsets[4];
-	for (int phase = 0; phase < 4; phase++) {
-		int16_t o[8];
-		for (int k = 0; k < 8; k++) o[k] = g->dither ? ditherTable[y & 3][(phase + k) & 3] : 0;
-		offsets[phase] = _mm_loadu_si128((const __m128i*) o);
-	}
-	const __m128i top = _mm_set1_epi16((short) 0x8000), set = _mm_set1_epi16((short) g->maskSet);
-	int32_t i = 0;
-	for (; i + 8 <= w; i += 8) {
-		uint16_t t[8], cr[8], cg[8], cb[8];
-		for (int k = 0; k < 8; k++) {
-			t[k] = texel(g, true, texMode, ig.u >> (COORD_FBS + COORD_POST_PADDING), ig.v >> (COORD_FBS + COORD_POST_PADDING));
-			cr[k] = (uint16_t) (ig.r >> (COORD_FBS + COORD_POST_PADDING));
-			cg[k] = (uint16_t) (ig.g >> (COORD_FBS + COORD_POST_PADDING));
-			cb[k] = (uint16_t) (ig.b >> (COORD_FBS + COORD_POST_PADDING));
-			addDx(&ig, d, 1, gouraud, true);
-		}
-		__m128i tex = _mm_loadu_si128((const __m128i*) t);
-		__m128i off = offsets[(x + i) & 3];
-		__m128i c0 = shadeChannel(tex, _mm_loadu_si128((const __m128i*) cr), off);
-		__m128i c1 = shadeChannel(_mm_srli_epi16(tex, 5), _mm_loadu_si128((const __m128i*) cg), off);
-		__m128i c2 = shadeChannel(_mm_srli_epi16(tex, 10), _mm_loadu_si128((const __m128i*) cb), off);
-		__m128i out = _mm_or_si128(_mm_and_si128(tex, top), _mm_or_si128(c0, _mm_or_si128(_mm_slli_epi16(c1, 5), _mm_slli_epi16(c2, 10))));
-		out = _mm_or_si128(out, set);
-		__m128i bg = _mm_loadu_si128((const __m128i*) (dest + i));
-		__m128i skip = _mm_cmpeq_epi16(tex, _mm_setzero_si128());
-		if (maskEval) skip = _mm_or_si128(skip, _mm_srai_epi16(bg, 15));
-		_mm_storeu_si128((__m128i*) (dest + i), _mm_or_si128(_mm_andnot_si128(skip, out), _mm_and_si128(skip, bg)));
-	}
-	for (; i < w; i++) {
-		uint16_t t = texel(g, true, texMode, ig.u >> (COORD_FBS + COORD_POST_PADDING), ig.v >> (COORD_FBS + COORD_POST_PADDING));
-		if (t) {
-			int dx = (x + i) & 3, dy = y & 3;
-			if (!g->dither) { dx = 3; dy = 2; }
-			t = modTexel(g, t, ig.r >> (COORD_FBS + COORD_POST_PADDING), ig.g >> (COORD_FBS + COORD_POST_PADDING),
-			             ig.b >> (COORD_FBS + COORD_POST_PADDING), dx, dy);
-			plot(g, -1, maskEval, true, (uint32_t) (x + i), (uint32_t) y, t);
-		}
-		addDx(&ig, d, 1, gouraud, true);
+ALWAYS V16 clamp31(S16 v) {
+	v &= ~(v >> 15);
+	return vsel((V16) (v > 31), (V16) {} + 31, (V16) v);
+}
+
+ALWAYS V16 shadeChannel(V16 t, V16 c, S16 off) {
+	return clamp31(((S16) (((t & 31) * c) >> 4) + off) >> 3);
+}
+
+ALWAYS V16 blendChannel(int blend, V16 f, V16 b) {
+	f &= 31;
+	b &= 31;
+	switch (blend) {
+	case 0: return (b + f) >> 1;
+	case 1: return clamp31((S16) (b + f));
+	case 2: return (b - f) & (V16) (b > f);
+	default: return clamp31((S16) (b + (f >> 2)));
 	}
 }
-#endif
+
+ALWAYS V16 finish(struct Gpu* g, V16 fore, V16 active, V16 bg, int blend, bool maskEval, bool textured) {
+	V16 pix = fore;
+	if (blend >= 0) {
+		V16 mixed = blendChannel(blend, fore, bg) | blendChannel(blend, fore >> 5, bg >> 5) << 5 | blendChannel(blend, fore >> 10, bg >> 10) << 10;
+		pix = vsel((V16) ((S16) fore < 0), mixed | 0x8000, fore);
+	}
+	if (!textured) pix &= 0x7FFF;
+	pix |= g->maskSet;
+	if (maskEval) active &= (V16) ((S16) bg >= 0);
+	return vsel(active, pix, bg);
+}
+
+ALWAYS V16 modulate(V16 t, V16 r, V16 gr, V16 b, S16 off) {
+	return (t & 0x8000) | shadeChannel(t, r, off) | shadeChannel(t >> 5, gr, off) << 5 | shadeChannel(t >> 10, b, off) << 10;
+}
+
+// Whether a span could fetch texels from its own pixels; then it goes pixel by pixel.
+ALWAYS bool texOverlap(struct Gpu* g, int texMode, int y, int32_t x, int32_t w) {
+	uint32_t pw = 64u << texMode;
+	return ((uint32_t) (y - (int) g->texPageY) & 511) < 256 &&
+	       (((uint32_t) (x - (int32_t) g->texPageX) & 1023) < pw || ((g->texPageX - (uint32_t) x) & 1023) < (uint32_t) w);
+}
 
 ALWAYS void drawSpan(struct Gpu* g, bool draw, int y, int32_t xStart, int32_t xBound, struct Interp ig, const struct Deltas* d,
                      bool gouraud, bool textured, int blend, bool texMult, int texMode, bool maskEval) {
@@ -273,12 +272,43 @@ ALWAYS void drawSpan(struct Gpu* g, bool draw, int y, int32_t xStart, int32_t xB
 	else if (blend >= 0 || maskEval) g->drawTime -= w + ((w + 1) >> 1);
 	else g->drawTime -= w;
 	if (!draw && !textured) return;
-#if defined(__SSE2__)
-	if (draw && textured && texMult && blend < 0 && w >= 8) {
-		spanVector(g, y, x, w, ig, d, gouraud, texMode, maskEval);
-		return;
+	if (VECTOR_SPANS && draw && w >= 8 && !(textured && texOverlap(g, texMode, y, x, w))) {
+		uint16_t* dest = &g->vram[(y & 511) * 1024 + x];
+		bool dith = g->dither && (textured ? texMult : gouraud);
+		S16 off = {};
+		for (int k = 0; dith && k < 8; k++) off[k] = ditherTable[y & 3][(x + k) & 3];
+		V16 c0 = (V16) {} + (uint16_t) (ig.r >> (COORD_FBS + COORD_POST_PADDING));
+		V16 c1 = (V16) {} + (uint16_t) (ig.g >> (COORD_FBS + COORD_POST_PADDING));
+		V16 c2 = (V16) {} + (uint16_t) (ig.b >> (COORD_FBS + COORD_POST_PADDING));
+		do {
+			V16 fore = {}, active = ~(V16) {};
+			for (int k = 0; k < 8; k++) {
+				if (textured) fore[k] = texel(g, true, texMode, ig.u >> (COORD_FBS + COORD_POST_PADDING), ig.v >> (COORD_FBS + COORD_POST_PADDING));
+				if (gouraud) {
+					c0[k] = (uint16_t) (ig.r >> (COORD_FBS + COORD_POST_PADDING));
+					c1[k] = (uint16_t) (ig.g >> (COORD_FBS + COORD_POST_PADDING));
+					c2[k] = (uint16_t) (ig.b >> (COORD_FBS + COORD_POST_PADDING));
+				}
+				addDx(&ig, d, 1, gouraud, textured);
+			}
+			if (textured) {
+				active = (V16) (fore != 0);
+				if (texMult) fore = modulate(fore, c0, c1, c2, off);
+			} else if (dith) {
+				fore = 0x8000 | clamp31(((S16) c0 + off) >> 3) | clamp31(((S16) c1 + off) >> 3) << 5 | clamp31(((S16) c2 + off) >> 3) << 10;
+			} else {
+				fore = 0x8000 | c0 >> 3 | (c1 >> 3) << 5 | (c2 >> 3) << 10;
+			}
+			V16 bg;
+			memcpy(&bg, dest, sizeof bg);
+			bg = finish(g, fore, active, bg, blend, maskEval, textured);
+			memcpy(dest, &bg, sizeof bg);
+			dest += 8;
+			x += 8;
+			w -= 8;
+		} while (w >= 8);
+		if (w <= 0) return;
 	}
-#endif
 	do {
 		uint32_t r = ig.r >> (COORD_FBS + COORD_POST_PADDING);
 		uint32_t gg = ig.g >> (COORD_FBS + COORD_POST_PADDING);
@@ -585,7 +615,27 @@ ALWAYS void drawSprite(struct Gpu* g, bool draw, int32_t x0, int32_t y0, int32_t
 				if (blend >= 0 || maskEval) t += (((xb + 1) & ~1) - (xs & ~1)) >> 1;
 				g->drawTime -= t;
 			}
-			for (int32_t x = xs; x < xb && (draw || (textured && !g->roughTime)); x++) {
+			int32_t x = xs;
+			if (VECTOR_SPANS && draw && xb - x >= 8 && !(textured && texOverlap(g, texMode, y, x, xb - x))) {
+				uint16_t* dest = &g->vram[(y & 511) * 1024 + x];
+				V16 c0 = (V16) {} + (uint16_t) r, c1 = (V16) {} + (uint16_t) gr, c2 = (V16) {} + (uint16_t) b;
+				for (; x + 8 <= xb; x += 8, dest += 8) {
+					V16 fore = (V16) {} + fill, active = ~(V16) {};
+					if (textured) {
+						for (int k = 0; k < 8; k++) {
+							fore[k] = texel(g, true, texMode, ur, v);
+							ur += uInc;
+						}
+						active = (V16) (fore != 0);
+						if (texMult) fore = modulate(fore, c0, c1, c2, (S16) {});
+					}
+					V16 bg;
+					memcpy(&bg, dest, sizeof bg);
+					bg = finish(g, fore, active, bg, blend, maskEval, textured);
+					memcpy(dest, &bg, sizeof bg);
+				}
+			}
+			for (; x < xb && (draw || (textured && !g->roughTime)); x++) {
 				if (textured) {
 					uint16_t t = texel(g, draw, texMode, ur, v);
 					if (draw && t) {
