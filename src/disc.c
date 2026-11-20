@@ -547,6 +547,17 @@ static void synthHeader(uint8_t* buf, int32_t lba, int format) {
 	}
 }
 
+// A PlayStation disc's data is Mode 2 Form 1. A Mode 1 sector (an image made from the disc's 2048-byte
+// data) reads as that: the subheader of a data sector, then the data. EDC and ECC are left at zero.
+static void asForm1(uint8_t* buf) {
+	if (buf[15] != 1) return;
+	memmove(buf + 24, buf + 16, 2048);
+	buf[15] = 2;
+	memset(buf + 16, 0, 8);
+	buf[16 + 2] = buf[16 + 6] = 0x08;
+	memset(buf + 24 + 2048, 0, 2352 - 24 - 2048);
+}
+
 static void readData(struct Disc* d, const struct Track* t, int32_t lba, uint8_t* buf) {
 	int64_t sector = lba - t->lba;
 	if (d->chd) {
@@ -564,6 +575,7 @@ static void readData(struct Disc* d, const struct Track* t, int32_t lba, uint8_t
 			}
 		} else {
 			memcpy(buf, s, 2352);
+			asForm1(buf);
 		}
 		return;
 	}
@@ -571,10 +583,12 @@ static void readData(struct Disc* d, const struct Track* t, int32_t lba, uint8_t
 		synthHeader(buf, lba, FORMAT_MODE1_RAW);
 		fseek(t->file, t->fileOffset + sector * 2048, SEEK_SET);
 		if (fread(buf + 16, 1, 2048, t->file) != 2048) memset(buf + 16, 0, 2048);
+		asForm1(buf);
 		return;
 	}
 	fseek(t->file, t->fileOffset + sector * 2352, SEEK_SET);
 	if (fread(buf, 1, 2352, t->file) != 2352) memset(buf, 0, 2352);
+	if (t->format != FORMAT_AUDIO) asForm1(buf);
 }
 
 void discReadRaw(struct Disc* d, int32_t lba, uint8_t* buf) {
