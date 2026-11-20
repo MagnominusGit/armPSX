@@ -13,6 +13,12 @@ struct Gles;
 
 // Its own context, current on this thread after; NULL with why in error when there is none.
 struct Gles* glesCreateContext(char* error, size_t errorSize);
+// With on, contexts made from now on do their GL with Vulkan (vkgl.c), on the device vkglCreate
+// started or one of their own.
+void glesUseVulkan(bool on);
+// Where vkgl keeps compiled shaders and pipelines ("" for nowhere).
+void glesCacheDir(const char* dir);
+const char* glesCacheDirectory(void);
 // From now on, contexts are the frontend's, current already when they are used, with GL functions
 // from getProc.
 void glesFrontend(void* (*getProc)(const char* name));

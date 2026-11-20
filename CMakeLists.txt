@@ -42,10 +42,27 @@ target_compile_options(armpsx PRIVATE -O2)
 # GCC's -O2 cost model won't vectorize the scanline output's 16- to 32-bit widening
 set_source_files_properties(src/gpu.c PROPERTIES COMPILE_OPTIONS $<$<C_COMPILER_ID:GNU>:-fvect-cost-model=dynamic>)
 
+# Vulkan: the GL renderer's GL done with Vulkan (src/vkgl.c, from armN64), its shaders compiled by
+# glslang, built in from ARMPSX_GLSLANG_DIR.
+option(ARMPSX_VULKAN "Build the Vulkan renderer" ON)
+set(ARMPSX_GLSLANG_DIR "${CMAKE_SOURCE_DIR}/deps/glslang" CACHE PATH "glslang's source")
+if(ARMPSX_VULKAN AND EXISTS ${ARMPSX_GLSLANG_DIR}/glslang/MachineIndependent/ShaderLang.cpp)
+	enable_language(CXX)
+	include(cmake/glslang.cmake)
+	target_sources(armpsx PRIVATE src/vkgl.c)
+	target_include_directories(armpsx PUBLIC deps/vulkan/include)
+	target_compile_definitions(armpsx PUBLIC ARMPSX_VULKAN)
+	target_link_libraries(armpsx PUBLIC glslang)
+	set(ARMPSX_LINKER_LANGUAGE CXX)
+else()
+	set(ARMPSX_LINKER_LANGUAGE C)
+endif()
+
 add_executable(psxrun tests/psxrun.c)
+set_target_properties(psxrun PROPERTIES LINKER_LANGUAGE ${ARMPSX_LINKER_LANGUAGE})
 target_link_libraries(psxrun armpsx)
 
 add_library(armpsx_libretro SHARED libretro/libretro.c)
 target_include_directories(armpsx_libretro PRIVATE libretro)
 target_link_libraries(armpsx_libretro armpsx)
-set_target_properties(armpsx_libretro PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden)
+set_target_properties(armpsx_libretro PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden LINKER_LANGUAGE ${ARMPSX_LINKER_LANGUAGE})

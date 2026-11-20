@@ -9,6 +9,10 @@
 #include "disc.h"
 #include "gles.h"
 #include "glr.h"
+#ifdef ARMPSX_VULKAN
+#include "vkgl.h"
+#include "libretro_vulkan.h"
+#endif
 
 static retro_environment_t environ_cb;
 static retro_video_refresh_t video_cb;
@@ -112,7 +116,7 @@ void retro_set_environment(retro_environment_t cb) {
 	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
 	static const struct retro_variable options[] = {
 		{ "armpsx_mode", "Mode (restart); Fast|Balanced|Exact" },
-		{ "armpsx_renderer", "Renderer (restart); Software|OpenGL" },
+		{ "armpsx_renderer", "Renderer (restart); Software|OpenGL|Vulkan" },
 		{ "armpsx_resolution", "Internal resolution (OpenGL); 1x|2x|3x|4x|5x|6x|7x|8x" },
 		{ NULL, NULL },
 	};
@@ -190,6 +194,97 @@ static void hwDestroy(void) {
 	gles = NULL;
 }
 
+#ifdef ARMPSX_VULKAN
+// The frontend's Vulkan device: the GL renderer's GL done on it (vkgl.c), the picture handed over
+// with set_image.
+static const struct retro_hw_render_interface_vulkan* vulkan;
+
+static void vulkanLock(void* handle) {
+	vulkan->lock_queue(handle);
+}
+
+static void vulkanUnlock(void* handle) {
+	vulkan->unlock_queue(handle);
+}
+
+static uint32_t vulkanSyncIndex(void* handle) {
+	return vulkan->get_sync_index(handle);
+}
+
+static uint32_t vulkanSyncIndexMask(void* handle) {
+	return vulkan->get_sync_index_mask(handle);
+}
+
+static void vulkanReset(void) {
+	if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void*) &vulkan) || !vulkan ||
+	    vulkan->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN || vulkan->interface_version != RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION) {
+		log_cb(RETRO_LOG_ERROR, "armPSX: the frontend's Vulkan interface is missing or of another version\n");
+		vulkan = NULL;
+		return;
+	}
+	struct VkglFrontend fe = { vulkan->instance, vulkan->gpu, vulkan->device, vulkan->queue, vulkan->queue_index,
+	                           vulkan->get_instance_proc_addr, vulkan->get_device_proc_addr, vulkan->handle,
+	                           vulkan->lock_queue ? vulkanLock : NULL, vulkan->unlock_queue ? vulkanUnlock : NULL,
+	                           vulkanSyncIndex, vulkanSyncIndexMask };
+	char error[256] = "";
+	if (!vkglCreate(&fe, error, sizeof error)) {
+		log_cb(RETRO_LOG_ERROR, "armPSX: Vulkan renderer: %s\n", error);
+		return;
+	}
+	glesUseVulkan(true);
+	glScale = scaleOption();
+	gles = glesCreateContext(error, sizeof error);
+	if (!gles || !gpuGlStart(psx, gles, glScale, error, sizeof error)) {
+		log_cb(RETRO_LOG_ERROR, "armPSX: Vulkan renderer: %s; the software renderer's picture is shown\n", error);
+		return;
+	}
+	log_cb(RETRO_LOG_INFO, "armPSX: Vulkan renderer on %s at %dx\n", glesRenderer(gles), glScale);
+}
+
+static void vulkanDestroy(void) {
+	if (psx) gpuGlStop(psx);
+	glesDestroy(gles);
+	gles = NULL;
+	vkglDestroy();
+	vulkan = NULL;
+}
+
+static const VkApplicationInfo* vulkanApplication(void) {
+	static const VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "armPSX", 1, "armPSX", 1, VK_API_VERSION_1_1 };
+	return &app;
+}
+
+// The frontend's device made here when the frontend lets the core make it, with what vkgl draws
+// better with that the GPU has.
+static bool vulkanDevice(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface,
+                         PFN_vkGetInstanceProcAddr get, retro_vulkan_create_device_wrapper_t create, void* opaque) {
+	struct VkglDevice d;
+	if (!vkglMakeDevice(instance, gpu, surface, get, create, opaque, &d)) return false;
+	*context = (struct retro_vulkan_context) { d.gpu, d.device, d.queue, d.queueFamily, d.presentQueue, d.presentFamily };
+	return true;
+}
+
+static bool askVulkan(void) {
+	hw = (struct retro_hw_render_callback) { 0 };
+	hw.context_type = RETRO_HW_CONTEXT_VULKAN;
+	hw.version_major = VK_API_VERSION_1_0;
+	hw.context_reset = vulkanReset;
+	hw.context_destroy = vulkanDestroy;
+	if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
+		hw.context_type = RETRO_HW_CONTEXT_NONE;
+		return false;
+	}
+	struct retro_hw_render_context_negotiation_interface support = { RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0 };
+	if (environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT, &support) && support.interface_version >= 2) {
+		static const struct retro_hw_render_context_negotiation_interface_vulkan negotiation = {
+			RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 2, vulkanApplication, NULL, NULL, NULL, vulkanDevice,
+		};
+		environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, (void*) &negotiation);
+	}
+	return true;
+}
+#endif
+
 // A context like the frontend's: GLES 3.0, or a 3.3 core profile (it runs GLSL ES 3.00 shaders).
 static bool askContext(void) {
 	unsigned preferred = RETRO_HW_CONTEXT_NONE;
@@ -250,9 +345,15 @@ bool retro_load_game(const struct retro_game_info* game) {
 	psxReset(psx);
 	struct retro_variable renderer = { "armpsx_renderer", NULL };
 	hw.context_type = RETRO_HW_CONTEXT_NONE;
-	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &renderer) && renderer.value && !strcmp(renderer.value, "OpenGL") && !askContext()) {
+	bool got = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &renderer) && renderer.value;
+	if (got && !strcmp(renderer.value, "OpenGL") && !askContext()) {
 		log_cb(RETRO_LOG_WARN, "armPSX: the frontend has no OpenGL context for the core; the software renderer draws\n");
 	}
+#ifdef ARMPSX_VULKAN
+	if (got && !strcmp(renderer.value, "Vulkan") && !askVulkan()) {
+		log_cb(RETRO_LOG_WARN, "armPSX: the frontend has no Vulkan context for the core; the software renderer draws\n");
+	}
+#endif
 	return true;
 }
 
@@ -295,21 +396,34 @@ void retro_run(void) {
 	psxRunFrame(psx);
 	if (psx->gpuGl) {
 		if (scaleOption() != glScale) {
-			hwDestroy();
-			hwReset();
+			// The renderer again at the new scale, on the same context
+			gpuGlStop(psx);
+			char error[256] = "";
+			glScale = scaleOption();
+			if (!gpuGlStart(psx, gles, glScale, error, sizeof error)) log_cb(RETRO_LOG_ERROR, "armPSX: renderer: %s\n", error);
 		}
 	}
 	struct Glr* glr = gpuGlFrame(psx);
 	if (glr) {
 		int w, h;
 		glrPictureFramebuffer(glr, &w, &h);
-		glrShow(glr, (unsigned) hw.get_current_framebuffer());
 		if (w != lastW || h != lastH) {
 			struct retro_game_geometry g = { w, h, 1024 * 8, 576 * 8, 4.0f / 3.0f };
 			environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g);
 			lastW = w;
 			lastH = h;
 		}
+#ifdef ARMPSX_VULKAN
+		if (hw.context_type == RETRO_HW_CONTEXT_VULKAN) {
+			glrShow(glr, vkglFrontendFramebuffer(w, h), false);
+			struct retro_vulkan_image image;
+			VkImage handle;
+			if (vulkan && vkglPicture(&handle, &image.image_view, &image.image_layout, &image.create_info)) {
+				vulkan->set_image(vulkan->handle, &image, 0, NULL, vulkan->queue_index);
+			}
+		} else
+#endif
+		glrShow(glr, (unsigned) hw.get_current_framebuffer(), true);
 		video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
 		int n = spuSamples(audio);
 		if (n > 0) audio_batch_cb(audio, n);

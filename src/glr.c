@@ -19,14 +19,14 @@ typedef intptr_t GLsizeiptr;
 enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_TEXTURE0 = 0x84C0, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
 	GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803, GL_NEAREST = 0x2600, GL_CLAMP_TO_EDGE = 0x812F,
-	GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_R16UI = 0x8234, GL_RED_INTEGER = 0x8D94,
+	GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401,
 	GL_UNSIGNED_SHORT = 0x1403, GL_SHORT = 0x1402, GL_UNSIGNED_INT = 0x1405, GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8,
 	GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
 	GL_COLOR_BUFFER_BIT = 0x4000, GL_SCISSOR_TEST = 0x0C11, GL_BLEND = 0x0BE2, GL_FUNC_ADD = 0x8006,
 	GL_FUNC_REVERSE_SUBTRACT = 0x800B, GL_ZERO = 0, GL_ONE = 1, GL_DST_ALPHA = 0x0304, GL_ONE_MINUS_DST_ALPHA = 0x0305,
 	GL_CONSTANT_COLOR = 0x8001, GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 0x0004,
 	GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
-	GL_UNPACK_ROW_LENGTH = 0x0CF2, GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
+	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
 
 struct Gl {
@@ -67,7 +67,7 @@ struct Gl {
 	void (*DeleteProgram)(GLuint);
 	GLint (*GetUniformLocation)(GLuint, const char*);
 	void (*Uniform1i)(GLint, GLint);
-	void (*Uniform2i)(GLint, GLint, GLint);
+	void (*Uniform4iv)(GLint, GLsizei, const GLint*);
 	void (*Uniform1f)(GLint, float);
 	void (*GenVertexArrays)(GLsizei, GLuint*);
 	void (*DeleteVertexArrays)(GLsizei, const GLuint*);
@@ -115,9 +115,10 @@ struct Glr {
 	GLuint target, targetFb, sample, sampleFb, words, picture, pictureFb;
 	int pictureW, pictureH;
 	GLuint draw, blit, vao, buffer;
-	GLint drawScale, drawScaleF, drawVram, blitWords, blitVram, blitScale, blitKind, blitMask, blitOrigin, blitSrc;
+	GLint drawScale, drawZoom, drawVram, blitWords, blitVram, blitScale, blitKind, blitMask, blitRect;
 	struct Vertex* vertices;
 	int vertexCount;
+	uint32_t* staging;  // CPU words on their way up, in VRAM's colors
 	struct Run runs[RUNS];
 	int runCount;
 	// VRAM tiles drawn since the sample copy was made
@@ -133,12 +134,16 @@ static const char* drawVertex =
 	"layout(location = 4) in uvec4 aPlane1;\n"
 	"layout(location = 5) in uvec4 aPlane2;\n"
 	"layout(location = 6) in uvec4 aPlane3;\n"
-	"uniform float uScaleF;\n"
-	"flat out uvec4 vInfo, vPlane0, vPlane1, vPlane2, vPlane3;\n"
+	"uniform float uZoom;\n"
+	"flat out uvec4 vInfo;\n"
+	"flat out uvec4 vPlane0;\n"
+	"flat out uvec4 vPlane1;\n"
+	"flat out uvec4 vPlane2;\n"
+	"flat out uvec4 vPlane3;\n"
 	"flat out uint vFlags;\n"
 	"void main() {\n"
 	// Pixels are sampled at their top-left corners, as the GPU does
-	"	vec2 p = (vec2(aPos) / 16.0 * uScaleF + 0.5) / (vec2(1024.0, 512.0) * uScaleF) * 2.0 - 1.0;\n"
+	"	vec2 p = (vec2(aPos) / 16.0 * uZoom + 0.5) / (vec2(1024.0, 512.0) * uZoom) * 2.0 - 1.0;\n"
 	"	gl_Position = vec4(p, 0.0, 1.0);\n"
 	"	vInfo = aInfo;\n"
 	"	vFlags = aFlags;\n"
@@ -154,7 +159,11 @@ static const char* drawFragment =
 	"precision highp int;\n"
 	"uniform highp sampler2D uVram;\n"
 	"uniform int uScale;\n"
-	"flat in uvec4 vInfo, vPlane0, vPlane1, vPlane2, vPlane3;\n"
+	"flat in uvec4 vInfo;\n"
+	"flat in uvec4 vPlane0;\n"
+	"flat in uvec4 vPlane1;\n"
+	"flat in uvec4 vPlane2;\n"
+	"flat in uvec4 vPlane3;\n"
 	"flat in uint vFlags;\n"
 	"out vec4 oColor;\n"
 	"const int dither[16] = int[16](-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2);\n"
@@ -213,15 +222,16 @@ static const char* blitVertex =
 	"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
-// Kinds: 0 the CPU's words into VRAM, 1 a copy within VRAM, 2 the 15-bit picture, 3 the 24-bit one.
+// Kinds: 0 the CPU's words (uWords: VRAM-sized, in VRAM's colors) into VRAM, 1 a copy within VRAM, 2
+// the 15-bit picture, 3 the 24-bit one.
 static const char* blitFragment =
 	"#version 300 es\n"
 	"precision highp float;\n"
 	"precision highp int;\n"
-	"uniform highp usampler2D uWords;\n"
+	"uniform highp sampler2D uWords;\n"
 	"uniform highp sampler2D uVram;\n"
 	"uniform int uScale, uKind, uMask;\n"
-	"uniform ivec2 uOrigin, uSrc;\n"
+	"uniform ivec4 uRect;\n"
 	"out vec4 oColor;\n"
 	"int word(int x, int y) {\n"
 	"	vec4 c = texelFetch(uVram, ivec2((x & 1023) * uScale + uScale / 2, (y & 511) * uScale + uScale / 2), 0);\n"
@@ -229,11 +239,11 @@ static const char* blitFragment =
 	"	return q.r | q.g << 5 | q.b << 10 | (q.a >> 4) << 15;\n"
 	"}\n"
 	"void main() {\n"
-	"	ivec2 d = ivec2(gl_FragCoord.xy);\n"
+	"	ivec2 d = ivec2(gl_FragCoord.xy), uOrigin = uRect.xy, uSrc = uRect.zw;\n"
 	"	ivec2 size = ivec2(1024, 512) * uScale;\n"
 	"	if (uKind == 0) {\n"
-	"		int w = int(texelFetch(uWords, d / uScale, 0).r);\n"
-	"		oColor = vec4((vec3(ivec3(w, w >> 5, w >> 10) & 31) * 8.0 + 0.25) / 255.0, float((w >> 15) | uMask));\n"
+	"		vec4 w = texelFetch(uWords, d / uScale, 0);\n"
+	"		oColor = vec4(w.rgb, max(w.a, float(uMask)));\n"
 	"	} else if (uKind == 1) {\n"
 	"		ivec2 s = (uSrc * uScale + d - uOrigin) % size;\n"
 	"		vec4 c = texelFetch(uVram, s, 0);\n"
@@ -299,7 +309,7 @@ static bool load(struct Glr* r) {
 	       LOAD(BlendFuncSeparate) && LOAD(BlendEquationSeparate) && LOAD(BlendColor) && LOAD(CreateShader) &&
 	       LOAD(ShaderSource) && LOAD(CompileShader) && LOAD(GetShaderiv) && LOAD(GetShaderInfoLog) && LOAD(DeleteShader) &&
 	       LOAD(CreateProgram) && LOAD(AttachShader) && LOAD(LinkProgram) && LOAD(GetProgramiv) && LOAD(GetProgramInfoLog) &&
-	       LOAD(UseProgram) && LOAD(DeleteProgram) && LOAD(GetUniformLocation) && LOAD(Uniform1i) && LOAD(Uniform2i) &&
+	       LOAD(UseProgram) && LOAD(DeleteProgram) && LOAD(GetUniformLocation) && LOAD(Uniform1i) && LOAD(Uniform4iv) &&
 	       LOAD(Uniform1f) && LOAD(GenVertexArrays) && LOAD(DeleteVertexArrays) && LOAD(BindVertexArray) &&
 	       LOAD(GenBuffers) && LOAD(DeleteBuffers) && LOAD(BindBuffer) && LOAD(BufferData) && LOAD(VertexAttribIPointer) &&
 	       LOAD(EnableVertexAttribArray) && LOAD(DrawArrays) && LOAD(PixelStorei) && LOAD(ReadPixels);
@@ -331,7 +341,8 @@ struct Glr* glrCreate(struct Gles* gles, int scale, char* error, size_t errorSiz
 	r->gles = gles;
 	r->scale = scale < 1 ? 1 : scale > 16 ? 16 : scale;
 	r->vertices = malloc(VERTICES * sizeof *r->vertices);
-	if (!r->vertices || !load(r)) {
+	r->staging = malloc(1024 * 512 * 4);
+	if (!r->vertices || !r->staging || !load(r)) {
 		snprintf(error, errorSize, "incomplete GLES 3.0");
 		glrDestroy(r);
 		return NULL;
@@ -353,7 +364,7 @@ struct Glr* glrCreate(struct Gles* gles, int scale, char* error, size_t errorSiz
 		glrDestroy(r);
 		return NULL;
 	}
-	r->words = texture(gl, GL_R16UI, 1024, 512, GL_RED_INTEGER, GL_UNSIGNED_SHORT);
+	r->words = texture(gl, GL_RGBA8, 1024, 512, GL_RGBA, GL_UNSIGNED_BYTE);
 	gl->ClearColor(0, 0, 0, 0);
 	gl->BindFramebuffer(GL_FRAMEBUFFER, r->targetFb);
 	gl->Clear(GL_COLOR_BUFFER_BIT);
@@ -361,15 +372,14 @@ struct Glr* glrCreate(struct Gles* gles, int scale, char* error, size_t errorSiz
 	gl->Clear(GL_COLOR_BUFFER_BIT);
 
 	r->drawScale = gl->GetUniformLocation(r->draw, "uScale");
-	r->drawScaleF = gl->GetUniformLocation(r->draw, "uScaleF");
+	r->drawZoom = gl->GetUniformLocation(r->draw, "uZoom");
 	r->drawVram = gl->GetUniformLocation(r->draw, "uVram");
 	r->blitWords = gl->GetUniformLocation(r->blit, "uWords");
 	r->blitVram = gl->GetUniformLocation(r->blit, "uVram");
 	r->blitScale = gl->GetUniformLocation(r->blit, "uScale");
 	r->blitKind = gl->GetUniformLocation(r->blit, "uKind");
 	r->blitMask = gl->GetUniformLocation(r->blit, "uMask");
-	r->blitOrigin = gl->GetUniformLocation(r->blit, "uOrigin");
-	r->blitSrc = gl->GetUniformLocation(r->blit, "uSrc");
+	r->blitRect = gl->GetUniformLocation(r->blit, "uRect");
 
 	gl->GenVertexArrays(1, &r->vao);
 	gl->BindVertexArray(r->vao);
@@ -398,6 +408,7 @@ void glrDestroy(struct Glr* r) {
 		if (r->blit) gl->DeleteProgram(r->blit);
 	}
 	free(r->vertices);
+	free(r->staging);
 	free(r);
 }
 
@@ -508,7 +519,7 @@ static void flush(struct Glr* r) {
 	gl->BindFramebuffer(GL_FRAMEBUFFER, r->targetFb);
 	gl->Viewport(0, 0, 1024 * s, 512 * s);
 	gl->UseProgram(r->draw);
-	gl->Uniform1f(r->drawScaleF, (float) s);
+	gl->Uniform1f(r->drawZoom, (float) s);
 	gl->Uniform1i(r->drawScale, s);
 	gl->Uniform1i(r->drawVram, 0);
 	gl->ActiveTexture(GL_TEXTURE0);
@@ -763,8 +774,7 @@ static void blitPass(struct Glr* r, int kind, int32_t x, int32_t y, int32_t w, i
 	gl->Viewport(x * s, y * s, w * s, h * s);
 	gl->Uniform1i(r->blitKind, kind);
 	gl->Uniform1i(r->blitMask, mask);
-	gl->Uniform2i(r->blitOrigin, x * s, y * s);
-	gl->Uniform2i(r->blitSrc, sx, sy);
+	gl->Uniform4iv(r->blitRect, 1, (const GLint[4]) { x * s, y * s, sx, sy });
 	gl->DrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -804,13 +814,18 @@ void glrUpload(struct Glr* r, const uint16_t* vram, int32_t x, int32_t y, int32_
 	int n = pieces(x, y, w, h, p);
 	gl->ActiveTexture(GL_TEXTURE0 + 1);
 	gl->BindTexture(GL_TEXTURE_2D, r->words);
-	gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 1024);
-	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 2);
+	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
 	for (int i = 0; i < n; i++) {
-		gl->TexSubImage2D(GL_TEXTURE_2D, 0, p[i][0], p[i][1], p[i][2], p[i][3], GL_RED_INTEGER, GL_UNSIGNED_SHORT,
-		                  &vram[p[i][1] * 1024 + p[i][0]]);
+		uint32_t* row = r->staging;
+		for (int32_t y = 0; y < p[i][3]; y++) {
+			const uint16_t* src = &vram[(p[i][1] + y) * 1024 + p[i][0]];
+			for (int32_t x = 0; x < p[i][2]; x++) {
+				uint32_t w = src[x];
+				row[y * p[i][2] + x] = (w & 31) << 3 | ((w >> 5) & 31) << 11 | ((w >> 10) & 31) << 19 | (w >> 15) * 0xFF000000u;
+			}
+		}
+		gl->TexSubImage2D(GL_TEXTURE_2D, 0, p[i][0], p[i][1], p[i][2], p[i][3], GL_RGBA, GL_UNSIGNED_BYTE, row);
 	}
-	gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 	useBlit(r, r->targetFb);
 	for (int i = 0; i < n; i++) {
 		blitPass(r, 0, p[i][0], p[i][1], p[i][2], p[i][3], 0, 0, false);
@@ -846,8 +861,7 @@ void glrPicture(struct Glr* r, int32_t x, int32_t y, int32_t width, int32_t heig
 	gl->Viewport(0, 0, r->pictureW, r->pictureH);
 	gl->Uniform1i(r->blitKind, mode24 ? 3 : 2);
 	gl->Uniform1i(r->blitMask, 0);
-	gl->Uniform2i(r->blitOrigin, 0, 0);
-	gl->Uniform2i(r->blitSrc, x & 1023, y & 511);
+	gl->Uniform4iv(r->blitRect, 1, (const GLint[4]) { 0, 0, x & 1023, y & 511 });
 	gl->DrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -857,11 +871,12 @@ unsigned glrPictureFramebuffer(struct Glr* r, int* width, int* height) {
 	return r->pictureFb;
 }
 
-void glrShow(struct Glr* r, unsigned framebuffer) {
+void glrShow(struct Glr* r, unsigned framebuffer, bool flip) {
 	struct Gl* gl = &r->gl;
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, r->pictureFb);
 	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
-	gl->BlitFramebuffer(0, 0, r->pictureW, r->pictureH, 0, r->pictureH, r->pictureW, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl->BlitFramebuffer(0, 0, r->pictureW, r->pictureH, 0, flip ? r->pictureH : 0, r->pictureW, flip ? 0 : r->pictureH,
+	                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	gl->BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 }
 

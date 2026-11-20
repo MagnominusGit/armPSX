@@ -2,6 +2,9 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include "gles.h"
+#ifdef ARMPSX_VULKAN
+#include "vkgl.h"
+#endif
 
 #include <dlfcn.h>
 #include <stdint.h>
@@ -26,6 +29,7 @@ enum {
 };
 
 struct Gles {
+	bool vulkan, ownsVulkan;  // GL done with Vulkan, and whether this context started it
 	void* egl;
 	void* gles;
 	EGLDisplay display;
@@ -51,6 +55,20 @@ struct Gles {
 };
 
 static void* (*frontendProc)(const char*);
+static bool vulkanContexts;
+static char cacheDir[4096];
+
+void glesUseVulkan(bool on) {
+	vulkanContexts = on;
+}
+
+void glesCacheDir(const char* dir) {
+	snprintf(cacheDir, sizeof cacheDir, "%s", dir ? dir : "");
+}
+
+const char* glesCacheDirectory(void) {
+	return cacheDir;
+}
 
 void glesFrontend(void* (*getProc)(const char* name)) {
 	frontendProc = getProc;
@@ -137,6 +155,18 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 struct Gles* glesCreateContext(char* error, size_t errorSize) {
 	struct Gles* g = calloc(1, sizeof *g);
 	if (!g) return NULL;
+#ifdef ARMPSX_VULKAN
+	if (vulkanContexts) {
+		g->vulkan = true;
+		g->ownsVulkan = !vkglActive();
+		if (!vkglCreate(NULL, error, errorSize)) {
+			free(g);
+			return NULL;
+		}
+		snprintf(g->renderer, sizeof g->renderer, "%s", vkglRenderer());
+		return g;
+	}
+#endif
 	if (!context(g, error, errorSize)) {
 		glesDestroy(g);
 		return NULL;
@@ -145,15 +175,25 @@ struct Gles* glesCreateContext(char* error, size_t errorSize) {
 }
 
 void* glesProc(struct Gles* g, const char* name) {
+#ifdef ARMPSX_VULKAN
+	if (g->vulkan) return vkglProc(name);
+#endif
 	return lookup(g, name);
 }
 
 void glesUse(struct Gles* g) {
-	if (!g->external) g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
+	if (!g->external && !g->vulkan) g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
 }
 
 void glesDestroy(struct Gles* g) {
 	if (!g) return;
+#ifdef ARMPSX_VULKAN
+	if (g->vulkan) {
+		if (g->ownsVulkan) vkglDestroy();
+		free(g);
+		return;
+	}
+#endif
 	if (g->context) {
 		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
 		g->eglDestroyContext(g->display, g->context);

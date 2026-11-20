@@ -58,8 +58,8 @@ void glrPicture(struct Glr*, int32_t x, int32_t y, int32_t width, int32_t height
 // The picture: its GL framebuffer and size, or its pixels (0xRRGGBB, top row first).
 unsigned glrPictureFramebuffer(struct Glr*, int* width, int* height);
 void glrReadPicture(struct Glr*, uint32_t* pixels);
-// The picture copied to framebuffer (a frontend's), bottom row first.
-void glrShow(struct Glr*, unsigned framebuffer);
+// The picture copied to framebuffer (a frontend's): bottom row first, or with flip false top row first.
+void glrShow(struct Glr*, unsigned framebuffer, bool flip);
 // Where primitives are listed as they come (for tests), or NULL.
 extern FILE* glrLogFile;
 // VRAM as drawn, at 1x (for tests).

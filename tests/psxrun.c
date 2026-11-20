@@ -210,11 +210,13 @@ int main(int argc, char** argv) {
 		p->pcRing = calloc(256, 4);
 		p->pcStop = strtoul(getenv("PSXRUN_PCSTOP"), NULL, 16);
 	}
-	// PSX_RENDERER=gl: the GL renderer draws a picture as well (PSX_SCALE times), saved next to the
+	// PSX_RENDERER=gl (or vulkan, its GL done with Vulkan): the GL renderer draws a picture as well (PSX_SCALE times), saved next to the
 	// software one (prefix-gl-frame.ppm); PSXRUN_GLVRAM=file saves its VRAM at the end.
 	struct Gles* gles = NULL;
-	if (getenv("PSX_RENDERER") && !strcmp(getenv("PSX_RENDERER"), "gl")) {
+	const char* renderer = getenv("PSX_RENDERER");
+	if (renderer && (!strcmp(renderer, "gl") || !strcmp(renderer, "vulkan"))) {
 		char error[256] = "";
+		glesUseVulkan(!strcmp(renderer, "vulkan"));
 		gles = glesCreateContext(error, sizeof error);
 		if (!gles || !gpuGlStart(p, gles, getenv("PSX_SCALE") ? atoi(getenv("PSX_SCALE")) : 1, error, sizeof error)) {
 			fprintf(stderr, "GL renderer: %s\n", error);
