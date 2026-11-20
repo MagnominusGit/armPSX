@@ -23,6 +23,7 @@ struct Compile {
 	bool fast;  // the Fast or Balanced mode: no ReadAbsorb or instruction cache timing
 	bool balanced;  // the Balanced mode: a cycle per instruction plus the bus's time
 	bool immediate;  // the Fast mode: this load writes its register at once (the next instruction doesn't read it)
+	bool codePages;  // stores check RAM's code pages (the Fast and Balanced modes' blocks, and the BIOS ROM's)
 	uint8_t* stubSites[BLOCK_MAX + 1];  // the check before instruction i that leaves near the limit
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -414,7 +415,7 @@ static void ramOffset(struct Compile* k, uint8_t** otherSite) {
 // out (rdx = the RAM offset).
 static void codePageCheck(struct Compile* k) {
 	struct Emitter* e = &k->e;
-	if (!k->fast) return;
+	if (!k->codePages) return;
 	xMovRR(e, 4, RAX, RDX);
 	xShiftI(e, X_SHR, 4, R(RAX), 12);
 	xAluI(e, X_CMP, 1, MI(RBX, RAX, 1, (int32_t) offsetof(struct Psx, codePage)), 0);

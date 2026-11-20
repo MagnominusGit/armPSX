@@ -24,7 +24,7 @@
 
 enum { PAGES = 4096, ARENA_SIZE = 64 << 20, BLOCK_MAX = 32, BLOCKS_MAX = 1 << 18, TABLE_SIZE = 1 << 19, NO_LOAD = 34, DYNAMIC = -1 };
 enum { GENERIC, CLEAN, CAREFUL };
-enum { FAST_CPI_X4 = 9 };  // the Fast mode's cycles per instruction, times 4: about the Exact mode's average
+enum { FAST_LOAD_CYCLES = 5 };  // the Fast mode's cycles for a load besides its own: the bus's from RAM
 
 struct Block {
 	uint32_t pc;
@@ -220,8 +220,8 @@ static uint8_t* jitLink(struct Psx* p, struct Block** slot, uint32_t pc);
 #endif
 
 // The Fast and Balanced modes' blocks: one version, from memory, no instruction cache or ReadAbsorb
-// timing. Fast charges a flat cost per instruction; Balanced one cycle each and the bus's time for
-// loads, BIOS fetches and the multiplier's waits.
+// timing. Both charge a cycle per instruction and 4 more per BIOS fetch; Balanced the bus's time for
+// each load and the multiplier's waits as they run, Fast FAST_LOAD_CYCLES per load as compiled.
 static bool fastMode(struct Psx* p) {
 	return FAST_JIT && p->mode != MODE_EXACT;
 }
@@ -336,7 +336,7 @@ static int stBeginRead(struct Compile* k) {
 static void stUncachedFetch(struct Compile* k) {
 	struct State* s = &k->st;
 	if (k->fast) {
-		if (k->balanced) s->cycles += 4;
+		s->cycles += 4;
 		return;
 	}
 	if (s->aw >= 0) {
@@ -363,10 +363,9 @@ static void stAfterWait(struct Compile* k) {
 	}
 }
 
-// (In the Fast mode the count is of instructions, each FAST_CPI_X4 / 4 cycles.)
 static void stFlushCycles(struct Compile* k) {
 	if (k->st.cycles) {
-		bAddCycles(k, k->fast && !k->balanced ? (k->st.cycles * FAST_CPI_X4 + 2) / 4 : k->st.cycles);
+		bAddCycles(k, k->st.cycles);
 		k->st.cycles = 0;
 	}
 }
@@ -396,6 +395,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	bBegin(&k, j, start, end);
 	k.fast = b->fast;
 	k.balanced = b->balanced;
+	k.codePages = b->fast || b->uncached;
 	bool inl[BLOCK_MAX];
 	for (int i = 0; i < b->count; i++) {
 		inl[i] = inlinable(b, i);
@@ -430,6 +430,9 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		b->at[version][i] = (uint16_t) (bHere(&k) - start);
 		if (b->uncached) stUncachedFetch(&k);
 		stAbsorbStep(&k);
+		if (k.fast && !k.balanced && (((instr >> 26) >= 0x20 && (instr >> 26) <= 0x26) || (instr >> 26) == 0x32)) {
+			k.st.cycles += FAST_LOAD_CYCLES;
+		}
 		// (The Fast mode's blocks run to their end; the limit is the dispatcher's.)
 		bool after = version != CAREFUL && i + 1 < b->count && !delay && !b->fast;
 		if (!inl[i]) {
@@ -547,7 +550,8 @@ static struct Block* compileBlock(struct Psx* p, struct Jit* j, uint32_t pc, boo
 	b->delay = false;
 	b->link[0] = b->link[1] = NULL;
 	b->uncached = romUncached(pc);
-	b->fast = fastMode(p);
+	// (the Fast mode runs the BIOS ROM's code on Exact's timing: its CD loader needs it)
+	b->fast = fastMode(p) && !(b->uncached && p->mode == MODE_FAST);
 	b->balanced = b->fast && p->mode == MODE_BALANCED;
 	b->dead = false;
 	for (uint32_t a = pc; b->count < BLOCK_MAX - 1; a += 4) {

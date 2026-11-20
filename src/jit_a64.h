@@ -95,6 +95,7 @@ struct Compile {
 	bool fast;
 	bool balanced;
 	bool immediate;
+	bool codePages;  // stores check RAM's code pages (the Fast and Balanced modes' blocks, and the BIOS ROM's)
 	uint8_t* stubSites[BLOCK_MAX + 1];
 	uint8_t* slows[BLOCK_MAX * 2];
 	int slowCount;
@@ -469,7 +470,7 @@ static void ramOffset(struct Compile* k, uint8_t** otherSite) {
 // throws the code out (x9 = the RAM offset; w0 and x1 are scratch).
 static void codePageCheck(struct Compile* k) {
 	struct Emitter* e = &k->e;
-	if (!k->fast) return;
+	if (!k->codePages) return;
 	aLsrImm(e, X0, X9, 12);
 	aAddImmX(e, X1, X19, OFF(codePage));
 	aLdst(e, L_LDRB, X0, X1, X0, L_UXTW);
