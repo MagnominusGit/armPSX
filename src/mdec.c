@@ -792,10 +792,11 @@ uint32_t mdecDmaRead(struct Psx* p, uint32_t* offset) {
  return MDEC_DMARead(offset);
 }
 
+// MDEC_DMACanWrite/CanRead a word at a time: in only while a command still takes words.
 bool mdecCanWrite(struct Psx* p) {
- return InFIFO.count < 0x20;
+ return (Control & (1U << 30)) && InCommand && InCounter != 0xFFFF && InFIFO.count < 0x20 && InFIFO.count <= InCounter;
 }
 
 bool mdecCanRead(struct Psx* p) {
- return OutFIFO.count > 0;
+ return (Control & (1U << 29)) && OutFIFO.count > 0;
 }
