@@ -175,24 +175,58 @@ static int scaleOption(void) {
 	return environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &v) && v.value ? atoi(v.value) : 1;
 }
 
+// With a context of its own sharing objects with the frontend's (EGL), the renderer runs on a thread
+// of its own and the picture is copied into the frontend's framebuffer here; otherwise it runs here,
+// in the frontend's context.
+static bool shared;
+static unsigned showFb;
+static struct {
+	void (*GenFramebuffers)(int, unsigned*);
+	void (*DeleteFramebuffers)(int, const unsigned*);
+	void (*BindFramebuffer)(unsigned, unsigned);
+	void (*FramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+	void (*BlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
+	void* (*FenceSync)(unsigned, unsigned);
+	void (*WaitSync)(void*, unsigned, uint64_t);
+	void (*DeleteSync)(void*);
+	void (*Flush)(void);
+} fgl;
+
+#define FGL(name) (*(void**) &fgl.name = glProc("gl" #name), fgl.name != NULL)
+
+static bool loadShowGl(void) {
+	return FGL(GenFramebuffers) && FGL(DeleteFramebuffers) && FGL(BindFramebuffer) && FGL(FramebufferTexture2D) &&
+	       FGL(BlitFramebuffer) && FGL(FenceSync) && FGL(WaitSync) && FGL(DeleteSync) && FGL(Flush);
+}
+
 // The frontend made the context (again): the GL renderer starts in it, from VRAM as it is.
 static void hwReset(void) {
 	glesFrontend(glProc);
 	char error[256] = "";
 	glScale = scaleOption();
-	gles = glesCreateContext(error, sizeof error);
-	// The frontend's context is current on the emulation's thread only: the renderer runs there
-	if (!gles || !gpuGlStart(psx, gles, glScale, false, error, sizeof error)) {
-		log_cb(RETRO_LOG_ERROR, "armPSX: OpenGL renderer: %s; the software renderer's picture is shown\n", error);
-		return;
+	gles = loadShowGl() ? glesCreateShared(error, sizeof error) : NULL;
+	shared = gles && gpuGlStart(psx, gles, glScale, true, error, sizeof error);
+	if (!shared) {
+		glesDestroy(gles);
+		gles = glesCreateContext(error, sizeof error);
+		if (!gles || !gpuGlStart(psx, gles, glScale, false, error, sizeof error)) {
+			log_cb(RETRO_LOG_ERROR, "armPSX: OpenGL renderer: %s; the software renderer's picture is shown\n", error);
+			return;
+		}
+	} else {
+		fgl.GenFramebuffers(1, &showFb);
 	}
-	log_cb(RETRO_LOG_INFO, "armPSX: OpenGL renderer on %s at %dx\n", glesRenderer(gles), glScale);
+	log_cb(RETRO_LOG_INFO, "armPSX: OpenGL renderer on %s at %dx%s\n", glesRenderer(gles), glScale,
+	       shared ? ", on a thread of its own" : "");
 }
 
 static void hwDestroy(void) {
 	if (psx) gpuGlStop(psx);
 	glesDestroy(gles);
 	gles = NULL;
+	if (showFb) fgl.DeleteFramebuffers(1, &showFb);
+	showFb = 0;
+	shared = false;
 }
 
 #ifdef ARMPSX_VULKAN
@@ -325,6 +359,42 @@ static void show(struct Glr* glr, void* arg) {
 	glrShow(glr, (unsigned) hw.get_current_framebuffer(), true);
 }
 
+struct SharedPicture {
+	unsigned texture;
+	void* sync;
+};
+
+static void pictureShared(struct Glr* glr, void* arg) {
+	struct SharedPicture* picture = arg;
+	picture->texture = glrPictureShared(glr, &picture->sync);
+}
+
+static void waitShared(struct Glr* glr, void* sync) {
+	glrWaitShared(glr, sync);
+}
+
+enum {
+	GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0,
+	GL_TEXTURE_2D = 0x0DE1, GL_COLOR_BUFFER_BIT = 0x4000, GL_NEAREST = 0x2600, GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117,
+};
+
+// The picture the renderer's thread finished, copied into the frontend's framebuffer bottom row
+// first; the renderer draws on once the copy is done.
+static void showShared(int w, int h) {
+	struct SharedPicture picture;
+	gpuGlRun(psx, pictureShared, &picture);
+	fgl.WaitSync(picture.sync, 0, UINT64_MAX);
+	fgl.DeleteSync(picture.sync);
+	unsigned framebuffer = (unsigned) hw.get_current_framebuffer();
+	fgl.BindFramebuffer(GL_READ_FRAMEBUFFER, showFb);
+	fgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, picture.texture, 0);
+	fgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+	fgl.BlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	fgl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	gpuGlPost(psx, waitShared, fgl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
+	fgl.Flush();
+}
+
 bool retro_load_game(const struct retro_game_info* game) {
 	if (!game || !game->path) return false;
 	enum retro_pixel_format format = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -420,7 +490,7 @@ void retro_run(void) {
 			gpuGlStop(psx);
 			char error[256] = "";
 			glScale = scaleOption();
-			if (!gpuGlStart(psx, gles, glScale, hw.context_type == RETRO_HW_CONTEXT_VULKAN, error, sizeof error)) {
+			if (!gpuGlStart(psx, gles, glScale, shared || hw.context_type == RETRO_HW_CONTEXT_VULKAN, error, sizeof error)) {
 				log_cb(RETRO_LOG_ERROR, "armPSX: renderer: %s\n", error);
 			}
 		}
@@ -435,7 +505,8 @@ void retro_run(void) {
 			lastW = w;
 			lastH = h;
 		}
-		gpuGlRun(psx, show, &hw);
+		if (shared) showShared(w, h);
+		else gpuGlRun(psx, show, &hw);
 		video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
 		int n = spuSamples(audio);
 		if (n > 0) audio_batch_cb(audio, n);

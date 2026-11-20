@@ -26,7 +26,7 @@ enum {
 	GL_FUNC_REVERSE_SUBTRACT = 0x800B, GL_ZERO = 0, GL_ONE = 1, GL_DST_ALPHA = 0x0304, GL_ONE_MINUS_DST_ALPHA = 0x0305,
 	GL_CONSTANT_COLOR = 0x8001, GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 0x0004,
 	GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
-	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
+	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5, GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117,
 };
 
 struct Gl {
@@ -81,6 +81,10 @@ struct Gl {
 	void (*DrawArrays)(GLenum, GLint, GLsizei);
 	void (*PixelStorei)(GLenum, GLint);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+	void* (*FenceSync)(GLenum, GLbitfield);
+	void (*WaitSync)(void*, GLbitfield, uint64_t);
+	void (*DeleteSync)(void*);
+	void (*Flush)(void);
 };
 
 // A vertex: position in 1/16 VRAM pixels; the texture's page, CLUT and window (u and v: mask |
@@ -303,6 +307,8 @@ static GLuint program(struct Gl* gl, const char* vertex, const char* fragment, c
 #define LOAD(name) (*(void**) &r->gl.name = glesProc(r->gles, "gl" #name), r->gl.name != NULL)
 
 static bool load(struct Glr* r) {
+	// Only for a context sharing the renderer's (glrPictureShared)
+	(void) (LOAD(FenceSync) && LOAD(WaitSync) && LOAD(DeleteSync) && LOAD(Flush));
 	return LOAD(GenTextures) && LOAD(DeleteTextures) && LOAD(BindTexture) && LOAD(ActiveTexture) && LOAD(TexImage2D) &&
 	       LOAD(TexSubImage2D) && LOAD(TexParameteri) && LOAD(GenFramebuffers) && LOAD(DeleteFramebuffers) &&
 	       LOAD(BindFramebuffer) && LOAD(FramebufferTexture2D) && LOAD(CheckFramebufferStatus) && LOAD(BlitFramebuffer) &&
@@ -887,6 +893,19 @@ unsigned glrPictureFramebuffer(struct Glr* r, int* width, int* height) {
 	*width = r->pictureW;
 	*height = r->pictureH;
 	return r->pictureFb;
+}
+
+unsigned glrPictureShared(struct Glr* r, void** sync) {
+	struct Gl* gl = &r->gl;
+	*sync = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	gl->Flush();
+	return r->picture;
+}
+
+void glrWaitShared(struct Glr* r, void* sync) {
+	struct Gl* gl = &r->gl;
+	gl->WaitSync(sync, 0, UINT64_MAX);
+	gl->DeleteSync(sync);
 }
 
 void glrShow(struct Glr* r, unsigned framebuffer, bool flip) {

@@ -13,6 +13,10 @@ struct Gles;
 
 // Its own context, current on this thread after; NULL with why in error when there is none.
 struct Gles* glesCreateContext(char* error, size_t errorSize);
+// With the frontend's EGL context current on this thread: a context of its own sharing objects with
+// it, current nowhere yet, with GL functions from glesFrontend's getProc. NULL when the frontend's
+// context is not an EGL one.
+struct Gles* glesCreateShared(char* error, size_t errorSize);
 // With on, contexts made from now on do their GL with Vulkan (vkgl.c), on the device vkglCreate
 // started or one of their own.
 void glesUseVulkan(bool on);

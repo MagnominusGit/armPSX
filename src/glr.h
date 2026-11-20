@@ -60,6 +60,11 @@ unsigned glrPictureFramebuffer(struct Glr*, int* width, int* height);
 void glrReadPicture(struct Glr*, uint32_t* pixels);
 // The picture copied to framebuffer (a frontend's): bottom row first, or with flip false top row first.
 void glrShow(struct Glr*, unsigned framebuffer, bool flip);
+// For a context sharing objects with the renderer's: the picture's texture, and a sync that context
+// waits for before reading it. glrWaitShared has the renderer wait for that context's sync before
+// drawing on.
+unsigned glrPictureShared(struct Glr*, void** sync);
+void glrWaitShared(struct Glr*, void* sync);
 // Counts of what the renderer asked of GL (for tests).
 enum { GLR_FRAMES, GLR_FLUSHES, GLR_DRAWS, GLR_VERTICES, GLR_SYNCS, GLR_FILLS, GLR_COPIES, GLR_UPLOADS, GLR_STATS };
 void glrStats(struct Glr*, uint64_t stats[GLR_STATS]);

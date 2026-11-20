@@ -242,12 +242,13 @@ const uint16_t* gpuVram(struct Psx* p);
 // The GL renderer drawing the picture at scale, on gles's context: on a thread of its own (threaded;
 // the context free to be made current there) or on the emulation's (the context current while it
 // runs). gpuGlFrame makes the frame's picture; gpuGlRun runs fn with the renderer where its GL is
-// (glr.h's calls go through it).
+// (glr.h's calls go through it), and gpuGlPost has it run there without waiting for it.
 struct Glr;
 bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char* error, size_t errorSize);
 void gpuGlStop(struct Psx* p);
 struct Glr* gpuGlFrame(struct Psx* p);
 void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg);
+void gpuGlPost(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg);
 uint32_t gpuRead(struct Psx* p, uint32_t address);
 void gpuWrite(struct Psx* p, uint32_t address, uint32_t value);
 void gpuGp0(struct Psx* p, uint32_t word);

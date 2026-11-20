@@ -1128,6 +1128,7 @@ struct GpuGl {
 	int32_t ux, uy, uw, uh;
 	uint32_t writes[16];  // VRAM write words not passed on yet
 	int writeCount;
+	struct Gles* gles;
 	bool threaded;
 	pthread_t thread;
 	pthread_mutex_t lock;
@@ -1284,7 +1285,7 @@ static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t 
 	glPublish(gl, &j);
 }
 
-void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg) {
+void gpuGlPost(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg) {
 	struct GpuGl* gl = p->gpuGl;
 	if (!gl) return;
 	glFlushWrites(gl);
@@ -1292,7 +1293,11 @@ void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg) {
 	struct GlCall c = { fn, arg };
 	memcpy(j.w, &c, sizeof c);
 	glPublish(gl, &j);
-	glWait(gl);
+}
+
+void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg) {
+	gpuGlPost(p, fn, arg);
+	if (p->gpuGl) glWait(p->gpuGl);
 }
 
 struct GlSetup {
@@ -1313,6 +1318,7 @@ static void glSetup(struct Glr* unused, void* arg) {
 
 static void glTeardown(struct Glr* glr, void* arg) {
 	glrDestroy(glr);
+	glesRelease(arg);
 }
 
 bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char* error, size_t errorSize) {
@@ -1326,6 +1332,7 @@ bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char
 	gl->g.drawPixels = true;
 	gl->g.drawParity = -1;
 	gl->g.glr = NULL;
+	gl->gles = gles;
 	p->gpuGl = gl;
 	if (threaded) {
 		pthread_mutex_init(&gl->lock, NULL);
@@ -1345,7 +1352,7 @@ bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char
 void gpuGlStop(struct Psx* p) {
 	struct GpuGl* gl = p->gpuGl;
 	if (!gl) return;
-	if (gl->g.glr) gpuGlRun(p, glTeardown, NULL);
+	if (gl->g.glr) gpuGlRun(p, glTeardown, gl->gles);
 	if (gl->threaded) {
 		pthread_mutex_lock(&gl->lock);
 		atomic_store(&gl->quit, true);

@@ -25,7 +25,8 @@ enum {
 	EGL_NONE = 0x3038, EGL_RENDERABLE_TYPE = 0x3040, EGL_SURFACE_TYPE = 0x3033, EGL_PBUFFER_BIT = 0x0001,
 	EGL_OPENGL_ES3_BIT = 0x0040, EGL_OPENGL_ES_API = 0x30A0, EGL_CONTEXT_MAJOR_VERSION = 0x3098,
 	EGL_CONTEXT_MINOR_VERSION = 0x30FB, EGL_EXTENSIONS = 0x3055, EGL_WIDTH = 0x3057, EGL_HEIGHT = 0x3056,
-	EGL_PLATFORM_SURFACELESS_MESA = 0x31DD, GL_RENDERER = 0x1F01,
+	EGL_PLATFORM_SURFACELESS_MESA = 0x31DD, GL_RENDERER = 0x1F01, EGL_CONFIG_ID = 0x3028, EGL_CONTEXT_CLIENT_TYPE = 0x3097,
+	EGL_OPENGL_API = 0x30A2, EGL_CONTEXT_OPENGL_PROFILE_MASK = 0x30FD, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT = 1,
 };
 
 struct Gles {
@@ -36,6 +37,8 @@ struct Gles {
 	EGLContext context;
 	EGLSurface surface;
 	bool external;  // the frontend's context: nothing to make or switch
+	bool shared;  // a context of its own on the frontend's display, sharing objects with its context
+	EGLenum api;
 	char renderer[128];
 
 	EGLDisplay (*eglGetDisplay)(void*);
@@ -43,6 +46,10 @@ struct Gles {
 	EGLBoolean (*eglInitialize)(EGLDisplay, EGLint*, EGLint*);
 	EGLBoolean (*eglTerminate)(EGLDisplay);
 	EGLBoolean (*eglBindAPI)(EGLenum);
+	EGLenum (*eglQueryAPI)(void);
+	EGLContext (*eglGetCurrentContext)(void);
+	EGLDisplay (*eglGetCurrentDisplay)(void);
+	EGLBoolean (*eglQueryContext)(EGLDisplay, EGLContext, EGLint, EGLint*);
 	EGLBoolean (*eglChooseConfig)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
 	EGLContext (*eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
 	EGLSurface (*eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint*);
@@ -75,7 +82,7 @@ void glesFrontend(void* (*getProc)(const char* name)) {
 }
 
 static void* lookup(struct Gles* g, const char* name) {
-	if (g->external) return frontendProc(name);
+	if (g->external || (g->shared && !strncmp(name, "gl", 2))) return frontendProc(name);
 	void* f = g->gles ? dlsym(g->gles, name) : NULL;
 	if (!f) f = dlsym(g->egl, name);
 	if (!f && g->eglGetProcAddress) f = g->eglGetProcAddress(name);
@@ -152,6 +159,53 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 	return true;
 }
 
+static struct Gles* sharedFailed(struct Gles* g, char* error, size_t errorSize, const char* what) {
+	g->display = NULL;
+	glesDestroy(g);
+	fail(error, errorSize, what);
+	return NULL;
+}
+
+struct Gles* glesCreateShared(char* error, size_t errorSize) {
+	struct Gles* g = calloc(1, sizeof *g);
+	if (!g) return NULL;
+	g->shared = true;
+	g->egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (!g->egl) g->egl = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+	if (!g->egl) return sharedFailed(g, error, errorSize, "no libEGL");
+	*(void**) &g->eglGetProcAddress = dlsym(g->egl, "eglGetProcAddress");
+	EGLContext frontend = NULL;
+	EGLint configId = 0, type = 0, count = 0;
+	EGLConfig config = NULL;
+	if (!loadEgl(g) || !LOAD(eglQueryAPI) || !LOAD(eglGetCurrentContext) || !LOAD(eglGetCurrentDisplay) || !LOAD(eglQueryContext) ||
+	    !(frontend = g->eglGetCurrentContext()) || !(g->display = g->eglGetCurrentDisplay()) ||
+	    !g->eglQueryContext(g->display, frontend, EGL_CONFIG_ID, &configId) ||
+	    !g->eglQueryContext(g->display, frontend, EGL_CONTEXT_CLIENT_TYPE, &type)) {
+		return sharedFailed(g, error, errorSize, "the frontend's context is not an EGL one");
+	}
+	const EGLint byId[] = { EGL_CONFIG_ID, configId, EGL_NONE };
+	g->eglChooseConfig(g->display, byId, &config, 1, &count);
+	const EGLint es[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+	const EGLint core[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_CONTEXT_OPENGL_PROFILE_MASK,
+		                    EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE };
+	g->api = (EGLenum) type;
+	EGLenum api = g->eglQueryAPI();
+	g->eglBindAPI(g->api);
+	if (count) g->context = g->eglCreateContext(g->display, config, frontend, g->api == EGL_OPENGL_API ? core : es);
+	g->eglBindAPI(api);
+	const char* extensions = g->eglQueryString(g->display, EGL_EXTENSIONS);
+	if (g->context && !(extensions && strstr(extensions, "EGL_KHR_surfaceless_context"))) {
+		const EGLint size[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+		g->surface = g->eglCreatePbufferSurface(g->display, config, size);
+		if (!g->surface) {
+			g->eglDestroyContext(g->display, g->context);
+			g->context = NULL;
+		}
+	}
+	if (!g->context) return sharedFailed(g, error, errorSize, "no context sharing the frontend's");
+	return g;
+}
+
 struct Gles* glesCreateContext(char* error, size_t errorSize) {
 	struct Gles* g = calloc(1, sizeof *g);
 	if (!g) return NULL;
@@ -182,7 +236,13 @@ void* glesProc(struct Gles* g, const char* name) {
 }
 
 void glesUse(struct Gles* g) {
-	if (!g->external && !g->vulkan) g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
+	if (g->external || g->vulkan) return;
+	if (g->shared) g->eglBindAPI(g->api);
+	g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
+	if (g->shared && LOAD(glGetString)) {
+		const char* renderer = (const char*) g->glGetString(GL_RENDERER);
+		snprintf(g->renderer, sizeof g->renderer, "%s", renderer ? renderer : "?");
+	}
 }
 
 void glesRelease(struct Gles* g) {
@@ -199,11 +259,12 @@ void glesDestroy(struct Gles* g) {
 	}
 #endif
 	if (g->context) {
-		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
+		// A shared context was let go by the thread that used it; the frontend's stays current here
+		if (!g->shared) g->eglMakeCurrent(g->display, NULL, NULL, NULL);
 		g->eglDestroyContext(g->display, g->context);
 	}
 	if (g->surface) g->eglDestroySurface(g->display, g->surface);
-	if (g->display) g->eglTerminate(g->display);
+	if (g->display && !g->shared) g->eglTerminate(g->display);
 	if (g->gles) dlclose(g->gles);
 	if (g->egl) dlclose(g->egl);
 	free(g);
