@@ -185,6 +185,10 @@ void glesUse(struct Gles* g) {
 	if (!g->external && !g->vulkan) g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
 }
 
+void glesRelease(struct Gles* g) {
+	if (!g->external && !g->vulkan) g->eglMakeCurrent(g->display, NULL, NULL, NULL);
+}
+
 void glesDestroy(struct Gles* g) {
 	if (!g) return;
 #ifdef ARMPSX_VULKAN

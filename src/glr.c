@@ -123,6 +123,7 @@ struct Glr {
 	int runCount;
 	// VRAM tiles drawn since the sample copy was made
 	uint32_t dirty[512 / TILE_H];
+	uint64_t stats[GLR_STATS];
 };
 
 static const char* drawVertex =
@@ -454,6 +455,7 @@ static void syncSample(struct Glr* r) {
 		}
 	}
 	if (y1 < 0) return;
+	r->stats[GLR_SYNCS]++;
 	memset(r->dirty, 0, sizeof r->dirty);
 	int s = r->scale;
 	int bx0 = x0 * TILE_W * s, by0 = y0 * TILE_H * s, bx1 = (x1 + 1) * TILE_W * s, by1 = (y1 + 1) * TILE_H * s;
@@ -527,6 +529,9 @@ static void flush(struct Glr* r) {
 	gl->BindVertexArray(r->vao);
 	gl->BindBuffer(GL_ARRAY_BUFFER, r->buffer);
 	gl->BufferData(GL_ARRAY_BUFFER, (GLsizeiptr) (r->vertexCount * sizeof(struct Vertex)), r->vertices, GL_STREAM_DRAW);
+	r->stats[GLR_FLUSHES]++;
+	r->stats[GLR_VERTICES] += (uint64_t) r->vertexCount;
+	r->stats[GLR_DRAWS] += (uint64_t) r->runCount;
 	gl->Enable(GL_SCISSOR_TEST);
 	int blend = -2;
 	for (int i = 0; i < r->runCount; i++) {
@@ -745,6 +750,7 @@ static int pieces(int32_t x, int32_t y, int32_t w, int32_t h, int32_t out[4][4])
 
 void glrFill(struct Glr* r, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color, int skip) {
 	if (glrLogFile) fprintf(glrLogFile, "fill %d,%d %dx%d %06x skip %d\n", x, y, w, h, color, skip);
+	r->stats[GLR_FILLS]++;
 	if (skip >= 0) {
 		// Every other line: drawn as rectangles, without the clip area or the mask
 		struct GlrState s = { 0, 0, 1023, 511, 0, 0, 0, 0, 0, 0, 0, false, false, false, -1, 0, skip };
@@ -794,6 +800,7 @@ static void useBlit(struct Glr* r, GLuint fb) {
 
 void glrCopy(struct Glr* r, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h, bool maskSet, bool maskEval) {
 	if (glrLogFile) fprintf(glrLogFile, "copy %d,%d -> %d,%d %dx%d\n", sx, sy, dx, dy, w, h);
+	r->stats[GLR_COPIES]++;
 	needSample(r, sx, sy, w, h);
 	flush(r);
 	useBlit(r, r->targetFb);
@@ -808,12 +815,14 @@ void glrCopy(struct Glr* r, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int3
 
 void glrUpload(struct Glr* r, const uint16_t* vram, int32_t x, int32_t y, int32_t w, int32_t h) {
 	if (glrLogFile) fprintf(glrLogFile, "upload %d,%d %dx%d\n", x, y, w, h);
+	r->stats[GLR_UPLOADS]++;
 	flush(r);
 	struct Gl* gl = &r->gl;
 	int32_t p[4][4];
 	int n = pieces(x, y, w, h, p);
+	// At 1x the words go into VRAM's image itself, otherwise through a pass scaling them up
 	gl->ActiveTexture(GL_TEXTURE0 + 1);
-	gl->BindTexture(GL_TEXTURE_2D, r->words);
+	gl->BindTexture(GL_TEXTURE_2D, r->scale == 1 ? r->target : r->words);
 	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
 	for (int i = 0; i < n; i++) {
 		uint32_t* row = r->staging;
@@ -826,6 +835,10 @@ void glrUpload(struct Glr* r, const uint16_t* vram, int32_t x, int32_t y, int32_
 		}
 		gl->TexSubImage2D(GL_TEXTURE_2D, 0, p[i][0], p[i][1], p[i][2], p[i][3], GL_RGBA, GL_UNSIGNED_BYTE, row);
 	}
+	if (r->scale == 1) {
+		for (int i = 0; i < n; i++) markDirty(r, p[i][0], p[i][1], p[i][0] + p[i][2], p[i][1] + p[i][3]);
+		return;
+	}
 	useBlit(r, r->targetFb);
 	for (int i = 0; i < n; i++) {
 		blitPass(r, 0, p[i][0], p[i][1], p[i][2], p[i][3], 0, 0, false);
@@ -833,7 +846,12 @@ void glrUpload(struct Glr* r, const uint16_t* vram, int32_t x, int32_t y, int32_
 	}
 }
 
+void glrStats(struct Glr* r, uint64_t stats[GLR_STATS]) {
+	memcpy(stats, r->stats, sizeof r->stats);
+}
+
 void glrPicture(struct Glr* r, int32_t x, int32_t y, int32_t width, int32_t height, bool mode24, bool off) {
+	r->stats[GLR_FRAMES]++;
 	flush(r);
 	struct Gl* gl = &r->gl;
 	int s = r->scale;
@@ -855,9 +873,9 @@ void glrPicture(struct Glr* r, int32_t x, int32_t y, int32_t width, int32_t heig
 		gl->Clear(GL_COLOR_BUFFER_BIT);
 		return;
 	}
-	// The picture reads the sample copy (24-bit words have to be whole)
-	syncSample(r);
+	// The picture reads VRAM's image itself
 	useBlit(r, r->pictureFb);
+	gl->BindTexture(GL_TEXTURE_2D, r->target);
 	gl->Viewport(0, 0, r->pictureW, r->pictureH);
 	gl->Uniform1i(r->blitKind, mode24 ? 3 : 2);
 	gl->Uniform1i(r->blitMask, 0);

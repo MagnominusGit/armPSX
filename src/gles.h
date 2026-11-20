@@ -24,5 +24,7 @@ const char* glesCacheDirectory(void);
 void glesFrontend(void* (*getProc)(const char* name));
 void* glesProc(struct Gles*, const char* name);
 void glesUse(struct Gles*);
+// The context no longer current on this thread (to be made current on another).
+void glesRelease(struct Gles*);
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);

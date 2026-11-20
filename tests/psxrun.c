@@ -143,7 +143,9 @@ static void saveVram(const uint16_t* pixels, const char* path) {
 	fclose(f);
 }
 
-static void saveGlPicture(struct Glr* glr, const char* path) {
+// (Run where the renderer's GL is, with gpuGlRun.)
+static void saveGlPicture(struct Glr* glr, void* arg) {
+	const char* path = arg;
 	int w, h;
 	glrPictureFramebuffer(glr, &w, &h);
 	uint32_t* pixels = malloc((size_t) w * h * 4);
@@ -158,6 +160,10 @@ static void saveGlPicture(struct Glr* glr, const char* path) {
 		fclose(f);
 	}
 	free(pixels);
+}
+
+static void readGlVram(struct Glr* glr, void* vram) {
+	glrReadVram(glr, vram);
 }
 
 int main(int argc, char** argv) {
@@ -218,7 +224,11 @@ int main(int argc, char** argv) {
 		char error[256] = "";
 		glesUseVulkan(!strcmp(renderer, "vulkan"));
 		gles = glesCreateContext(error, sizeof error);
-		if (!gles || !gpuGlStart(p, gles, getenv("PSX_SCALE") ? atoi(getenv("PSX_SCALE")) : 1, error, sizeof error)) {
+		// The renderer on a thread of its own unless PSX_GL_THREAD=0
+		bool threaded = !getenv("PSX_GL_THREAD") || strcmp(getenv("PSX_GL_THREAD"), "0");
+		p->softPicture = shots != NULL;
+		if (gles && threaded) glesRelease(gles);
+		if (!gles || !gpuGlStart(p, gles, getenv("PSX_SCALE") ? atoi(getenv("PSX_SCALE")) : 1, threaded, error, sizeof error)) {
 			fprintf(stderr, "GL renderer: %s\n", error);
 			return 1;
 		}
@@ -242,7 +252,7 @@ int main(int argc, char** argv) {
 		}
 		if (glCheck) {
 			static uint16_t glVram[1024 * 512];
-			glrReadVram(glr, glVram);
+			gpuGlRun(p, readGlVram, glVram);
 			const uint16_t* sw = gpuVram(p);
 			int differ = 0;
 			for (int k = 0; k < 1024 * 512; k++) differ += (glVram[k] & 0x7FFF) != (sw[k] & 0x7FFF);
@@ -269,7 +279,7 @@ int main(int argc, char** argv) {
 				savePpm(p, path);
 				if (glr) {
 					snprintf(path, sizeof path, "%s-gl-%05d.ppm", shots, i);
-					saveGlPicture(glr, path);
+					gpuGlRun(p, saveGlPicture, path);
 				}
 			}
 		}
@@ -294,7 +304,7 @@ int main(int argc, char** argv) {
 	if (vram) saveVram(gpuVram(p), vram);
 	if (p->gpuGl && getenv("PSXRUN_GLVRAM")) {
 		static uint16_t glVram[1024 * 512];
-		glrReadVram(gpuGlFrame(p), glVram);
+		gpuGlRun(p, readGlVram, glVram);
 		saveVram(glVram, getenv("PSXRUN_GLVRAM"));
 	}
 	if (wav) {
@@ -304,6 +314,13 @@ int main(int argc, char** argv) {
 		fseek(wav, 40, SEEK_SET);
 		fwrite(&wavBytes, 4, 1, wav);
 		fclose(wav);
+	}
+	if (p->gpuGl && getenv("PSXRUN_GLSTATS")) {
+		uint64_t st[GLR_STATS];
+		glrStats(gpuGlFrame(p), st);
+		double f = st[GLR_FRAMES] ? (double) st[GLR_FRAMES] : 1;
+		fprintf(stderr, "gl per frame: %.1f flushes, %.1f draws, %.0f vertices, %.1f sample copies, %.1f fills, %.1f copies, %.1f uploads\n",
+		        st[GLR_FLUSHES] / f, st[GLR_DRAWS] / f, st[GLR_VERTICES] / f, st[GLR_SYNCS] / f, st[GLR_FILLS] / f, st[GLR_COPIES] / f, st[GLR_UPLOADS] / f);
 	}
 	if (getenv("PSXRUN_PROF")) profReport(p);
 	if (getenv("PSXRUN_JITDUMP")) jitDump(p, getenv("PSXRUN_JITDUMP"));

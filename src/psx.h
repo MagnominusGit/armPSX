@@ -150,6 +150,7 @@ struct Psx {
 	struct Gpu gpu;
 	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
 	struct GpuGl* gpuGl;  // the GL renderer's side, drawing the picture as well
+	bool softPicture;  // the software renderer's picture made too, with the GL renderer on
 	int mode;  // MODE_*, from PSX_MODE (fast, balanced or exact) or the frontend
 	uint8_t codePage[RAM_SIZE >> 12];  // 4 KB pages of RAM the Fast mode's recompiled code came from
 	struct Sio sio;
@@ -238,11 +239,15 @@ void gpuReset(struct Psx* p);
 void gpuSync(struct Psx* p);
 void gpuFree(struct Psx* p);
 const uint16_t* gpuVram(struct Psx* p);
-// The GL renderer (on gles's context, current while the emulation runs) drawing the picture at
-// scale; gpuGlFrame makes the frame's picture (glr.h reads it).
-bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, char* error, size_t errorSize);
+// The GL renderer drawing the picture at scale, on gles's context: on a thread of its own (threaded;
+// the context free to be made current there) or on the emulation's (the context current while it
+// runs). gpuGlFrame makes the frame's picture; gpuGlRun runs fn with the renderer where its GL is
+// (glr.h's calls go through it).
+struct Glr;
+bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char* error, size_t errorSize);
 void gpuGlStop(struct Psx* p);
 struct Glr* gpuGlFrame(struct Psx* p);
+void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg);
 uint32_t gpuRead(struct Psx* p, uint32_t address);
 void gpuWrite(struct Psx* p, uint32_t address, uint32_t value);
 void gpuGp0(struct Psx* p, uint32_t word);

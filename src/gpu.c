@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
+#include "gles.h"
 #include "glr.h"
 
 #define ALWAYS static inline __attribute__((always_inline))
@@ -1117,11 +1118,23 @@ const uint16_t* gpuVram(struct Psx* p) {
 }
 
 // The GL renderer's side: a GPU of its own taking the same commands, its drawing going to GL. Its
-// VRAM only gets the CPU's writes, which go to GL whole.
+// VRAM only gets the CPU's writes, which go to GL whole. With a thread of its own, the commands go to
+// it through a ring (one writer, one reader), and calls to the renderer (glrX) run there too.
+enum { JOB_FRAME = 16, JOB_CALL, GL_JOBS = 4096 };
+
 struct GpuGl {
 	struct Gpu g;
 	bool uploading;
 	int32_t ux, uy, uw, uh;
+	uint32_t writes[16];  // VRAM write words not passed on yet
+	int writeCount;
+	bool threaded;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t work, done;
+	_Atomic unsigned head, tail;  // jobs done, jobs queued
+	atomic_bool sleeping, waiting, quit;
+	struct GpuJob jobs[GL_JOBS];
 };
 
 static void glUploadDone(struct GpuGl* gl) {
@@ -1134,13 +1147,19 @@ static void executeDraw(struct Gpu* g, const uint32_t* cb, uint32_t cc);
 static void vramWrite(struct Gpu* g, uint32_t data, bool write);
 static void softResetGpu(struct Gpu* g);
 
-static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t cc) {
-	struct GpuGl* gl = p->gpuGl;
+struct GlCall {
+	void (*fn)(struct Glr*, void*);
+	void* arg;
+};
+
+static void glRunJob(struct GpuGl* gl, const struct GpuJob* j) {
 	struct Gpu* g = &gl->g;
-	g->displayMode = p->gpu.displayMode;
-	g->displayY = p->gpu.displayY;
-	g->fieldReadout = p->gpu.fieldReadout;
-	switch (type) {
+	const uint32_t* w = j->w;
+	uint32_t cc = j->cc;
+	g->displayMode = j->displayMode;
+	g->displayY = j->displayY;
+	g->fieldReadout = j->fieldReadout;
+	switch (j->type) {
 	case JOB_COMMAND:
 		glUploadDone(gl);
 		executeDraw(g, w, cc);
@@ -1156,8 +1175,10 @@ static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t 
 	case JOB_POLYLINE: commandLine(g, w, cc); break;
 	case JOB_POLYLINE_END: g->inCommand = CMD_NONE; break;
 	case JOB_VRAM_WRITE:
-		vramWrite(g, w[0], true);
-		if (g->inCommand != CMD_FBWRITE) glUploadDone(gl);
+		for (int i = 0; i < j->len; i++) {
+			vramWrite(g, w[i], true);
+			if (g->inCommand != CMD_FBWRITE) glUploadDone(gl);
+		}
 		break;
 	case JOB_GP1:
 		glUploadDone(gl);
@@ -1165,12 +1186,138 @@ static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t 
 		else if (cc == 0x01) g->inCommand = CMD_NONE;
 		else g->texDisableAllowChange = w[0] & 1;
 		break;
+	case JOB_FRAME:
+		// A transfer still going goes up as far as it has come, and again when it ends
+		if (gl->uploading) glrUpload(g->glr, g->vram, gl->ux, gl->uy, gl->uw, gl->uh);
+		glrPicture(g->glr, (int32_t) w[0], (int32_t) w[1], (int32_t) w[2], (int32_t) w[3], w[4], w[5]);
+		break;
+	case JOB_CALL: {
+		struct GlCall c;
+		memcpy(&c, w, sizeof c);
+		c.fn(g->glr, c.arg);
+		break;
+	}
 	}
 }
 
-bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, char* error, size_t errorSize) {
+static void* glThread(void* arg) {
+	struct GpuGl* gl = arg;
+	for (;;) {
+		unsigned head = atomic_load(&gl->head);
+		for (int spin = 0; spin < 2000 && head == atomic_load(&gl->tail) && !atomic_load(&gl->quit); spin++) relax();
+		if (head == atomic_load(&gl->tail)) {
+			pthread_mutex_lock(&gl->lock);
+			atomic_store(&gl->sleeping, true);
+			while (head == atomic_load(&gl->tail) && !atomic_load(&gl->quit)) pthread_cond_wait(&gl->work, &gl->lock);
+			atomic_store(&gl->sleeping, false);
+			pthread_mutex_unlock(&gl->lock);
+		}
+		if (head == atomic_load(&gl->tail)) break;
+		glRunJob(gl, &gl->jobs[head % GL_JOBS]);
+		atomic_store(&gl->head, head + 1);
+		if (atomic_load(&gl->waiting)) {
+			pthread_mutex_lock(&gl->lock);
+			pthread_cond_signal(&gl->done);
+			pthread_mutex_unlock(&gl->lock);
+		}
+	}
+	return NULL;
+}
+
+static void glWake(struct GpuGl* gl) {
+	if (atomic_load(&gl->sleeping)) {
+		pthread_mutex_lock(&gl->lock);
+		pthread_cond_signal(&gl->work);
+		pthread_mutex_unlock(&gl->lock);
+	}
+}
+
+// Everything queued is done.
+static void glWait(struct GpuGl* gl) {
+	if (!gl->threaded) return;
+	unsigned tail = atomic_load(&gl->tail);
+	if (atomic_load(&gl->head) == tail) return;
+	glWake(gl);
+	for (int spin = 0; spin < 2000 && atomic_load(&gl->head) != tail; spin++) relax();
+	if (atomic_load(&gl->head) == tail) return;
+	pthread_mutex_lock(&gl->lock);
+	atomic_store(&gl->waiting, true);
+	while (atomic_load(&gl->head) != tail) pthread_cond_wait(&gl->done, &gl->lock);
+	atomic_store(&gl->waiting, false);
+	pthread_mutex_unlock(&gl->lock);
+}
+
+static void glPublish(struct GpuGl* gl, const struct GpuJob* j) {
+	if (!gl->threaded) {
+		glRunJob(gl, j);
+		return;
+	}
+	unsigned tail = atomic_load(&gl->tail);
+	while (tail - atomic_load(&gl->head) == GL_JOBS) {
+		glWake(gl);
+		sched_yield();
+	}
+	gl->jobs[tail % GL_JOBS] = *j;
+	atomic_store(&gl->tail, tail + 1);
+	// The thread is woken for a batch, not each job
+	if (tail + 1 - atomic_load(&gl->head) >= 64) glWake(gl);
+}
+
+static void glFlushWrites(struct GpuGl* gl) {
+	if (!gl->writeCount) return;
+	struct GpuJob j = { JOB_VRAM_WRITE, (uint8_t) gl->writeCount, false, 0, gl->g.displayMode, gl->g.displayY, { 0 } };
+	memcpy(j.w, gl->writes, (size_t) gl->writeCount * 4);
+	gl->writeCount = 0;
+	glPublish(gl, &j);
+}
+
+static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t cc) {
+	struct GpuGl* gl = p->gpuGl;
+	if (type == JOB_VRAM_WRITE) {
+		gl->writes[gl->writeCount++] = w[0];
+		if (gl->writeCount == 16) glFlushWrites(gl);
+		return;
+	}
+	glFlushWrites(gl);
+	struct GpuJob j = { (uint8_t) type, (uint8_t) len, p->gpu.fieldReadout, cc, p->gpu.displayMode, p->gpu.displayY, { 0 } };
+	memcpy(j.w, w, (size_t) len * 4);
+	glPublish(gl, &j);
+}
+
+void gpuGlRun(struct Psx* p, void (*fn)(struct Glr*, void*), void* arg) {
+	struct GpuGl* gl = p->gpuGl;
+	if (!gl) return;
+	glFlushWrites(gl);
+	struct GpuJob j = { JOB_CALL, 0, false, 0, 0, 0, { 0 } };
+	struct GlCall c = { fn, arg };
+	memcpy(j.w, &c, sizeof c);
+	glPublish(gl, &j);
+	glWait(gl);
+}
+
+struct GlSetup {
+	struct GpuGl* gl;
+	struct Gles* gles;
+	int scale;
+	char* error;
+	size_t errorSize;
+};
+
+static void glSetup(struct Glr* unused, void* arg) {
+	struct GlSetup* s = arg;
+	struct Gpu* g = &s->gl->g;
+	glesUse(s->gles);
+	g->glr = glrCreate(s->gles, s->scale, s->error, s->errorSize);
+	if (g->glr) glrUpload(g->glr, g->vram, 0, 0, 1024, 512);
+}
+
+static void glTeardown(struct Glr* glr, void* arg) {
+	glrDestroy(glr);
+}
+
+bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, bool threaded, char* error, size_t errorSize) {
 	gpuGlStop(p);
-	struct GpuGl* gl = malloc(sizeof *gl);
+	struct GpuGl* gl = calloc(1, sizeof *gl);
 	if (!gl) return false;
 	const uint16_t* vram = gpuVram(p);
 	memcpy(&gl->g, &p->gpu, sizeof gl->g);
@@ -1178,36 +1325,53 @@ bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, char* error, size_t
 	memcpy(gl->g.vram, vram, sizeof gl->g.vramStore);
 	gl->g.drawPixels = true;
 	gl->g.drawParity = -1;
-	gl->uploading = false;
-	gl->g.glr = glrCreate(gles, scale, error, errorSize);
+	gl->g.glr = NULL;
+	p->gpuGl = gl;
+	if (threaded) {
+		pthread_mutex_init(&gl->lock, NULL);
+		pthread_cond_init(&gl->work, NULL);
+		pthread_cond_init(&gl->done, NULL);
+		gl->threaded = pthread_create(&gl->thread, NULL, glThread, gl) == 0;
+	}
+	struct GlSetup setup = { gl, gles, scale, error, errorSize };
+	gpuGlRun(p, glSetup, &setup);
 	if (!gl->g.glr) {
-		free(gl);
+		gpuGlStop(p);
 		return false;
 	}
-	glrUpload(gl->g.glr, gl->g.vram, 0, 0, 1024, 512);
-	p->gpuGl = gl;
 	return true;
 }
 
 void gpuGlStop(struct Psx* p) {
-	if (!p->gpuGl) return;
-	glrDestroy(p->gpuGl->g.glr);
-	free(p->gpuGl);
+	struct GpuGl* gl = p->gpuGl;
+	if (!gl) return;
+	if (gl->g.glr) gpuGlRun(p, glTeardown, NULL);
+	if (gl->threaded) {
+		pthread_mutex_lock(&gl->lock);
+		atomic_store(&gl->quit, true);
+		pthread_cond_signal(&gl->work);
+		pthread_mutex_unlock(&gl->lock);
+		pthread_join(gl->thread, NULL);
+		pthread_mutex_destroy(&gl->lock);
+		pthread_cond_destroy(&gl->work);
+		pthread_cond_destroy(&gl->done);
+	}
+	free(gl);
 	p->gpuGl = NULL;
 }
 
 struct Glr* gpuGlFrame(struct Psx* p) {
 	struct GpuGl* gl = p->gpuGl;
 	if (!gl) return NULL;
-	// A transfer still going goes up as far as it has come, and again when it ends
-	if (gl->uploading) glrUpload(gl->g.glr, gl->g.vram, gl->ux, gl->uy, gl->uw, gl->uh);
 	const struct Gpu* g = &p->gpu;
 	static const int32_t widths[4] = { 256, 320, 512, 640 };
 	int32_t width = (g->displayMode & 0x40) ? 368 : widths[g->displayMode & 3];
 	int32_t height = (int32_t) g->vEnd - (int32_t) g->vStart;
 	if (height <= 0 || height > (p->pal ? 288 : 240)) height = p->pal ? 256 : 240;
 	if ((g->displayMode & 0x24) == 0x24) height *= 2;
-	glrPicture(gl->g.glr, (int32_t) g->displayX, (int32_t) g->displayY, width, height, g->displayMode & 0x10, g->displayOff);
+	uint32_t w[6] = { g->displayX, g->displayY, (uint32_t) width, (uint32_t) height, (g->displayMode & 0x10) != 0, g->displayOff };
+	glJob(p, JOB_FRAME, w, 6, 0);
+	glWait(gl);
 	return gl->g.glr;
 }
 
@@ -1725,7 +1889,9 @@ static void outputLine(struct Psx* p) {
 	if (g->inVblank || g->displayOff) xs = xe = 0;
 	g->lineWidth[line] = dmw - dmpa * 2;
 	bool mode24 = g->displayMode & 0x10;
-	if (p->gpuThread) {
+	// The GL renderer's picture is the one shown: the software one isn't made, unless asked for
+	if (p->gpuGl && !p->softPicture) {
+	} else if (p->gpuThread) {
 		uint32_t w[7] = { (uint32_t) (dest - g->frame), g->curLineY, (uint32_t) xs, (uint32_t) xe, (uint32_t) dmw, (uint32_t) fbx, mode24 };
 		queueJob(p, JOB_LINE, w, 7, 0);
 	} else {

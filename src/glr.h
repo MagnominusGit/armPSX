@@ -60,6 +60,9 @@ unsigned glrPictureFramebuffer(struct Glr*, int* width, int* height);
 void glrReadPicture(struct Glr*, uint32_t* pixels);
 // The picture copied to framebuffer (a frontend's): bottom row first, or with flip false top row first.
 void glrShow(struct Glr*, unsigned framebuffer, bool flip);
+// Counts of what the renderer asked of GL (for tests).
+enum { GLR_FRAMES, GLR_FLUSHES, GLR_DRAWS, GLR_VERTICES, GLR_SYNCS, GLR_FILLS, GLR_COPIES, GLR_UPLOADS, GLR_STATS };
+void glrStats(struct Glr*, uint64_t stats[GLR_STATS]);
 // Where primitives are listed as they come (for tests), or NULL.
 extern FILE* glrLogFile;
 // VRAM as drawn, at 1x (for tests).

@@ -181,7 +181,8 @@ static void hwReset(void) {
 	char error[256] = "";
 	glScale = scaleOption();
 	gles = glesCreateContext(error, sizeof error);
-	if (!gles || !gpuGlStart(psx, gles, glScale, error, sizeof error)) {
+	// The frontend's context is current on the emulation's thread only: the renderer runs there
+	if (!gles || !gpuGlStart(psx, gles, glScale, false, error, sizeof error)) {
 		log_cb(RETRO_LOG_ERROR, "armPSX: OpenGL renderer: %s; the software renderer's picture is shown\n", error);
 		return;
 	}
@@ -234,7 +235,8 @@ static void vulkanReset(void) {
 	glesUseVulkan(true);
 	glScale = scaleOption();
 	gles = glesCreateContext(error, sizeof error);
-	if (!gles || !gpuGlStart(psx, gles, glScale, error, sizeof error)) {
+	// vkgl's GL can be used from any thread: the renderer has one of its own
+	if (!gles || !gpuGlStart(psx, gles, glScale, true, error, sizeof error)) {
 		log_cb(RETRO_LOG_ERROR, "armPSX: Vulkan renderer: %s; the software renderer's picture is shown\n", error);
 		return;
 	}
@@ -303,6 +305,24 @@ static bool askContext(void) {
 	if (environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) return true;
 	hw.context_type = RETRO_HW_CONTEXT_NONE;
 	return false;
+}
+
+// The picture into the frontend's framebuffer (or, with Vulkan, image), where the renderer's GL is.
+static void show(struct Glr* glr, void* arg) {
+	int w, h;
+	glrPictureFramebuffer(glr, &w, &h);
+#ifdef ARMPSX_VULKAN
+	if (hw.context_type == RETRO_HW_CONTEXT_VULKAN) {
+		glrShow(glr, vkglFrontendFramebuffer(w, h), false);
+		struct retro_vulkan_image image;
+		VkImage handle;
+		if (vulkan && vkglPicture(&handle, &image.image_view, &image.image_layout, &image.create_info)) {
+			vulkan->set_image(vulkan->handle, &image, 0, NULL, vulkan->queue_index);
+		}
+		return;
+	}
+#endif
+	glrShow(glr, (unsigned) hw.get_current_framebuffer(), true);
 }
 
 bool retro_load_game(const struct retro_game_info* game) {
@@ -400,7 +420,9 @@ void retro_run(void) {
 			gpuGlStop(psx);
 			char error[256] = "";
 			glScale = scaleOption();
-			if (!gpuGlStart(psx, gles, glScale, error, sizeof error)) log_cb(RETRO_LOG_ERROR, "armPSX: renderer: %s\n", error);
+			if (!gpuGlStart(psx, gles, glScale, hw.context_type == RETRO_HW_CONTEXT_VULKAN, error, sizeof error)) {
+				log_cb(RETRO_LOG_ERROR, "armPSX: renderer: %s\n", error);
+			}
 		}
 	}
 	struct Glr* glr = gpuGlFrame(psx);
@@ -413,17 +435,7 @@ void retro_run(void) {
 			lastW = w;
 			lastH = h;
 		}
-#ifdef ARMPSX_VULKAN
-		if (hw.context_type == RETRO_HW_CONTEXT_VULKAN) {
-			glrShow(glr, vkglFrontendFramebuffer(w, h), false);
-			struct retro_vulkan_image image;
-			VkImage handle;
-			if (vulkan && vkglPicture(&handle, &image.image_view, &image.image_layout, &image.create_info)) {
-				vulkan->set_image(vulkan->handle, &image, 0, NULL, vulkan->queue_index);
-			}
-		} else
-#endif
-		glrShow(glr, (unsigned) hw.get_current_framebuffer(), true);
+		gpuGlRun(psx, show, &hw);
 		video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
 		int n = spuSamples(audio);
 		if (n > 0) audio_batch_cb(audio, n);
