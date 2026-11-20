@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "psx.h"
+#include "glr.h"
 
 #define ALWAYS static inline __attribute__((always_inline))
 
@@ -364,28 +365,30 @@ static void roughTriangle(struct Gpu* g, const struct GpuVertex* v, bool gouraud
 	else g->drawTime -= (int32_t) pixels;
 }
 
+// Sorts the vertices top to bottom; the one the interpolation starts from.
+static unsigned sortTriangle(struct GpuVertex* v) {
+	unsigned cv = 0;
+	if (v[1].x <= v[0].x) cv = v[2].x <= v[1].x ? 4 : 2;
+	else if (v[2].x < v[0].x) cv = 4;
+	else cv = 1;
+	if (v[2].y < v[1].y) {
+		swapVertex(&v[2], &v[1]);
+		cv = ((cv >> 1) & 2) | ((cv << 1) & 4) | (cv & 1);
+	}
+	if (v[1].y < v[0].y) {
+		swapVertex(&v[1], &v[0]);
+		cv = ((cv >> 1) & 1) | ((cv << 1) & 2) | (cv & 4);
+	}
+	if (v[2].y < v[1].y) {
+		swapVertex(&v[2], &v[1]);
+		cv = ((cv >> 1) & 2) | ((cv << 1) & 4) | (cv & 1);
+	}
+	return cv >> 1;
+}
+
 ALWAYS void drawTriangle(struct Gpu* g, bool draw, struct GpuVertex* v, bool gouraud, bool textured, int blend, bool texMult, int texMode, bool maskEval) {
 	struct Deltas d;
-	unsigned core;
-	{
-		unsigned cv = 0;
-		if (v[1].x <= v[0].x) cv = v[2].x <= v[1].x ? 4 : 2;
-		else if (v[2].x < v[0].x) cv = 4;
-		else cv = 1;
-		if (v[2].y < v[1].y) {
-			swapVertex(&v[2], &v[1]);
-			cv = ((cv >> 1) & 2) | ((cv << 1) & 4) | (cv & 1);
-		}
-		if (v[1].y < v[0].y) {
-			swapVertex(&v[1], &v[0]);
-			cv = ((cv >> 1) & 1) | ((cv << 1) & 2) | (cv & 4);
-		}
-		if (v[2].y < v[1].y) {
-			swapVertex(&v[2], &v[1]);
-			cv = ((cv >> 1) & 2) | ((cv << 1) & 4) | (cv & 1);
-		}
-		core = cv >> 1;
-	}
+	unsigned core = sortTriangle(v);
 	if (v[0].y == v[2].y || v[2].y - v[0].y >= 512) return;
 	if (abs(v[2].x - v[0].x) >= 1024 || abs(v[2].x - v[1].x) >= 1024 || abs(v[1].x - v[0].x) >= 1024) return;
 	if (!draw && g->roughTime) {
@@ -530,6 +533,38 @@ static void setTpage(struct Gpu* g, uint32_t w) {
 	recalcWindow(g);
 }
 
+static int glSkip(const struct Gpu* g) {
+	return (g->displayMode & 0x24) == 0x24 && !g->drawDisplayed ? (int) ((g->displayY + g->fieldReadout) & 1) : -1;
+}
+
+static struct GlrState glState(const struct Gpu* g, int blend, int texMode, uint32_t clut) {
+	return (struct GlrState) { g->clipX0, g->clipY0, g->clipX1, g->clipY1, g->texPageX, g->texPageY, (uint32_t) texMode,
+		g->tww, g->twh, g->twx, g->twy, g->maskSet != 0, g->maskEval != 0, g->dither, blend, clut, glSkip(g) };
+}
+
+static void glTriangle(struct Gpu* g, struct GpuVertex* v, bool gouraud, bool textured, int blend, bool texMult, int texMode, uint32_t clut) {
+	unsigned core = sortTriangle(v);
+	if (v[0].y == v[2].y || v[2].y - v[0].y >= 512) return;
+	if (abs(v[2].x - v[0].x) >= 1024 || abs(v[2].x - v[1].x) >= 1024 || abs(v[1].x - v[0].x) >= 1024) return;
+	struct Deltas d = { 0 };
+	if (!deltas(&d, &v[0], &v[1], &v[2], gouraud, textured)) return;
+	struct Interp ig = { 0 };
+	if (textured) {
+		ig.u = ((v[core].u << COORD_FBS) + (1 << (COORD_FBS - 1))) << COORD_POST_PADDING;
+		ig.v = ((v[core].v << COORD_FBS) + (1 << (COORD_FBS - 1))) << COORD_POST_PADDING;
+	}
+	ig.r = ((v[core].r << COORD_FBS) + (1 << (COORD_FBS - 1))) << COORD_POST_PADDING;
+	ig.g = ((v[core].g << COORD_FBS) + (1 << (COORD_FBS - 1))) << COORD_POST_PADDING;
+	ig.b = ((v[core].b << COORD_FBS) + (1 << (COORD_FBS - 1))) << COORD_POST_PADDING;
+	addDx(&ig, &d, -v[core].x, gouraud, textured);
+	addDy(&ig, &d, -v[core].y, gouraud, textured);
+	struct GlrPlane planes[5] = { { ig.u, d.dudx, d.dudy }, { ig.v, d.dvdx, d.dvdy }, { ig.r, d.drdx, d.drdy },
+	                              { ig.g, d.dgdx, d.dgdy }, { ig.b, d.dbdx, d.dbdy } };
+	int32_t xy[3][2] = { { v[0].x, v[0].y }, { v[1].x, v[1].y }, { v[2].x, v[2].y } };
+	struct GlrState s = glState(g, blend, texMode, clut);
+	glrTriangle(g->glr, &s, xy, planes, textured, textured && !texMult, g->dither && (textured ? texMult : gouraud));
+}
+
 static void commandPolygon(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	bool quad = cc & 8, gouraud = cc & 0x10, textured = cc & 4;
 	int blend = cc & 2 ? (int) g->abr : -1;
@@ -538,7 +573,7 @@ static void commandPolygon(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	bool maskEval = g->maskEval;
 	struct GpuVertex v[3];
 	unsigned sv = 0;
-	uint32_t cb0 = cb[0];
+	uint32_t cb0 = cb[0], clut = 0;
 	g->drawTime -= quad && g->inCommand == CMD_QUAD ? 28 + 18 : 64 + 18;
 	if (gouraud && textured) g->drawTime -= 150 * 3;
 	else if (gouraud) g->drawTime -= 96 * 3;
@@ -546,6 +581,7 @@ static void commandPolygon(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	if (quad && g->inCommand == CMD_QUAD) {
 		v[0] = g->quad[1];
 		v[1] = g->quad[2];
+		clut = g->quadClut;
 		sv = 2;
 	}
 	for (unsigned i = sv; i < 3; i++) {
@@ -565,7 +601,10 @@ static void commandPolygon(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 		if (textured) {
 			v[i].u = *cb & 0xFF;
 			v[i].v = (*cb >> 8) & 0xFF;
-			if (i == 0) updateClut(g, g->drawPixels, texMode, (*cb >> 16) & 0xFFFF);
+			if (i == 0) {
+				clut = (*cb >> 16) & 0xFFFF;
+				updateClut(g, g->drawPixels, texMode, clut);
+			}
 			cb++;
 		}
 	}
@@ -576,9 +615,11 @@ static void commandPolygon(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 			g->inCommand = CMD_QUAD;
 			g->inCommandCode = cb0 >> 24;
 			memcpy(g->quad, v, sizeof g->quad);
+			g->quadClut = clut;
 		}
 	}
-	if (textured) triangleTextured(g, v, gouraud, blend, texMult, texMode, maskEval);
+	if (g->glr) glTriangle(g, v, gouraud, textured, blend, texMult, texMode, clut);
+	else if (textured) triangleTextured(g, v, gouraud, blend, texMult, texMode, maskEval);
 	else triangleUntextured(g, v, gouraud, blend, maskEval);
 }
 
@@ -680,6 +721,7 @@ static void commandSprite(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	int texMode = g->texMode < 2 ? g->texMode : 2;
 	int32_t x, y, w, h;
 	uint8_t u = 0, v = 0;
+	uint32_t clut = 0;
 	g->drawTime -= 16;
 	uint32_t color = *cb & 0xFFFFFF;
 	cb++;
@@ -689,7 +731,8 @@ static void commandSprite(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	if (textured) {
 		u = *cb & 0xFF;
 		v = (*cb >> 8) & 0xFF;
-		updateClut(g, g->drawPixels, texMode, (*cb >> 16) & 0xFFFF);
+		clut = (*cb >> 16) & 0xFFFF;
+		updateClut(g, g->drawPixels, texMode, clut);
 		cb++;
 	}
 	switch (size) {
@@ -700,7 +743,10 @@ static void commandSprite(struct Gpu* g, const uint32_t* cb, uint32_t cc) {
 	}
 	x = sx11(x + g->offX);
 	y = sx11(y + g->offY);
-	if (textured) {
+	if (g->glr) {
+		struct GlrState s = glState(g, blend, texMode, clut);
+		glrSprite(g->glr, &s, x, y, w, h, u, v, color, g->spriteFlip & 0x1000, g->spriteFlip & 0x2000, textured, !texMult || color == 0x808080);
+	} else if (textured) {
 		if (color == 0x808080) texMult = false;
 		spriteTextured(g, x, y, w, h, u, v, color, g->spriteFlip & 0x1000, g->spriteFlip & 0x2000, blend, texMult, texMode, g->maskEval);
 	} else {
@@ -722,6 +768,13 @@ static void drawLine(struct Gpu* g, struct LinePoint* pts, bool gouraud, int ble
 		pts[0] = t;
 	}
 	g->drawTime -= k * 2;
+	if (g->glr) {
+		struct GlrState s = glState(g, blend, 0, 0);
+		struct GlrVertex gv[2];
+		for (int i = 0; i < 2; i++) gv[i] = (struct GlrVertex) { pts[i].x, pts[i].y, pts[i].r, pts[i].g, pts[i].b };
+		glrLine(g->glr, &s, gv, g->dither);
+		return;
+	}
 	if (!g->drawPixels) return;
 	int64_t dxdk = 0, dydk = 0;
 	int32_t drdk = 0, dgdk = 0, dbdk = 0;
@@ -841,6 +894,10 @@ static void commandFill(struct Gpu* g, const uint32_t* cb) {
 	uint16_t value = (r >> 3) | (gr >> 3) << 5 | (b >> 3) << 10;
 	int32_t dx = cb[1] & 0x3F0, dy = (cb[1] >> 16) & 0x3FF;
 	int32_t w = ((cb[2] & 0x3FF) + 0xF) & ~0xF, h = (cb[2] >> 16) & 0x1FF;
+	if (g->glr) {
+		glrFill(g->glr, dx, dy, w, h, cb[0], glSkip(g));
+		return;
+	}
 	g->drawTime -= 46;
 	for (int32_t y = 0; y < h; y++) {
 		int32_t yy = (y + dy) & 511;
@@ -862,6 +919,10 @@ static void commandCopy(struct Gpu* g, const uint32_t* cb) {
 	int32_t w = cb[3] & 0x3FF, h = (cb[3] >> 16) & 0x1FF;
 	if (!w) w = 0x400;
 	if (!h) h = 0x200;
+	if (g->glr) {
+		glrCopy(g->glr, sx, sy, dx, dy, w, h, g->maskSet != 0, g->maskEval != 0);
+		return;
+	}
 	invalidateTexCache(g);
 	g->drawTime -= w * h * 2;
 	for (int32_t y = 0; y < h && g->drawPixels && g->drawParity != 1; y++) {
@@ -1016,7 +1077,10 @@ static void flushWrites(struct Psx* p) {
 	publish(t, &j);
 }
 
+static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t cc);
+
 static void queueJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t cc) {
+	if (p->gpuGl) glJob(p, type, w, len, cc);
 	struct GpuThread* t = p->gpuThread;
 	if (!t) return;
 	if (type == JOB_VRAM_WRITE) {
@@ -1050,6 +1114,101 @@ void gpuSync(struct Psx* p) {
 const uint16_t* gpuVram(struct Psx* p) {
 	gpuSync(p);
 	return p->gpuThread ? p->gpuThread->g.vram : p->gpu.vram;
+}
+
+// The GL renderer's side: a GPU of its own taking the same commands, its drawing going to GL. Its
+// VRAM only gets the CPU's writes, which go to GL whole.
+struct GpuGl {
+	struct Gpu g;
+	bool uploading;
+	int32_t ux, uy, uw, uh;
+};
+
+static void glUploadDone(struct GpuGl* gl) {
+	if (!gl->uploading) return;
+	gl->uploading = false;
+	glrUpload(gl->g.glr, gl->g.vram, gl->ux, gl->uy, gl->uw, gl->uh);
+}
+
+static void executeDraw(struct Gpu* g, const uint32_t* cb, uint32_t cc);
+static void vramWrite(struct Gpu* g, uint32_t data, bool write);
+static void softResetGpu(struct Gpu* g);
+
+static void glJob(struct Psx* p, int type, const uint32_t* w, int len, uint32_t cc) {
+	struct GpuGl* gl = p->gpuGl;
+	struct Gpu* g = &gl->g;
+	g->displayMode = p->gpu.displayMode;
+	g->displayY = p->gpu.displayY;
+	g->fieldReadout = p->gpu.fieldReadout;
+	switch (type) {
+	case JOB_COMMAND:
+		glUploadDone(gl);
+		executeDraw(g, w, cc);
+		if (cc >= 0xA0 && cc < 0xC0 && g->inCommand == CMD_FBWRITE) {
+			gl->uploading = true;
+			gl->ux = (int32_t) g->rwX;
+			gl->uy = (int32_t) g->rwY;
+			gl->uw = (int32_t) g->rwW;
+			gl->uh = (int32_t) g->rwH;
+		}
+		break;
+	case JOB_QUAD: commandPolygon(g, w, cc); break;
+	case JOB_POLYLINE: commandLine(g, w, cc); break;
+	case JOB_POLYLINE_END: g->inCommand = CMD_NONE; break;
+	case JOB_VRAM_WRITE:
+		vramWrite(g, w[0], true);
+		if (g->inCommand != CMD_FBWRITE) glUploadDone(gl);
+		break;
+	case JOB_GP1:
+		glUploadDone(gl);
+		if (cc == 0x00) softResetGpu(g);
+		else if (cc == 0x01) g->inCommand = CMD_NONE;
+		else g->texDisableAllowChange = w[0] & 1;
+		break;
+	}
+}
+
+bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, char* error, size_t errorSize) {
+	gpuGlStop(p);
+	struct GpuGl* gl = malloc(sizeof *gl);
+	if (!gl) return false;
+	const uint16_t* vram = gpuVram(p);
+	memcpy(&gl->g, &p->gpu, sizeof gl->g);
+	gl->g.vram = gl->g.vramStore;
+	memcpy(gl->g.vram, vram, sizeof gl->g.vramStore);
+	gl->g.drawPixels = true;
+	gl->g.drawParity = -1;
+	gl->uploading = false;
+	gl->g.glr = glrCreate(gles, scale, error, errorSize);
+	if (!gl->g.glr) {
+		free(gl);
+		return false;
+	}
+	glrUpload(gl->g.glr, gl->g.vram, 0, 0, 1024, 512);
+	p->gpuGl = gl;
+	return true;
+}
+
+void gpuGlStop(struct Psx* p) {
+	if (!p->gpuGl) return;
+	glrDestroy(p->gpuGl->g.glr);
+	free(p->gpuGl);
+	p->gpuGl = NULL;
+}
+
+struct Glr* gpuGlFrame(struct Psx* p) {
+	struct GpuGl* gl = p->gpuGl;
+	if (!gl) return NULL;
+	// A transfer still going goes up as far as it has come, and again when it ends
+	if (gl->uploading) glrUpload(gl->g.glr, gl->g.vram, gl->ux, gl->uy, gl->uw, gl->uh);
+	const struct Gpu* g = &p->gpu;
+	static const int32_t widths[4] = { 256, 320, 512, 640 };
+	int32_t width = (g->displayMode & 0x40) ? 368 : widths[g->displayMode & 3];
+	int32_t height = (int32_t) g->vEnd - (int32_t) g->vStart;
+	if (height <= 0 || height > (p->pal ? 288 : 240)) height = p->pal ? 256 : 240;
+	if ((g->displayMode & 0x24) == 0x24) height *= 2;
+	glrPicture(gl->g.glr, (int32_t) g->displayX, (int32_t) g->displayY, width, height, g->displayMode & 0x10, g->displayOff);
+	return gl->g.glr;
 }
 
 static void executeDraw(struct Gpu* g, const uint32_t* cb, uint32_t cc) {

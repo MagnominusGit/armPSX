@@ -76,6 +76,7 @@ struct Gpu {
 	int inCommand;  // 0 none, 1 VRAM write, 2 VRAM read, 4 quad's second triangle, 8 polyline
 	uint32_t inCommandCode;
 	struct GpuVertex quad[3];
+	uint32_t quadClut;  // the quad's CLUT field, for its second triangle
 	struct GpuVertex lineLast;
 	uint32_t rwX, rwY, rwW, rwH, rwCurX, rwCurY;
 	uint32_t displayX, displayY, hStart, hEnd, vStart, vEnd, displayMode;
@@ -90,6 +91,7 @@ struct Gpu {
 	bool drawPixels;  // false while another thread draws: this GPU only takes drawing's time
 	bool roughTime;   // Fast and Balanced modes: drawing's time from each primitive's size, without the texture cache
 	int8_t drawParity;  // a Fast mode drawing thread's lines (0 even, 1 odd), or -1 for all
+	struct Glr* glr;  // the GL renderer this GPU's drawing goes to, instead of its VRAM
 	uint8_t ditherLut[4][4][512];
 	// The picture, as Mednafen makes it: 768 wide, up to 576 lines, with the line widths
 	uint32_t frame[576 * 768];
@@ -124,6 +126,8 @@ struct Sio {
 
 struct Disc;
 struct GpuThread;
+struct GpuGl;
+struct Gles;
 
 // How closely the emulation follows the hardware: Fast (the default) as PCSX-ReARMed does, Balanced as
 // SwanStation does, Exact as Mednafen does.
@@ -145,6 +149,7 @@ struct Psx {
 	bool vblank, hretrace;
 	struct Gpu gpu;
 	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
+	struct GpuGl* gpuGl;  // the GL renderer's side, drawing the picture as well
 	int mode;  // MODE_*, from PSX_MODE (fast, balanced or exact) or the frontend
 	uint8_t codePage[RAM_SIZE >> 12];  // 4 KB pages of RAM the Fast mode's recompiled code came from
 	struct Sio sio;
@@ -233,6 +238,11 @@ void gpuReset(struct Psx* p);
 void gpuSync(struct Psx* p);
 void gpuFree(struct Psx* p);
 const uint16_t* gpuVram(struct Psx* p);
+// The GL renderer (on gles's context, current while the emulation runs) drawing the picture at
+// scale; gpuGlFrame makes the frame's picture (glr.h reads it).
+bool gpuGlStart(struct Psx* p, struct Gles* gles, int scale, char* error, size_t errorSize);
+void gpuGlStop(struct Psx* p);
+struct Glr* gpuGlFrame(struct Psx* p);
 uint32_t gpuRead(struct Psx* p, uint32_t address);
 void gpuWrite(struct Psx* p, uint32_t address, uint32_t value);
 void gpuGp0(struct Psx* p, uint32_t word);

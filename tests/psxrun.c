@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include "psx.h"
 #include "disc.h"
+#include "gles.h"
+#include "glr.h"
 
 // psxrun bios frames [exe]: runs headless; PSXRUN_SHOTS=dir/prefix saves pictures at PSXRUN_AT=frame,frame...
 // PSXRUN_PRESS="from-to:buttons,..." holds pad 1 buttons (hex, pad order: 0x0008 Start, 0x4000 Cross,
@@ -129,6 +131,35 @@ static void savePpm(struct Psx* p, const char* path) {
 	fclose(f);
 }
 
+static void saveVram(const uint16_t* pixels, const char* path) {
+	FILE* f = fopen(path, "wb");
+	if (!f) return;
+	fprintf(f, "P6\n1024 512\n255\n");
+	for (int i = 0; i < 1024 * 512; i++) {
+		uint16_t c = pixels[i];
+		uint8_t rgb[3] = { (uint8_t) ((c & 31) << 3), (uint8_t) (((c >> 5) & 31) << 3), (uint8_t) (((c >> 10) & 31) << 3) };
+		fwrite(rgb, 1, 3, f);
+	}
+	fclose(f);
+}
+
+static void saveGlPicture(struct Glr* glr, const char* path) {
+	int w, h;
+	glrPictureFramebuffer(glr, &w, &h);
+	uint32_t* pixels = malloc((size_t) w * h * 4);
+	FILE* f = pixels ? fopen(path, "wb") : NULL;
+	if (f) {
+		glrReadPicture(glr, pixels);
+		fprintf(f, "P6\n%d %d\n255\n", w, h);
+		for (int i = 0; i < w * h; i++) {
+			uint8_t rgb[3] = { pixels[i] >> 16, pixels[i] >> 8, pixels[i] };
+			fwrite(rgb, 1, 3, f);
+		}
+		fclose(f);
+	}
+	free(pixels);
+}
+
 int main(int argc, char** argv) {
 	if (argc < 3) {
 		fprintf(stderr, "usage: psxrun bios frames [exe]\n");
@@ -179,12 +210,47 @@ int main(int argc, char** argv) {
 		p->pcRing = calloc(256, 4);
 		p->pcStop = strtoul(getenv("PSXRUN_PCSTOP"), NULL, 16);
 	}
+	// PSX_RENDERER=gl: the GL renderer draws a picture as well (PSX_SCALE times), saved next to the
+	// software one (prefix-gl-frame.ppm); PSXRUN_GLVRAM=file saves its VRAM at the end.
+	struct Gles* gles = NULL;
+	if (getenv("PSX_RENDERER") && !strcmp(getenv("PSX_RENDERER"), "gl")) {
+		char error[256] = "";
+		gles = glesCreateContext(error, sizeof error);
+		if (!gles || !gpuGlStart(p, gles, getenv("PSX_SCALE") ? atoi(getenv("PSX_SCALE")) : 1, error, sizeof error)) {
+			fprintf(stderr, "GL renderer: %s\n", error);
+			return 1;
+		}
+		fprintf(stderr, "GL renderer on %s\n", glesRenderer(gles));
+	}
 	if (getenv("PSXRUN_PROF")) profStart();
 	int traceAt = getenv("PSXRUN_TRACE_AT") ? atoi(getenv("PSXRUN_TRACE_AT")) : -1;
 	for (int i = 1; i <= frames; i++) {
 		p->sio.pad[0].buttons = pressed(getenv("PSXRUN_PRESS"), i);
 		if (i == traceAt) p->traceIo = getenv("PSXRUN_TRACE_N") ? atoi(getenv("PSXRUN_TRACE_N")) : 200;
+		// PSXRUN_GLLOG=file: the GL primitives of the last frame; with PSXRUN_GLCHECK=n, of the first
+		// frame after which GL's VRAM has more than n pixels unlike the software renderer's (then stops).
+		const char* glLog = getenv("PSXRUN_GLLOG");
+		bool glCheck = p->gpuGl && getenv("PSXRUN_GLCHECK");
+		if (glLog && (i == frames || glCheck)) glrLogFile = fopen(glLog, "w");
 		psxRunFrame(p);
+		struct Glr* glr = gpuGlFrame(p);
+		if (glrLogFile) {
+			fclose(glrLogFile);
+			glrLogFile = NULL;
+		}
+		if (glCheck) {
+			static uint16_t glVram[1024 * 512];
+			glrReadVram(glr, glVram);
+			const uint16_t* sw = gpuVram(p);
+			int differ = 0;
+			for (int k = 0; k < 1024 * 512; k++) differ += (glVram[k] & 0x7FFF) != (sw[k] & 0x7FFF);
+			if (differ > atoi(getenv("PSXRUN_GLCHECK"))) {
+				fprintf(stderr, "frame %d: %d pixels differ\n", i, differ);
+				saveVram(sw, "glcheck-sw.ppm");
+				saveVram(glVram, "glcheck-gl.ppm");
+				break;
+			}
+		}
 		int n = spuSamples(audio);
 		if (wav) {
 			fwrite(audio, 4, n, wav);
@@ -199,6 +265,10 @@ int main(int argc, char** argv) {
 				char path[512];
 				snprintf(path, sizeof path, "%s-%05d.ppm", shots, i);
 				savePpm(p, path);
+				if (glr) {
+					snprintf(path, sizeof path, "%s-gl-%05d.ppm", shots, i);
+					saveGlPicture(glr, path);
+				}
 			}
 		}
 		const char* ram = getenv("PSXRUN_RAM");
@@ -219,18 +289,11 @@ int main(int argc, char** argv) {
 	clock_gettime(CLOCK_MONOTONIC, &wallEnd);
 	double secs = (double) (wallEnd.tv_sec - wallStart.tv_sec) + (wallEnd.tv_nsec - wallStart.tv_nsec) / 1e9;
 	const char* vram = getenv("PSXRUN_VRAM");
-	if (vram) {
-		FILE* f = fopen(vram, "wb");
-		if (f) {
-			const uint16_t* pixels = gpuVram(p);
-			fprintf(f, "P6\n1024 512\n255\n");
-			for (int i = 0; i < 1024 * 512; i++) {
-				uint16_t c = pixels[i];
-				uint8_t rgb[3] = { (uint8_t) ((c & 31) << 3), (uint8_t) (((c >> 5) & 31) << 3), (uint8_t) (((c >> 10) & 31) << 3) };
-				fwrite(rgb, 1, 3, f);
-			}
-			fclose(f);
-		}
+	if (vram) saveVram(gpuVram(p), vram);
+	if (p->gpuGl && getenv("PSXRUN_GLVRAM")) {
+		static uint16_t glVram[1024 * 512];
+		glrReadVram(gpuGlFrame(p), glVram);
+		saveVram(glVram, getenv("PSXRUN_GLVRAM"));
 	}
 	if (wav) {
 		uint32_t riff = wavBytes + 36;

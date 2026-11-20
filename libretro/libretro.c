@@ -7,6 +7,8 @@
 #include "libretro.h"
 #include "psx.h"
 #include "disc.h"
+#include "gles.h"
+#include "glr.h"
 
 static retro_environment_t environ_cb;
 static retro_video_refresh_t video_cb;
@@ -21,6 +23,11 @@ static int discs, discIndex;
 static bool trayOpen;
 static uint32_t* picture;
 static int16_t audio[4096 * 2];
+// The GL renderer, in the frontend's context
+static struct retro_hw_render_callback hw;
+static struct Gles* gles;
+static int glScale = 1;
+static int lastW, lastH;
 
 static void logf_(enum retro_log_level level, const char* fmt, ...) {
 }
@@ -42,8 +49,8 @@ void retro_get_system_av_info(struct retro_system_av_info* info) {
 	bool pal = psx && psx->pal;
 	info->geometry.base_width = 320;
 	info->geometry.base_height = pal ? 288 : 240;
-	info->geometry.max_width = 768;
-	info->geometry.max_height = 576;
+	info->geometry.max_width = hw.context_type ? 1024 * 8 : 768;
+	info->geometry.max_height = hw.context_type ? 576 * 8 : 576;
 	info->geometry.aspect_ratio = 4.0f / 3.0f;
 	// Mednafen's rates: 53693182 / (3412.5 * 262.5) NTSC, 53203425 / (3405 * 312.5) PAL
 	info->timing.fps = pal ? 53203425.0 / (3405.0 * 312.5) : 53693182.0 / (3412.5 * 262.5);
@@ -105,6 +112,8 @@ void retro_set_environment(retro_environment_t cb) {
 	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
 	static const struct retro_variable options[] = {
 		{ "armpsx_mode", "Mode (restart); Fast|Balanced|Exact" },
+		{ "armpsx_renderer", "Renderer (restart); Software|OpenGL" },
+		{ "armpsx_resolution", "Internal resolution (OpenGL); 1x|2x|3x|4x|5x|6x|7x|8x" },
 		{ NULL, NULL },
 	};
 	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*) options);
@@ -153,6 +162,54 @@ static bool hasExtension(const char* path, const char* ext) {
 	return n > e && !strcasecmp(path + n - e, ext);
 }
 
+static void* glProc(const char* name) {
+	return (void*) hw.get_proc_address(name);
+}
+
+static int scaleOption(void) {
+	struct retro_variable v = { "armpsx_resolution", NULL };
+	return environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &v) && v.value ? atoi(v.value) : 1;
+}
+
+// The frontend made the context (again): the GL renderer starts in it, from VRAM as it is.
+static void hwReset(void) {
+	glesFrontend(glProc);
+	char error[256] = "";
+	glScale = scaleOption();
+	gles = glesCreateContext(error, sizeof error);
+	if (!gles || !gpuGlStart(psx, gles, glScale, error, sizeof error)) {
+		log_cb(RETRO_LOG_ERROR, "armPSX: OpenGL renderer: %s; the software renderer's picture is shown\n", error);
+		return;
+	}
+	log_cb(RETRO_LOG_INFO, "armPSX: OpenGL renderer on %s at %dx\n", glesRenderer(gles), glScale);
+}
+
+static void hwDestroy(void) {
+	if (psx) gpuGlStop(psx);
+	glesDestroy(gles);
+	gles = NULL;
+}
+
+// A context like the frontend's: GLES 3.0, or a 3.3 core profile (it runs GLSL ES 3.00 shaders).
+static bool askContext(void) {
+	unsigned preferred = RETRO_HW_CONTEXT_NONE;
+	environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
+	bool core = preferred == RETRO_HW_CONTEXT_OPENGL_CORE || preferred == RETRO_HW_CONTEXT_OPENGL;
+	hw = (struct retro_hw_render_callback) { 0 };
+	hw.context_type = core ? RETRO_HW_CONTEXT_OPENGL_CORE : RETRO_HW_CONTEXT_OPENGLES3;
+	hw.version_major = 3;
+	hw.version_minor = core ? 3 : 0;
+	hw.context_reset = hwReset;
+	hw.context_destroy = hwDestroy;
+	hw.bottom_left_origin = true;
+	if (environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) return true;
+	hw.context_type = core ? RETRO_HW_CONTEXT_OPENGLES3 : RETRO_HW_CONTEXT_OPENGL_CORE;
+	hw.version_minor = core ? 0 : 3;
+	if (environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) return true;
+	hw.context_type = RETRO_HW_CONTEXT_NONE;
+	return false;
+}
+
 bool retro_load_game(const struct retro_game_info* game) {
 	if (!game || !game->path) return false;
 	enum retro_pixel_format format = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -191,6 +248,11 @@ bool retro_load_game(const struct retro_game_info* game) {
 	}
 	sioFormatCard(&psx->sio.card[0]);
 	psxReset(psx);
+	struct retro_variable renderer = { "armpsx_renderer", NULL };
+	hw.context_type = RETRO_HW_CONTEXT_NONE;
+	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &renderer) && renderer.value && !strcmp(renderer.value, "OpenGL") && !askContext()) {
+		log_cb(RETRO_LOG_WARN, "armPSX: the frontend has no OpenGL context for the core; the software renderer draws\n");
+	}
 	return true;
 }
 
@@ -231,6 +293,28 @@ void retro_run(void) {
 	psx->sio.pad[0].buttons = readPad(0);
 	psx->sio.pad[1].buttons = readPad(1);
 	psxRunFrame(psx);
+	if (psx->gpuGl) {
+		if (scaleOption() != glScale) {
+			hwDestroy();
+			hwReset();
+		}
+	}
+	struct Glr* glr = gpuGlFrame(psx);
+	if (glr) {
+		int w, h;
+		glrPictureFramebuffer(glr, &w, &h);
+		glrShow(glr, (unsigned) hw.get_current_framebuffer());
+		if (w != lastW || h != lastH) {
+			struct retro_game_geometry g = { w, h, 1024 * 8, 576 * 8, 4.0f / 3.0f };
+			environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g);
+			lastW = w;
+			lastH = h;
+		}
+		video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
+		int n = spuSamples(audio);
+		if (n > 0) audio_batch_cb(audio, n);
+		return;
+	}
 	int w, h;
 	gpuDisplay(psx, picture, &w, &h);
 	if (w != 320 || h != (psx->pal ? 288 : 240)) {
