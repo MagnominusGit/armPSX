@@ -25,7 +25,6 @@ static struct Psx* psx;
 static char gamePath[4096];
 static int discs, discIndex;
 static bool trayOpen;
-static uint32_t* picture;
 static int16_t audio[4096 * 2];
 // The GL renderer, in the frontend's context
 static struct retro_hw_render_callback hw;
@@ -126,6 +125,7 @@ void retro_set_environment(retro_environment_t cb) {
 		{ "armpsx_mode", "Mode (restart); Fast|Balanced|Exact" },
 		{ "armpsx_renderer", "Renderer (restart); Software|OpenGL|Vulkan" },
 		{ "armpsx_resolution", "Internal resolution (OpenGL); 1x|2x|3x|4x|5x|6x|7x|8x" },
+		{ "armpsx_colors", "Picture colours (restart; 24-bit for movies' full colour); 16-bit|24-bit" },
 		{ "armpsx_analog_start", "DualShock starts in analog mode (restart); Off|On" },
 		{ "armpsx_analog_combo", "DualShock Analog button: hold L3+R3; On|Off" },
 		{ NULL, NULL },
@@ -145,14 +145,9 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
 	if (psx) psx->sio.pad[port].dualShock = padDualShock[port];
 }
 
-void retro_init(void) {
-	picture = calloc(768 * 576, 4);
-}
+void retro_init(void) {}
 
-void retro_deinit(void) {
-	free(picture);
-	picture = NULL;
-}
+void retro_deinit(void) {}
 
 // The first BIOS found for the disc's region, in the system folder.
 static bool loadBios(char region) {
@@ -412,9 +407,16 @@ static void showShared(int w, int h) {
 
 bool retro_load_game(const struct retro_game_info* game) {
 	if (!game || !game->path) return false;
-	enum retro_pixel_format format = RETRO_PIXEL_FORMAT_XRGB8888;
-	if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format)) return false;
+	// The picture in 16 bits unless 24 are asked for: half the bytes for the frontend to take
+	struct retro_variable colors = { "armpsx_colors", NULL };
+	bool full = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &colors) && colors.value && !strcmp(colors.value, "24-bit");
+	enum retro_pixel_format format = full ? RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;
+	if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format)) {
+		format = RETRO_PIXEL_FORMAT_XRGB8888;
+		if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format)) return false;
+	}
 	psx = psxCreate();
+	psx->picture565 = format == RETRO_PIXEL_FORMAT_RGB565;
 	struct retro_variable mode = { "armpsx_mode", NULL };
 	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &mode) && mode.value) psx->mode = psxMode(mode.value);
 	snprintf(gamePath, sizeof gamePath, "%s", game->path);
@@ -573,13 +575,15 @@ void retro_run(void) {
 		if (n > 0) audio_batch_cb(audio, n);
 		return;
 	}
-	int w, h;
-	gpuDisplay(psx, picture, &w, &h);
-	if (w != 320 || h != (psx->pal ? 288 : 240)) {
+	int w, h, pitch;
+	const void* frame = gpuPicture(psx, &w, &h, &pitch);
+	if (w != lastW || h != lastH) {
 		struct retro_game_geometry g = { w, h, 768, 576, 4.0f / 3.0f };
 		environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g);
+		lastW = w;
+		lastH = h;
 	}
-	video_cb(picture, w, h, w * 4);
+	video_cb(frame, w, h, (size_t) pitch);
 	int n = spuSamples(audio);
 	if (n > 0) audio_batch_cb(audio, n);
 }

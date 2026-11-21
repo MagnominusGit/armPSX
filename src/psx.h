@@ -159,6 +159,7 @@ struct Psx {
 	struct GpuThread* gpuThread;  // draws for the GPU, unless PSX_GPU_THREAD=0
 	struct GpuGl* gpuGl;  // the GL renderer's side, drawing the picture as well
 	bool softPicture;  // the software renderer's picture made too, with the GL renderer on
+	bool picture565;   // the picture's pixels are RGB565 (rows of FB_WIDTH of them), not XRGB8888
 	int mode;  // MODE_*, from PSX_MODE (fast, balanced or exact) or the frontend
 	uint8_t codePage[RAM_SIZE >> 12];  // 4 KB pages of RAM the Fast mode's recompiled code came from
 	struct Sio sio;
@@ -262,6 +263,8 @@ void gpuWrite(struct Psx* p, uint32_t address, uint32_t value);
 void gpuGp0(struct Psx* p, uint32_t word);
 void gpuRun(struct Psx* p);
 int gpuDisplay(struct Psx* p, uint32_t* out, int* width, int* height);
+// The picture in place, until the next frame runs: pitch bytes a row, its pixels as picture565 says.
+const void* gpuPicture(struct Psx* p, int* width, int* height, int* pitch);
 int64_t gpuNextEvent(struct Psx* p);
 uint32_t gpuDotClock(struct Psx* p);
 

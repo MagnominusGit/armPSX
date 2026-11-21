@@ -39,6 +39,8 @@ target_include_directories(armpsx PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(armpsx PUBLIC chdr-static m Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(armpsx PRIVATE -O2)
+# Hidden: inside the libretro core its functions call each other directly, not through the PLT
+set_target_properties(armpsx PROPERTIES C_VISIBILITY_PRESET hidden)
 # GCC's -O2 cost model won't vectorize the scanline output's 16- to 32-bit widening
 set_source_files_properties(src/gpu.c PROPERTIES COMPILE_OPTIONS $<$<C_COMPILER_ID:GNU>:-fvect-cost-model=dynamic>)
 

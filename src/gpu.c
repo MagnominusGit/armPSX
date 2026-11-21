@@ -1851,6 +1851,35 @@ static void outputPixels(uint32_t* restrict dest, const uint16_t* restrict src, 
 	}
 }
 
+// 15-bit pixels to RGB565 (green's 5 bits widened to 6).
+static void outputPixels565(uint16_t* restrict dest, const uint16_t* restrict src, int32_t n) {
+	for (int32_t x = 0; x < n; x++) {
+		uint32_t v = src[x], green = v >> 5 & 0x1F;
+		dest[x] = (uint16_t) ((v & 0x1F) << 11 | green << 6 | (green >> 4) << 5 | (v >> 10 & 0x1F));
+	}
+}
+
+// A line of the picture from VRAM's line src, as RGB565.
+static void linePixels565(uint16_t* dest, const uint16_t* src, int32_t xs, int32_t xe, int32_t dmw, int32_t fbx, bool mode24) {
+	for (int32_t x = 0; x < xs; x++) dest[x] = 0;
+	if (mode24) {
+		for (int32_t x = xs; x < xe; x++) {
+			uint32_t s = src[fbx >> 1] | (uint32_t) src[((fbx >> 1) + 1) & 0x7FF] << 16;
+			s >>= (fbx & 1) * 8;
+			dest[x] = (uint16_t) ((s & 0xF8) << 8 | (s >> 5 & 0x7E0) | (s >> 19 & 0x1F));
+			fbx = (fbx + 3) & 0x7FF;
+		}
+	} else if ((fbx >> 1) + (xe - xs) <= 1024) {
+		outputPixels565(dest + xs, src + (fbx >> 1), xe - xs);
+	} else {
+		for (int32_t x = xs; x < xe; x++) {
+			outputPixels565(dest + x, src + (fbx >> 1), 1);
+			fbx = (fbx + 2) & 0x7FF;
+		}
+	}
+	for (int32_t x = xe; x < dmw; x++) dest[x] = 0;
+}
+
 // A line of the picture from VRAM's line src.
 static void linePixels(uint32_t* dest, const uint16_t* src, int32_t xs, int32_t xe, int32_t dmw, int32_t fbx, bool mode24) {
 	for (int32_t x = 0; x < xs; x++) dest[x] = 0;
@@ -1881,7 +1910,7 @@ static void outputLine(struct Psx* p) {
 	if (g->scanline < first || g->scanline >= first + count || g->skip) return;
 	bool interlace = g->displayMode & 0x20;
 	int32_t line = ((g->scanline - first) << interlace) + (interlace && g->field);
-	uint32_t* dest = g->frame + line * FB_WIDTH + (DRXBO - dmpa);
+	uint32_t offset = (uint32_t) (line * FB_WIDTH + (DRXBO - dmpa));
 	int32_t fbx = g->displayX * 2, xs = g->hStart, xe = g->hEnd;
 	if (xe < xs) xe = xs;
 	uint32_t hmc = p->pal ? 560 : 520;
@@ -1899,10 +1928,12 @@ static void outputLine(struct Psx* p) {
 	// The GL renderer's picture is the one shown: the software one isn't made, unless asked for
 	if (p->gpuGl && !p->softPicture) {
 	} else if (p->gpuThread) {
-		uint32_t w[7] = { (uint32_t) (dest - g->frame), g->curLineY, (uint32_t) xs, (uint32_t) xe, (uint32_t) dmw, (uint32_t) fbx, mode24 };
+		uint32_t w[7] = { offset, g->curLineY, (uint32_t) xs, (uint32_t) xe, (uint32_t) dmw, (uint32_t) fbx, mode24 | p->picture565 << 1 };
 		queueJob(p, JOB_LINE, w, 7, 0);
+	} else if (p->picture565) {
+		linePixels565((uint16_t*) g->frame + offset, &g->vram[g->curLineY * 1024], xs, xe, dmw, fbx, mode24);
 	} else {
-		linePixels(dest, &g->vram[g->curLineY * 1024], xs, xe, dmw, fbx, mode24);
+		linePixels(g->frame + offset, &g->vram[g->curLineY * 1024], xs, xe, dmw, fbx, mode24);
 	}
 	g->frameX = DRXBO;
 	g->frameW = dmw - dmpa * 2;
@@ -2012,6 +2043,19 @@ void gpuRun(struct Psx* p) {
 	psxSchedule(p, p->cycles + next);
 }
 
+const void* gpuPicture(struct Psx* p, int* width, int* height, int* pitch) {
+	struct Gpu* g = &p->gpu;
+	gpuSync(p);
+	*width = g->frameW;
+	*height = g->frameH;
+	if (p->picture565) {
+		*pitch = FB_WIDTH * 2;
+		return (const uint16_t*) g->frame + g->frameX;
+	}
+	*pitch = FB_WIDTH * 4;
+	return g->frame + g->frameX;
+}
+
 int gpuDisplay(struct Psx* p, uint32_t* out, int* width, int* height) {
 	struct Gpu* g = &p->gpu;
 	gpuSync(p);
@@ -2039,7 +2083,9 @@ static void runJob(struct GpuThread* t, int id, const struct GpuJob* j) {
 		break;
 	case JOB_LINE:
 		if (id) break;
-		linePixels(t->frame + w[0], &g->vram[w[1] * 1024], (int32_t) w[2], (int32_t) w[3], (int32_t) w[4], (int32_t) w[5], w[6]); break;
+		if (w[6] & 2) linePixels565((uint16_t*) t->frame + w[0], &g->vram[w[1] * 1024], (int32_t) w[2], (int32_t) w[3], (int32_t) w[4], (int32_t) w[5], w[6] & 1);
+		else linePixels(t->frame + w[0], &g->vram[w[1] * 1024], (int32_t) w[2], (int32_t) w[3], (int32_t) w[4], (int32_t) w[5], w[6] & 1);
+		break;
 	case JOB_GP1:
 		if (j->cc == 0x00) softResetGpu(g);
 		else if (j->cc == 0x01) g->inCommand = CMD_NONE;
