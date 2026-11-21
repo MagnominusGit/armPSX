@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "libretro.h"
 
 static unsigned frame;
@@ -170,7 +171,12 @@ int main(int argc, char** argv) {
 	const char* ram = getenv("LR_RAM");
 	char list[1024];
 	snprintf(list, sizeof list, ",%s,", getenv("LR_AT") ? getenv("LR_AT") : "");
+	// LR_FROM=n: the speed counts from frame n on
+	int from = getenv("LR_FROM") ? atoi(getenv("LR_FROM")) : 1;
+	struct timespec start, end;
+	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (frame = 1; frame <= (unsigned) frames; frame++) {
+		if ((int) frame == from) clock_gettime(CLOCK_MONOTONIC, &start);
 		held = pressed(getenv("LR_PRESS"), frame);
 		p_retro_run();
 		char key[16];
@@ -191,5 +197,9 @@ int main(int argc, char** argv) {
 			}
 		}
 	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double secs = (double) (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	int timed = frames - (from > 1 ? from - 1 : 0);
+	fprintf(stderr, "%d frames in %.2f s (%.1f fps)\n", timed, secs, timed / secs);
 	return 0;
 }
