@@ -137,6 +137,7 @@ enum { MODE_FAST, MODE_BALANCED, MODE_EXACT };
 struct Psx {
 	struct Cpu cpu;
 	int64_t cycles;     // CPU cycles since power-on
+	uint32_t dmaSteal;  // cycles each CPU data read loses while a GPU block transfer runs (Mednafen's)
 	int64_t nextEvent;  // the earliest cycle anything besides the CPU has to run at
 	uint8_t ram[RAM_SIZE];
 	uint8_t bios[BIOS_SIZE];

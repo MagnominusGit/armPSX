@@ -191,13 +191,16 @@ static bool fallible(uint32_t instr) {
 // interpreter (whose own check comes after it), or of the last one: each fetch (5 from the ROM
 // through KSEG1, where the bus takes 4), each load's (2 more when no load came just before, the
 // bus's 3 and 2 more), and each GTE wait, at most the command before it in the block takes. The first GTE wait is the GTE's own (*gte): the check then starts
-// from when the GTE is done.
-static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, bool* gte) {
+// from when the GTE is done. *reads counts the reads, each of which a GPU block transfer may make
+// dmaSteal longer.
+static int boundFrom(struct Jit* j, struct Block* b, const bool* inl, int s, bool* gte, int* reads) {
 	int sum = 0, last = -1;
 	*gte = false;
+	*reads = 0;
 	for (int t = s; t < b->count - 1 && inl[t]; t++) {
 		uint32_t instr = b->words[t];
 		int op = instr >> 26, fn = instr & 63;
+		if ((op >= 0x20 && op <= 0x26) || op == 0x32) ++*reads;
 		if (op == 0 && (fn == 0x10 || fn == 0x12)) sum += 37;  // the longest multiply or divide
 		sum += (b->uncached ? 5 : 1) + (op >= 0x20 && op <= 0x25 ? 7 : op == 0x32 ? 6 : 0);
 		if (op == 0x12 || op == 0x32 || op == 0x3A) {
@@ -406,8 +409,9 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 	}
 	if (version != CAREFUL && !b->fast) {
 		bool gte;
-		int bound = boundFrom(j, b, inl, 0, &gte);
-		bDecline(&k, bound, gte, b->body[CAREFUL]);
+		int reads;
+		int bound = boundFrom(j, b, inl, 0, &gte, &reads);
+		bDecline(&k, bound, gte, reads, b->body[CAREFUL]);
 	}
 	int pending = version == CLEAN ? NO_LOAD : DYNAMIC;
 	struct Slow slow[BLOCK_MAX];
@@ -420,7 +424,7 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			// that missed goes on here, after its fill
 			stFlush(&k);
 			stUnknown(&k.st);
-			bCheck(&k, 0, false, i);
+			bCheck(&k, 0, false, 0, i);
 		}
 		if (i && !(a & 0xF) && !b->uncached && !b->fast) {
 			// A new cache line: on while it's as last checked
@@ -441,8 +445,9 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 			stUnknown(&k.st);
 			if (after) {
 				bool gte;
-				int bound = boundFrom(j, b, inl, i + 1, &gte);
-				bCheck(&k, bound, gte, i + 1);
+				int reads;
+				int bound = boundFrom(j, b, inl, i + 1, &gte, &reads);
+				bCheck(&k, bound, gte, reads, i + 1);
 			}
 		} else {
 			if (fallible(instr)) stFlushCycles(&k);
@@ -496,8 +501,9 @@ static uint8_t* emitBlock(struct Jit* j, struct Block* b, int version, uint8_t* 
 		if (d->commit) bCommitDynamicFast(&k);
 		if (d->after) {
 			bool gte;
-			int bound = boundFrom(j, b, inl, i + 1, &gte);
-			bCheck(&k, bound, gte, i + 1);
+			int reads;
+			int bound = boundFrom(j, b, inl, i + 1, &gte, &reads);
+			bCheck(&k, bound, gte, reads, i + 1);
 		}
 		bJumpTo(&k, d->back);
 	}

@@ -193,7 +193,7 @@ static void bPatchSlows(struct Compile* k) {
 
 // rax = the cycle count (or when the GTE is done, if that's later, with gte) plus bound, compared
 // with the limit.
-static void compareBound(struct Emitter* e, int bound, bool gte) {
+static void compareBound(struct Emitter* e, int bound, bool gte, int reads) {
 	if (gte) {
 		xLoad(e, 8, RAX, P(cpu.gteDone));
 		xAluRR(e, X_CMP, 8, R(RAX), R13);
@@ -202,20 +202,26 @@ static void compareBound(struct Emitter* e, int bound, bool gte) {
 	} else {
 		xLea(e, 8, RAX, M(R13, bound));
 	}
+	if (reads) {
+		xLoad(e, 4, RCX, P(dmaSteal));
+		movI(e, RDX, (uint32_t) reads);
+		xImul(e, 4, RCX, R(RDX));
+		xAluRR(e, X_ADD, 8, R(RAX), RCX);
+	}
 	xAluRR(e, X_CMP, 8, R(RAX), R14);
 }
 
 // On the way in: the block's careful version takes over when its instructions up to the next through
 // the interpreter could reach the limit.
-static void bDecline(struct Compile* k, int bound, bool gte, uint8_t* careful) {
-	compareBound(&k->e, bound, gte);
+static void bDecline(struct Compile* k, int bound, bool gte, int reads, uint8_t* careful) {
+	compareBound(&k->e, bound, gte, reads);
 	xJcc(&k->e, CC_GE, careful);
 }
 
 // Before instruction next: the block leaves when the ones up to the next through the interpreter
 // could reach the limit.
-static void bCheck(struct Compile* k, int bound, bool gte, int next) {
-	compareBound(&k->e, bound, gte);
+static void bCheck(struct Compile* k, int bound, bool gte, int reads, int next) {
+	compareBound(&k->e, bound, gte, reads);
 	k->stubSites[next] = xJcc(&k->e, CC_GE, NULL);
 }
 
@@ -468,6 +474,16 @@ static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr,
 
 // A load from [r15 + rdx] (RAM) or [rbx + rdx] (the scratchpad, pass 1), then the load in flight
 // as the interpreter leaves it.
+// A read from RAM: the cycles a GPU block transfer takes from it (p->dmaSteal), and its wait the next
+// instructions may hide, absorb more (the Exact mode).
+static void bSteal(struct Compile* k, int absorb) {
+	struct Emitter* e = &k->e;
+	xLoad(e, 4, RAX, P(dmaSteal));
+	xAluRR(e, X_ADD, 8, R(R13), RAX);
+	xAluI(e, X_ADD, 4, R(RAX), absorb);
+	xStore(e, 1, P(cpu.ldAbsorb), RAX);
+}
+
 static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
@@ -489,7 +505,7 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 5 + (surcharge > 0 ? surcharge : 0));
-		xStoreI(e, 1, P(cpu.ldAbsorb), 5);
+		bSteal(k, 5);
 	} else {
 		xStoreI(e, 1, P(cpu.ldAbsorb), 0);
 	}
@@ -510,7 +526,7 @@ static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		xAluI(e, X_ADD, 8, R(R13), 4 + (surcharge > 0 ? surcharge : 0));
-		xStoreI(e, 1, P(cpu.ldAbsorb), 4);
+		bSteal(k, 4);
 	} else {
 		xStoreI(e, 1, P(cpu.ldAbsorb), 0);
 	}

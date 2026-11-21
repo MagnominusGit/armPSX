@@ -158,6 +158,11 @@ static inline void aAddImm(struct Emitter* e, int rd, int rn, int32_t value, int
 }
 
 // A 64-bit add of a constant, for addresses in the machine state.
+// xd = xn * xm + xa
+static inline void aMaddX(struct Emitter* e, int rd, int rn, int rm, int ra) {
+	emit32(e, 0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+}
+
 static inline void aAddImmX(struct Emitter* e, int rd, int rn, uint32_t value) {
 	if (value < 0x1000) {
 		aDpImm(e, A_ADD_IMM | W64, rd, rn, value);

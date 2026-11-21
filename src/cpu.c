@@ -143,6 +143,7 @@ static uint32_t read32(struct Psx* p, uint32_t address) {
 		return v;
 	}
 	int64_t before = p->cycles;
+	p->cycles += p->dmaSteal;
 	v = busRead32(p, address);
 	p->cycles += 2;
 	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);
@@ -156,6 +157,7 @@ static uint32_t read16(struct Psx* p, uint32_t address) {
 		return v;
 	}
 	int64_t before = p->cycles;
+	p->cycles += p->dmaSteal;
 	uint32_t v = busRead16(p, address);
 	p->cycles += 2;
 	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);
@@ -167,6 +169,7 @@ static uint32_t read8(struct Psx* p, uint32_t address) {
 		return p->scratch[address & 0x3FF];
 	}
 	int64_t before = p->cycles;
+	p->cycles += p->dmaSteal;
 	uint32_t v = busRead8(p, address);
 	p->cycles += 2;
 	p->cpu.ldAbsorb = (uint8_t) (p->cycles - before);

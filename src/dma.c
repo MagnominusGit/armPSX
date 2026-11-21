@@ -62,6 +62,7 @@ static int wordCost(int channel, uint32_t chcr) {
 
 static void finish(struct Psx* p, int channel) {
 	struct Dma* d = &p->dma;
+	if (channel == GPU) p->dmaSteal = 0;
 	d->chcr[channel] &= ~0x11000000u;
 	if (d->dicr & 1u << (16 + channel)) {
 		d->dicr |= 1u << (24 + channel);
@@ -176,16 +177,21 @@ static void run(struct Psx* p, int channel) {
 		// Immediate transfers hold the CPU.
 		p->cycles += clocks;
 		finish(p, channel);
-	} else if (channel == GPU && sync == 1) {
-		// GPU block transfers nearly hold the CPU too (Mednafen steals cycles from every CPU read
-		// while one runs); they end after the store that started them.
+	} else if (channel == GPU && sync == 1 && p->mode != MODE_EXACT) {
+		// The Fast and Balanced modes' GPU block transfers hold the CPU; they end after the store that
+		// started them.
 		p->cycles += clocks;
 		d->doneAt[channel] = p->cycles;
 		psxSchedule(p, p->cycles);
 	} else {
 		// Block and linked-list transfers run beside the CPU; the channel is busy until they're done.
+		// While a GPU block transfer runs, each CPU data read waits a block's words less one.
 		d->doneAt[channel] = p->cycles + clocks;
 		psxSchedule(p, d->doneAt[channel]);
+		if (channel == GPU && sync == 1) {
+			uint32_t steal = d->bcr[GPU] & 0xFFFF;
+			p->dmaSteal = steal > 201 ? 200 : steal ? steal - 1 : 0;
+		}
 	}
 }
 
@@ -298,6 +304,12 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 		}
 		return;
 	}
+	if (channel == GPU && d->doneAt[GPU] > p->cycles && !d->listActive && (d->chcr[GPU] >> 9 & 3) == 1) {
+		// The channel set up again while a block transfer runs: the CPU waits for it first
+		p->cycles = d->doneAt[GPU];
+		d->doneAt[GPU] = 0;
+		finish(p, GPU);
+	}
 	switch (address & 0xC) {
 	case 0: d->madr[channel] = value & 0xFFFFFF; break;
 	case 4: d->bcr[channel] = value; break;
@@ -310,7 +322,10 @@ void dmaWrite(struct Psx* p, uint32_t address, uint32_t value) {
 		if (!(value & 0x01000000)) {
 			d->remaining[channel] = 0;
 			d->doneAt[channel] = 0;
-			if (channel == GPU) d->listActive = false;
+			if (channel == GPU) {
+				d->listActive = false;
+				p->dmaSteal = 0;
+			}
 		}
 		maybeStart(p, channel);
 		break;

@@ -247,7 +247,7 @@ static void bPatchSlows(struct Compile* k) {
 
 // x0 = the cycle count (or when the GTE is done, if that's later, with gte) plus bound, compared
 // with the limit.
-static void compareBound(struct Emitter* e, int bound, bool gte) {
+static void compareBound(struct Emitter* e, int bound, bool gte, int reads) {
 	if (gte) {
 		aLdrX(e, X0, X19, OFF(cpu.gteDone));
 		aCmpX(e, X0, X21);
@@ -256,16 +256,21 @@ static void compareBound(struct Emitter* e, int bound, bool gte) {
 	} else {
 		aAddImmX(e, X0, X21, (uint32_t) bound);
 	}
+	if (reads) {
+		aLdr(e, X1, X19, OFF(dmaSteal));
+		movI(e, X2, (uint32_t) reads);
+		aMaddX(e, X0, X1, X2, X0);
+	}
 	aCmpX(e, X0, X22);
 }
 
-static void bDecline(struct Compile* k, int bound, bool gte, uint8_t* careful) {
-	compareBound(&k->e, bound, gte);
+static void bDecline(struct Compile* k, int bound, bool gte, int reads, uint8_t* careful) {
+	compareBound(&k->e, bound, gte, reads);
 	aBcond(&k->e, C_GE, careful);
 }
 
-static void bCheck(struct Compile* k, int bound, bool gte, int next) {
-	compareBound(&k->e, bound, gte);
+static void bCheck(struct Compile* k, int bound, bool gte, int reads, int next) {
+	compareBound(&k->e, bound, gte, reads);
 	k->stubSites[next] = aBcond(&k->e, C_GE, NULL);
 }
 
@@ -523,6 +528,16 @@ static void coldHere(struct Compile* k, int kind, uint8_t* site, uint32_t instr,
 
 // A load from [x23 + x9] (RAM) or [x25 + x9] (the scratchpad, pass 1), then the load in flight as
 // the interpreter leaves it.
+// A read from RAM: the cycles a GPU block transfer takes from it (p->dmaSteal), and its wait the next
+// instructions may hide, absorb more (the Exact mode; w1 is scratch).
+static void bSteal(struct Compile* k, int absorb) {
+	struct Emitter* e = &k->e;
+	aLdr(e, X1, X19, OFF(dmaSteal));
+	aDp(e, A_ADD | W64, X21, X21, X1, S_LSL, 0);
+	aDpImm(e, A_ADD_IMM, X1, X1, absorb);
+	aStrb(e, X1, X19, OFF(cpu.ldAbsorb));
+}
+
 static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	struct Emitter* e = &k->e;
 	int op = instr >> 26, rs = instr >> 21 & 31, rt = instr >> 16 & 31;
@@ -541,7 +556,7 @@ static void loadPass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		aDpImm(e, A_ADD_IMM | W64, X21, X21, 5 + (surcharge > 0 ? surcharge : 0));
-		storeByteI(e, OFF(cpu.ldAbsorb), 5);
+		bSteal(k, 5);
 	} else {
 		aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
 	}
@@ -562,7 +577,7 @@ static void lwc2Pass(struct Compile* k, uint32_t instr, int pending, int pass) {
 	} else if (pass == 0) {
 		if (surcharge < 0) bSurchargeIndirect(k);
 		aDpImm(e, A_ADD_IMM | W64, X21, X21, 4 + (surcharge > 0 ? surcharge : 0));
-		storeByteI(e, OFF(cpu.ldAbsorb), 4);
+		bSteal(k, 4);
 	} else {
 		aStrb(e, ZR, X19, OFF(cpu.ldAbsorb));
 	}
