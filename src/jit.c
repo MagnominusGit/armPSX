@@ -662,7 +662,13 @@ static uint8_t* enterAt(struct Psx* p, struct Jit* j, uint32_t pc) {
 		struct Block* b = *slot;
 		if (!b || b->pc != pc || (b->checked != c->icacheChanges && !lineCurrent(c, b, 0))) {
 			struct Block* n = compileBlock(p, j, pc, false);
-			if (n) *slot = b = n;
+			if (n) {
+				*slot = b = n;
+			} else if (fastMode(p) && (j->blockCount == BLOCKS_MAX || j->used + 64 * 1024 > ARENA_SIZE)) {
+				// The arena is full: on through the dispatcher, which empties it, rather than the
+				// interpreter, whose timing isn't the Fast and Balanced modes'
+				return j->leave;
+			}
 		}
 		if (b && b->pc == pc && (b->checked == c->icacheChanges || lineCurrent(c, b, 0))) {
 			b->checked = c->icacheChanges;
