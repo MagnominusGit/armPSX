@@ -100,9 +100,16 @@ struct Gpu {
 };
 
 struct Pad {
-	uint16_t buttons;  // pressed bits in the pad's order (bit 0 Select ... bit 15 Square)
+	uint16_t buttons;     // pressed bits in the pad's order (bit 0 Select ... bit 15 Square)
+	bool dualShock;       // a DualShock (SCPH-1200) rather than the digital pad
+	uint8_t axes[2][2];   // the DualShock's sticks, right then left, x then y (0-255, 128 centred)
+	bool analogButton;    // its Analog button held
+	// The DualShock's own state (Mednafen's dualshock.cpp): analog mode and its lock, the
+	// configuration mode, Dual Analog style rumble until configured, the rumble mapping and motors
+	bool analogMode, analogLocked, config, daRumble, analogButtonWas;
+	uint8_t rumbleMap[6], rumble[2];
 	int phase, txPos, txCount;
-	uint8_t command, tx[3];
+	uint8_t command, tx[8];
 	bool dtr;
 };
 
@@ -263,6 +270,12 @@ uint32_t sioRead(struct Psx* p, uint32_t address, int size);
 void sioWrite(struct Psx* p, uint32_t address, uint32_t value, int size);
 void sioRun(struct Psx* p);
 void sioFormatCard(struct Memcard* c);
+// The pads as at power-on (their kind and what's pressed kept).
+void sioPowerPads(struct Psx* p);
+// After a frame's input: a DualShock's Analog button changes its mode.
+void sioPadInput(struct Pad* d);
+// A DualShock's motors as the game drives them (0-255): the large one and the small one.
+void sioPadRumble(const struct Pad* d, uint8_t* large, uint8_t* small);
 
 // spu.c
 void spuReset(struct Psx* p);

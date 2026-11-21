@@ -189,6 +189,10 @@ int main(int argc, char** argv) {
 		image = NULL;
 	}
 	sioFormatCard(&p->sio.card[0]);
+	// PSXRUN_DUALSHOCK=1: a DualShock in port 1 (PSXRUN_ANALOG=1: in analog mode), sticks centred
+	p->sio.pad[0].dualShock = getenv("PSXRUN_DUALSHOCK") && strcmp(getenv("PSXRUN_DUALSHOCK"), "0");
+	p->sio.pad[0].analogMode = getenv("PSXRUN_ANALOG") && strcmp(getenv("PSXRUN_ANALOG"), "0");
+	memset(p->sio.pad[0].axes, 128, sizeof p->sio.pad[0].axes);
 	psxReset(p);
 	if (image) {
 		FILE* f = fopen(image, "rb");

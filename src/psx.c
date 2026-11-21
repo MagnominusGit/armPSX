@@ -58,6 +58,7 @@ void psxReset(struct Psx* p) {
 	p->sio.mode = p->sio.control = p->sio.baud = 0;
 	p->sio.txPending = p->sio.txBusy = p->sio.rxAvail = p->sio.irq = false;
 	p->sio.dsrAt = p->sio.dsrUntil = 0;
+	sioPowerPads(p);
 	p->nextEvent = p->cycles;
 }
 

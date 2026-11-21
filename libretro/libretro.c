@@ -32,6 +32,11 @@ static struct retro_hw_render_callback hw;
 static struct Gles* gles;
 static int glScale = 1;
 static int lastW, lastH;
+// The controllers: the digital pad (the default) or a DualShock, and the frontend's rumble
+#define PAD_DIGITAL RETRO_DEVICE_JOYPAD
+#define PAD_DUALSHOCK RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 0)
+static bool padDualShock[2];
+static struct retro_rumble_interface rumble;
 
 static void logf_(enum retro_log_level level, const char* fmt, ...) {
 }
@@ -111,13 +116,18 @@ void retro_set_environment(retro_environment_t cb) {
 		setEject, getEject, getImageIndex, setImageIndex, getNumImages, replaceImage, addImage,
 	};
 	cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, &disk);
-	static const struct retro_controller_description pads[] = { { "PlayStation Controller", RETRO_DEVICE_JOYPAD } };
-	static const struct retro_controller_info ports[] = { { pads, 1 }, { pads, 1 }, { NULL, 0 } };
+	static const struct retro_controller_description pads[] = {
+		{ "PlayStation Controller", PAD_DIGITAL },
+		{ "DualShock", PAD_DUALSHOCK },
+	};
+	static const struct retro_controller_info ports[] = { { pads, 2 }, { pads, 2 }, { NULL, 0 } };
 	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
 	static const struct retro_variable options[] = {
 		{ "armpsx_mode", "Mode (restart); Fast|Balanced|Exact" },
 		{ "armpsx_renderer", "Renderer (restart); Software|OpenGL|Vulkan" },
 		{ "armpsx_resolution", "Internal resolution (OpenGL); 1x|2x|3x|4x|5x|6x|7x|8x" },
+		{ "armpsx_analog_start", "DualShock starts in analog mode (restart); Off|On" },
+		{ "armpsx_analog_combo", "DualShock Analog button: hold L3+R3; On|Off" },
 		{ NULL, NULL },
 	};
 	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*) options);
@@ -128,7 +138,12 @@ void retro_set_audio_sample(retro_audio_sample_t cb) {}
 void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_batch_cb = cb; }
 void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
 void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
-void retro_set_controller_port_device(unsigned port, unsigned device) {}
+// Each port's controller: the digital pad unless a DualShock is chosen.
+void retro_set_controller_port_device(unsigned port, unsigned device) {
+	if (port >= 2) return;
+	padDualShock[port] = device == PAD_DUALSHOCK;
+	if (psx) psx->sio.pad[port].dualShock = padDualShock[port];
+}
 
 void retro_init(void) {
 	picture = calloc(768 * 576, 4);
@@ -432,7 +447,15 @@ bool retro_load_game(const struct retro_game_info* game) {
 		return false;
 	}
 	sioFormatCard(&psx->sio.card[0]);
+	struct retro_variable analog = { "armpsx_analog_start", NULL };
+	bool analogStart = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &analog) && analog.value && !strcmp(analog.value, "On");
+	for (int i = 0; i < 2; i++) {
+		psx->sio.pad[i].dualShock = padDualShock[i];
+		psx->sio.pad[i].analogMode = analogStart;
+		for (int s = 0; s < 2; s++) psx->sio.pad[i].axes[s][0] = psx->sio.pad[i].axes[s][1] = 128;
+	}
 	psxReset(psx);
+	if (!environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble)) rumble.set_rumble_state = NULL;
 	struct retro_variable renderer = { "armpsx_renderer", NULL };
 	hw.context_type = RETRO_HW_CONTEXT_NONE;
 	bool got = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &renderer) && renderer.value;
@@ -479,11 +502,49 @@ static uint16_t readPad(unsigned port) {
 	return buttons;
 }
 
+// A stick's axis from the frontend (-32768 to 32767) as the DualShock gives it (0-255).
+static uint8_t padAxis(unsigned port, unsigned stick, unsigned axis) {
+	int32_t v = input_state_cb(port, RETRO_DEVICE_ANALOG, stick, axis) + 32768;
+	return (uint8_t) ((v * 255 + 32767) / 65535);
+}
+
+// A DualShock's sticks, and its Analog button: L3 and R3 held about a second (when that's on).
+static void readDualShock(unsigned port, struct Pad* d) {
+	static int held[2];
+	d->axes[0][0] = padAxis(port, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+	d->axes[0][1] = padAxis(port, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+	d->axes[1][0] = padAxis(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+	d->axes[1][1] = padAxis(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+	struct retro_variable combo = { "armpsx_analog_combo", NULL };
+	bool on = !environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &combo) || !combo.value || strcmp(combo.value, "Off");
+	held[port] = on && (d->buttons & 6) == 6 ? held[port] + 1 : 0;
+	d->analogButton = held[port] >= 60;
+	sioPadInput(d);
+}
+
+// The DualShocks' motors to the frontend's rumble, when they change.
+static void padRumble(void) {
+	static uint8_t was[2][2];
+	if (!rumble.set_rumble_state) return;
+	for (unsigned port = 0; port < 2; port++) {
+		uint8_t large, small;
+		sioPadRumble(&psx->sio.pad[port], &large, &small);
+		if (large != was[port][0]) rumble.set_rumble_state(port, RETRO_RUMBLE_STRONG, (uint16_t) (large * 257));
+		if (small != was[port][1]) rumble.set_rumble_state(port, RETRO_RUMBLE_WEAK, (uint16_t) (small * 257));
+		was[port][0] = large;
+		was[port][1] = small;
+	}
+}
+
 void retro_run(void) {
 	input_poll_cb();
-	psx->sio.pad[0].buttons = readPad(0);
-	psx->sio.pad[1].buttons = readPad(1);
+	for (unsigned port = 0; port < 2; port++) {
+		struct Pad* d = &psx->sio.pad[port];
+		d->buttons = readPad(port);
+		if (d->dualShock) readDualShock(port, d);
+	}
 	psxRunFrame(psx);
+	padRumble();
 	if (psx->gpuGl) {
 		if (scaleOption() != glScale) {
 			// The renderer again at the new scale, on the same context

@@ -17,12 +17,18 @@ static uint32_t bitClocks(struct Sio* s) {
 
 // Each device puts out what it queued after the last byte, then takes this one; it returns the delay
 // of its acknowledge pulse, 0 for none.
+static void dualShockByte(struct Pad* d, uint8_t in);
+
 static int padByte(struct Pad* d, uint8_t in, uint8_t* out) {
 	if (!d->dtr) return 0;
 	if (d->txCount) {
 		*out &= d->tx[d->txPos];
 		d->txPos++;
 		d->txCount--;
+	}
+	if (d->dualShock) {
+		dualShockByte(d, in);
+		return d->txCount ? 0x40 : 0;
 	}
 	switch (d->phase) {
 	case 0:
@@ -52,6 +58,172 @@ static int padByte(struct Pad* d, uint8_t in, uint8_t* out) {
 		break;
 	}
 	return d->txCount ? 0x40 : 0;
+}
+
+// The DualShock (Mednafen's dualshock.cpp): the digital pad's reply in digital mode, the sticks too
+// in analog mode, and a configuration mode (entered with command 0x43) with commands 0x40-0x4F for
+// the mode, its lock, the motors' mapping and the pad's description.
+static void queue(struct Pad* d, const uint8_t* bytes, int n) {
+	memcpy(d->tx, bytes, (size_t) n);
+	d->txPos = 0;
+	d->txCount = n;
+}
+
+static void dualShockByte(struct Pad* d, uint8_t in) {
+	uint8_t b0 = 0xFF ^ (uint8_t) d->buttons, b1 = 0xFF ^ (uint8_t) (d->buttons >> 8);
+	int phase = d->phase;
+	if (phase == 0) {
+		if (in != 0x01) {
+			d->phase = -1;
+		} else if (d->config) {
+			queue(d, (const uint8_t[]) { 0xF3 }, 1);
+			d->phase = 101;
+		} else {
+			queue(d, (const uint8_t[]) { d->analogMode ? 0x73 : 0x41 }, 1);
+			d->phase = 1;
+		}
+	} else if (phase == 1) {
+		d->command = in;
+		d->phase = 2;
+		if (in == 0x42) {
+			queue(d, (const uint8_t[]) { 0x5A }, 1);
+			d->phase = 0x4200;
+		} else if (in == 0x43) {
+			const uint8_t a[7] = { 0x5A, b0, b1, d->axes[0][0], d->axes[0][1], d->axes[1][0], d->axes[1][1] };
+			queue(d, a, d->analogMode ? 7 : 3);
+		} else {
+			d->phase = -1;
+			d->txCount = 0;
+		}
+	} else if (phase == 2) {
+		// Command 0x43 outside the configuration mode: its second data byte 1 enters it
+		if (d->command == 0x43 && d->txPos == 2 && in == 0x01) {
+			d->config = true;
+			if (d->daRumble) {
+				d->rumble[0] = d->rumble[1] = 0;
+				d->daRumble = false;
+			}
+			d->phase = -1;
+		}
+	} else if (phase == 101) {
+		d->command = in;
+		if (in >= 0x40 && in <= 0x4F) {
+			queue(d, (const uint8_t[]) { 0x5A }, 1);
+			d->phase = in << 8;
+		} else {
+			d->txCount = 0;
+			d->phase = -1;
+		}
+	} else if (phase == 0x4200) {
+		if (d->analogMode || d->config) {
+			const uint8_t a[6] = { b0, b1, d->axes[0][0], d->axes[0][1], d->axes[1][0], d->axes[1][1] };
+			queue(d, a, 6);
+		} else {
+			const uint8_t a[4] = { b0, b1, 0, 0 };
+			queue(d, a, (d->rumbleMap[2] & 0xFE) ? 2 : 4);
+		}
+		d->phase++;
+	} else if (phase == 0x4201) {
+		const uint8_t* m = d->rumbleMap;
+		if (d->daRumble) d->rumble[0] = in;
+		else if (m[0] == 0x00 && m[2] && m[3] && m[4] && m[5]) d->rumble[0] = in;
+		d->phase++;
+	} else if (phase == 0x4202) {
+		const uint8_t* m = d->rumbleMap;
+		if (d->daRumble) d->rumble[1] = in;
+		else if (m[1] == 0x01) d->rumble[1] = in;
+		else if (m[1] == 0x00 && m[2] && m[3] && m[4] && m[5]) d->rumble[0] = in;
+		d->phase++;
+	} else if (phase == 0x4203) {
+		if (!d->daRumble && d->rumbleMap[1] == 0x00 && d->rumbleMap[2] == 0x01) d->rumble[1] = in;
+		d->phase++;
+	} else if ((phase & 0xFF) == 0 && phase >= 0x4000 && phase <= 0x4F00) {
+		// The configuration commands' first data byte: 0 goes on
+		if (in != 0x00) {
+			d->phase = -1;
+		} else {
+			uint8_t first = phase == 0x4500 ? 0x01 : phase == 0x4D00 ? d->rumbleMap[0] : 0x00;
+			queue(d, &first, 1);
+			d->phase++;
+		}
+	} else if (phase >= 0x4D01 && phase <= 0x4D06) {
+		unsigned index = (unsigned) (phase - 0x4D01);
+		if (index < 5) {
+			queue(d, &d->rumbleMap[1 + index], 1);
+			d->phase++;
+		} else {
+			d->phase = -1;
+		}
+		d->rumbleMap[index] = in;
+	} else if (phase == 0x4402) {
+		if (in == 0x02) d->analogLocked = false;
+		else if (in == 0x03) d->analogLocked = true;
+		d->phase = -1;
+	} else if ((phase & 0xFF) == 1 && phase >= 0x4001 && phase <= 0x4F01) {
+		uint8_t a[5] = { 0 };
+		int command = phase >> 8;
+		d->phase = -1;
+		if (command == 0x43) {
+			if (in == 0x00) d->config = false;
+		} else if (command == 0x44) {
+			// The mode, whatever the lock; then its lock
+			if (in == 0x00) d->analogMode = false;
+			else if (in == 0x01) d->analogMode = true;
+			d->phase = 0x4402;
+		} else if (command == 0x45) {
+			a[0] = 0x02, a[1] = d->analogMode ? 0x01 : 0x00, a[2] = 0x02, a[3] = 0x01;
+		} else if (command == 0x46) {
+			if (in == 0x00) a[1] = 0x01, a[2] = 0x02, a[4] = 0x0A;
+			else if (in == 0x01) a[1] = 0x01, a[2] = 0x01, a[3] = 0x01, a[4] = 0x14;
+		} else if (command == 0x47) {
+			if (in == 0x00) a[1] = 0x02, a[3] = 0x01;
+		} else if (command == 0x48) {
+			if (in == 0x00) a[3] = 0x01, a[4] = d->rumble[0];
+			else if (in == 0x01) a[3] = 0x01, a[4] = d->rumble[1];
+		} else if (command == 0x4C) {
+			if (in == 0x00) a[2] = 0x04;
+			else if (in == 0x01) a[2] = 0x07;
+		}
+		queue(d, a, 5);
+	}
+}
+
+// Its Analog button changes its mode while it isn't being talked to, unless the mode is locked.
+static void analogButton(struct Pad* d) {
+	if (d->dtr) return;
+	if (d->analogButton && !d->analogButtonWas && !d->analogLocked) d->analogMode = !d->analogMode;
+	d->analogButtonWas = d->analogButton;
+}
+
+void sioPadInput(struct Pad* d) {
+	if (d->dualShock) analogButton(d);
+}
+
+void sioPadRumble(const struct Pad* d, uint8_t* large, uint8_t* small) {
+	if (!d->dualShock) {
+		*large = *small = 0;
+	} else if (!d->daRumble) {
+		*small = d->rumble[0] == 0x01 ? 0xFF : 0;
+		*large = d->rumble[1];
+	} else {
+		*small = (d->rumble[0] & 0xC0) == 0x40 && (d->rumble[1] & 1) ? 0xFF : 0;
+		*large = 0;
+	}
+}
+
+void sioPowerPads(struct Psx* p) {
+	for (int i = 0; i < 2; i++) {
+		struct Pad* d = &p->sio.pad[i];
+		struct Pad keep = *d;
+		memset(d, 0, sizeof *d);
+		d->buttons = keep.buttons;
+		d->dualShock = keep.dualShock;
+		memcpy(d->axes, keep.axes, sizeof d->axes);
+		d->analogButton = d->analogButtonWas = keep.analogButton;
+		d->analogMode = keep.analogMode;  // (as the frontend set it to start)
+		memset(d->rumbleMap, 0xFF, sizeof d->rumbleMap);
+		d->daRumble = true;
+	}
 }
 
 static int cardByte(struct Memcard* c, uint8_t in, uint8_t* out) {
@@ -187,7 +359,9 @@ static void setDtr(struct Psx* p) {
 			c->phase = 0;
 			c->txCount = 0;
 		}
+		bool was = d->dtr;
 		d->dtr = c->dtr = dtr;
+		if (was && !dtr && d->dualShock) analogButton(d);
 	}
 	if (!(s->control & 2)) {
 		s->dsrAt = 0;
